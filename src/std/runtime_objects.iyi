@@ -1,0 +1,260 @@
+# Complete runtime object and error surface for iyi standard library.
+#
+# Provides Box, Class, Exception, GC, Kernel, Object, Raise, Reference,
+# ReferenceStorage, Struct, Union, Value, WeakRef, SystemError, Errno,
+# WasiError, and WinError APIs.
+
+module std/runtime_objects
+
+pub import std/box
+pub import std/weak_ref
+pub import std/reference_storage
+pub import std/errno
+pub import std/wasi_error
+pub import std/winerror
+pub import std/system_error
+pub import std/gc
+pub import std/kernel
+pub import std/exception
+
+using std/box::{Box}
+using std/weak_ref::{WeakRef}
+using std/reference_storage::{ReferenceStorage}
+using std/errno::{Errno}
+using std/wasi_error::{WasiError}
+using std/winerror::{WinError}
+
+class ::Object
+  def tap(&)
+    yield self
+    self
+  end
+
+  def try(&)
+    yield self
+  end
+
+  def itself
+    self
+  end
+
+  def !~(other) : Bool
+    !(self =~ other)
+  end
+
+  def =~(other)
+    nil
+  end
+
+  def in?(collection : Object) : Bool
+    collection == self
+  end
+
+  def in?(*values : *T) : Bool forall T
+    {% for index in 0...T.size %}
+      return true if self == values[{{ index }}]
+    {% end %}
+    false
+  end
+
+  def unsafe_as(type : T.class) forall T
+    x = self
+    pointerof(x).as(T*).value
+  end
+
+  macro delegate(*methods, to object)
+    {% for method in methods %}
+      def {{method.id}}(*args, **options)
+        {{object.id}}.{{method.id}}(*args, **options)
+      end
+    {% end %}
+  end
+
+  macro def_hash(*fields)
+    def hash : Int32
+      h = 0
+      {% for field in fields %}
+        h = (h * 31) ^ {{field.id}}.hash
+      {% end %}
+      h
+    end
+  end
+
+  macro def_equals(*fields)
+    def ==(other : self) : Bool
+      {% for field in fields %}
+        return false unless {{field.id}} == other.{{field.id}}
+      {% end %}
+      true
+    end
+  end
+
+  macro def_equals_and_hash(*fields)
+    def_equals {{fields.splat}}
+    def_hash {{fields.splat}}
+  end
+
+  macro forward_missing_to(delegate)
+    macro method_missing(call)
+      {{delegate}}.\{{call}}
+    end
+  end
+end
+
+class ::Class
+  def inspect : String
+    to_s
+  end
+
+  def to_s : String
+    name
+  end
+
+  def hash : Int32
+    crystal_type_id
+  end
+
+  def ==(other : Class) : Bool
+    crystal_type_id == other.crystal_type_id
+  end
+
+  def <(other : T.class) : Bool forall T
+    {% @type %}
+    other._gt(self)
+  end
+
+  def <=(other : T.class) : Bool forall T
+    {% @type %}
+    other._gte(self)
+  end
+
+  def >(other : T.class) : Bool forall T
+    {% @type %}
+    other._lt(self)
+  end
+
+  def >=(other : T.class) forall T
+    {% @type %}
+    other._lte(self)
+  end
+
+  def _lt(other : T.class) forall T
+    {{ @type < T }}
+  end
+
+  def _lte(other : T.class) forall T
+    {{ @type <= T }}
+  end
+
+  def _gt(other : T.class) forall T
+    {{ @type > T }}
+  end
+
+  def _gte(other : T.class) forall T
+    {{ @type >= T }}
+  end
+
+  def ===(other)
+    {% if @type == Class %}
+      other.is_a?(Class)
+    {% else %}
+      other.is_a?(self)
+    {% end %}
+  end
+
+  def name : String
+    {{ @type.name.stringify }}
+  end
+
+  def cast(other) : self
+    other.as(self)
+  end
+
+  def nilable? : Bool
+    {{ @type >= Nil }}
+  end
+
+  def dup
+    self
+  end
+
+  def clone
+    self
+  end
+end
+
+class ::Reference
+  def ==(other : self) : Bool
+    same?(other)
+  end
+
+  def ==(other) : Bool
+    false
+  end
+
+  def same?(other) : Bool
+    if other.is_a?(Reference)
+      object_id == other.object_id
+    else
+      false
+    end
+  end
+
+  def dup
+    {% if @type.abstract? %}
+      raise "Can't dup #{@type}"
+    {% else %}
+      dup_obj = self.class.allocate
+      dup_obj.as(Pointer(UInt8)).copy_from(self.as(Pointer(UInt8)), instance_sizeof(self).to_i32)
+      dup_obj
+    {% end %}
+  end
+end
+
+struct ::Value
+  def ==(other) : Bool
+    false
+  end
+
+  def dup
+    self
+  end
+end
+
+struct ::Struct
+  def ==(other) : Bool
+    if other.is_a?(self)
+      {% for ivar in @type.instance_vars %}
+        return false unless @{{ivar.id}} == other.@{{ivar.id}}
+      {% end %}
+      true
+    else
+      false
+    end
+  end
+
+  def hash : Int32
+    h = 0
+    {% for ivar in @type.instance_vars %}
+      h = (h * 31) ^ @{{ivar.id}}.hash
+    {% end %}
+    h
+  end
+
+  def to_s : String
+    self.class.name
+  end
+
+  def inspect : String
+    to_s
+  end
+end
+
+struct ::Tuple
+  def ==(other : self) : Bool
+    {% for i in 0...T.size %}
+      return false unless self[{{i}}] == other[{{i}}]
+    {% end %}
+    true
+  end
+end

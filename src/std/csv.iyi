@@ -1,0 +1,926 @@
+# Standard CSV library for iyi, conforming to RFC 4180 and Crystal's CSV API.
+#
+# Provides parsing and building of comma-separated values (CSV) with support for:
+#   * Configurable separator and quote characters
+#   * Quoting modes: NONE, RFC, ALL via CSV::Builder::Quoting
+#   * Header row extraction and column access by header name, index, or Regex pattern
+#   * Row objects via CSV::Row with to_h, to_a, values_at, and size
+#   * Streaming row-at-a-time parsing via CSV::Parser
+#   * Token-level streaming lexer via CSV::Lexer and CSV::Token
+#   * Detailed error locations via CSV::MalformedCSVError (line_number, column_number)
+#   * In-memory or IO building via CSV.build and CSV::Builder
+
+module std/csv
+
+import std/regex
+using std/regex::{Regex}
+
+DEFAULT_SEPARATOR  = ','
+DEFAULT_QUOTE_CHAR = '"'
+
+pub class CSV
+  DEFAULT_SEPARATOR  = ','
+  DEFAULT_QUOTE_CHAR = '"'
+
+  getter strip : Bool
+
+  def strip? : Bool
+    @strip
+  end
+
+  getter indices : Hash(String, Int32)
+  getter headers : Array(String)
+  getter current_row : Array(String)?
+
+  @parser : Parser
+  @has_headers : Bool
+  @current_row : Array(String)?
+
+  def initialize(str : String, headers : Bool = false, @strip : Bool = false, separator : Char = DEFAULT_SEPARATOR, quote_char : Char = DEFAULT_QUOTE_CHAR)
+    @parser = Parser.new(str, separator, quote_char)
+    @has_headers = headers
+    @headers = [] of String
+    @indices = Hash(String, Int32).new
+    @current_row = nil
+
+    if headers
+      if first = @parser.next_row
+        @headers = first.map { |h| h.strip }
+        @headers.each_with_index do |h, idx|
+          @indices[h] = idx unless @indices.has_key?(h)
+        end
+      end
+    end
+  end
+
+  def initialize(io, headers : Bool = false, @strip : Bool = false, separator : Char = DEFAULT_SEPARATOR, quote_char : Char = DEFAULT_QUOTE_CHAR)
+    @parser = Parser.new(io, separator, quote_char)
+    @has_headers = headers
+    @headers = [] of String
+    @indices = Hash(String, Int32).new
+    @current_row = nil
+
+    if headers
+      if first = @parser.next_row
+        @headers = first.map { |h| h.strip }
+        @headers.each_with_index do |h, idx|
+          @indices[h] = idx unless @indices.has_key?(h)
+        end
+      end
+    end
+  end
+
+  def self.new(string_or_io, headers : Bool = false, strip : Bool = false, separator : Char = DEFAULT_SEPARATOR, quote_char : Char = DEFAULT_QUOTE_CHAR, &block : CSV -> Nil) : CSV
+    csv = CSV.new(string_or_io, headers, strip, separator, quote_char)
+    while csv.next
+      block.call(csv)
+    end
+    csv
+  end
+
+  def next : Bool
+    row = @parser.next_row
+    @current_row = row
+    !row.nil?
+  end
+
+  def row : Row
+    if r = @current_row
+      Row.new(self, r)
+    else
+      raise "no current row (did you call next?)"
+    end
+  end
+
+  def [](column_name : String) : String
+    row[column_name]
+  end
+
+  def []?(column_name : String) : String?
+    row[column_name]?
+  end
+
+  def [](index : Int32) : String
+    row[index]
+  end
+
+  def []?(index : Int32) : String?
+    row[index]?
+  end
+
+  def [](header_pattern : Regex) : String
+    row[header_pattern]
+  end
+
+  def []?(header_pattern : Regex) : String?
+    row[header_pattern]?
+  end
+
+  def to_h : Hash(String, String)
+    row.to_h
+  end
+
+  def each(&block : CSV -> Nil) : Nil
+    while self.next
+      block.call(self)
+    end
+  end
+
+  def each_row(&block : Array(String) -> Nil) : Nil
+    while self.next
+      if r = @current_row
+        block.call(r)
+      end
+    end
+  end
+
+  def values_at(*columns : Int32) : Array(String)
+    row.values_at(*columns)
+  end
+
+  def values_at(*headers : String) : Array(String)
+    row.values_at(*headers)
+  end
+
+  def values_at(columns : Array(Int32)) : Array(String)
+    row.values_at(columns)
+  end
+
+  def values_at(headers : Array(String)) : Array(String)
+    row.values_at(headers)
+  end
+
+  def rewind : Nil
+    @parser.rewind
+    if @has_headers
+      if first = @parser.next_row
+        @headers = first.map { |h| h.strip }
+        @indices.clear
+        @headers.each_with_index do |h, idx|
+          @indices[h] = idx unless @indices.has_key?(h)
+        end
+      end
+    end
+    @current_row = nil
+  end
+
+  def self.parse(str : String, separator : Char = DEFAULT_SEPARATOR, quote_char : Char = DEFAULT_QUOTE_CHAR) : Array(Array(String))
+    Parser.new(str, separator, quote_char).parse
+  end
+
+  def self.parse(io, separator : Char = DEFAULT_SEPARATOR, quote_char : Char = DEFAULT_QUOTE_CHAR) : Array(Array(String))
+    Parser.new(io, separator, quote_char).parse
+  end
+
+  def self.each_row(str : String, separator : Char = DEFAULT_SEPARATOR, quote_char : Char = DEFAULT_QUOTE_CHAR, &block : Array(String) -> Nil) : Nil
+    Parser.new(str, separator, quote_char).each_row(&block)
+  end
+
+  def self.each_row(io, separator : Char = DEFAULT_SEPARATOR, quote_char : Char = DEFAULT_QUOTE_CHAR, &block : Array(String) -> Nil) : Nil
+    Parser.new(io, separator, quote_char).each_row(&block)
+  end
+
+  def self.build(separator : Char = DEFAULT_SEPARATOR, quote_char : Char = DEFAULT_QUOTE_CHAR, quoting : Builder::Quoting = Builder::Quoting::RFC, &block : Builder -> Nil) : String
+    builder = Builder.new(nil, separator, quote_char, quoting)
+    block.call(builder)
+    builder.to_s
+  end
+
+  def self.build(io : IyiIO, separator : Char = DEFAULT_SEPARATOR, quote_char : Char = DEFAULT_QUOTE_CHAR, quoting : Builder::Quoting = Builder::Quoting::RFC, &block : Builder -> Nil) : Nil
+    builder = Builder.new(io, separator, quote_char, quoting)
+    block.call(builder)
+  end
+
+  pub class Error < Exception
+  end
+
+  pub class MalformedCSVError < Error
+    getter line_number : Int32
+    getter column_number : Int32
+    getter message : String
+
+    def initialize(message : String, @line_number : Int32 = 1, @column_number : Int32 = 1)
+      @message = "#{message} at line #{@line_number}, column #{@column_number}"
+    end
+  end
+
+  pub struct Token
+    enum Kind
+      Cell
+      Newline
+      Eof
+    end
+
+    def cell? : Bool
+      @kind.value == 0
+    end
+
+    def newline? : Bool
+      @kind.value == 1
+    end
+
+    def eof? : Bool
+      @kind.value == 2
+    end
+
+    property kind : Kind
+    property value : String
+
+    def initialize
+      @kind = Kind::Cell
+      @value = ""
+    end
+  end
+
+  pub abstract class Lexer
+    getter token : Token
+    getter separator : Char
+    getter quote_char : Char
+
+    def self.new(string : String, separator : Char = DEFAULT_SEPARATOR, quote_char : Char = DEFAULT_QUOTE_CHAR) : Lexer
+      StringBased.new(string, separator, quote_char)
+    end
+
+    def self.new(io, separator : Char = DEFAULT_SEPARATOR, quote_char : Char = DEFAULT_QUOTE_CHAR) : Lexer
+      IOBased.new(io, separator, quote_char)
+    end
+
+    def initialize(@separator : Char = DEFAULT_SEPARATOR, @quote_char : Char = DEFAULT_QUOTE_CHAR)
+      @token = Token.new
+      @column_number = 1
+      @line_number = 1
+      @last_empty_column = false
+      @last_was_slash_r = false
+      @last_was_slash_n = false
+    end
+
+    def rewind : Nil
+      @column_number = 1
+      @line_number = 1
+      @last_empty_column = false
+      @last_was_slash_r = false
+      @last_was_slash_n = false
+    end
+
+    abstract def next_token : Token
+    protected abstract def consume_unquoted_cell : String
+    protected abstract def current_char : Char
+    protected abstract def next_char_no_column_increment : Char
+
+    protected def next_char : Char
+      @column_number += 1
+      ch = next_char_no_column_increment
+      if ch == '\n' || ch == '\r'
+        @column_number = 0
+        @line_number += 1
+      end
+      ch
+    end
+
+    protected def check_last_empty_column : Nil
+      case next_char
+      when '\r', '\n', '\0'
+        @last_empty_column = true
+      end
+    end
+
+    protected def raise_malformed(msg : String) : NoReturn
+      raise MalformedCSVError.new(msg, @line_number, @column_number).message
+    end
+
+    class StringBased < Lexer
+      @string : String
+      @bytes : Pointer(UInt8)
+      @len : Int32
+      @pos : Int32
+
+      def initialize(@string : String, separator : Char = DEFAULT_SEPARATOR, quote_char : Char = DEFAULT_QUOTE_CHAR)
+        super(separator, quote_char)
+        @bytes = @string.to_unsafe
+        @len = @string.bytesize
+        @pos = 0
+        if current_char == '\n'
+          @line_number += 1
+          @column_number = 0
+        end
+      end
+
+      def rewind : Nil
+        super
+        @pos = 0
+        if current_char == '\n'
+          @line_number += 1
+          @column_number = 0
+        end
+      end
+
+      protected def current_char : Char
+        @pos < @len ? @bytes[@pos].unsafe_chr : '\0'
+      end
+
+      protected def next_char_no_column_increment : Char
+        @pos += 1
+        current_char
+      end
+
+      def next_token : Token
+        if @last_empty_column
+          @last_empty_column = false
+          @token.kind = Token::Kind::Cell
+          @token.value = ""
+          return @token
+        end
+
+        if @last_was_slash_r
+          if current_char == '\n'
+            next_char
+          end
+          @last_was_slash_r = false
+        elsif @last_was_slash_n
+          @last_was_slash_n = false
+        end
+
+        ch = current_char
+        case ch
+        when '\0'
+          @token.kind = Token::Kind::Eof
+          @token.value = ""
+        when @separator
+          @token.kind = Token::Kind::Cell
+          @token.value = ""
+          check_last_empty_column
+        when '\r'
+          @token.kind = Token::Kind::Newline
+          @token.value = ""
+          @last_was_slash_r = true
+          next_char
+        when '\n'
+          @token.kind = Token::Kind::Newline
+          @token.value = ""
+          @last_was_slash_n = true
+          next_char
+        when @quote_char
+          @token.kind = Token::Kind::Cell
+          @token.value = consume_quoted_cell
+        else
+          @token.kind = Token::Kind::Cell
+          @token.value = consume_unquoted_cell
+        end
+        @token
+      end
+
+      private def consume_quoted_cell : String
+        parts = [] of UInt8
+        quote_byte = @quote_char.ord.to_u8
+        sep_byte = @separator.ord.to_u8
+
+        while true
+          ch = next_char
+          if ch == '\0'
+            raise_malformed("Unclosed quote")
+          elsif ch == @quote_char
+            ch_next = next_char
+            if ch_next == @separator
+              check_last_empty_column
+              break
+            elsif ch_next == '\r' || ch_next == '\n' || ch_next == '\0'
+              break
+            elsif ch_next == @quote_char
+              parts << quote_byte
+            else
+              # Allow trailing whitespace or raise
+              while current_char == ' ' || current_char == '\t'
+                next_char
+              end
+              if current_char == @separator
+                check_last_empty_column
+                break
+              elsif current_char == '\r' || current_char == '\n' || current_char == '\0'
+                break
+              else
+                raise_malformed("Expecting comma, newline or end, not #{current_char.inspect}")
+              end
+            end
+          else
+            parts << ch.ord.to_u8
+          end
+        end
+
+        String.new(parts.size) do |buf|
+          buf.copy_from(parts.to_unsafe, parts.size)
+        end
+      end
+
+      protected def consume_unquoted_cell : String
+        start_pos = @pos
+        while true
+          ch = current_char
+          if ch == @separator
+            end_pos = @pos
+            check_last_empty_column
+            return @string[start_pos, end_pos - start_pos]
+          elsif ch == '\r' || ch == '\n' || ch == '\0'
+            end_pos = @pos
+            return @string[start_pos, end_pos - start_pos]
+          elsif ch == @quote_char
+            raise_malformed("Unexpected quote")
+          end
+          next_char
+        end
+      end
+    end
+
+    class IOBased < Lexer
+      @io : IyiIO
+      @current_ch : Char
+
+      def initialize(@io : IyiIO, separator : Char = DEFAULT_SEPARATOR, quote_char : Char = DEFAULT_QUOTE_CHAR)
+        super(separator, quote_char)
+        @current_ch = read_next_byte_or_eof
+      end
+
+      def rewind : Nil
+        raise "CSV::Lexer::IOBased#rewind is not supported: the underlying IyiIO cannot seek"
+      end
+
+      protected def current_char : Char
+        @current_ch
+      end
+
+      protected def next_char_no_column_increment : Char
+        @current_ch = read_next_byte_or_eof
+        @current_ch
+      end
+
+      private def read_next_byte_or_eof : Char
+        s = @io.read_bytes(1)
+        s.bytesize == 0 ? '\0' : s.to_unsafe[0].unsafe_chr
+      end
+
+      def next_token : Token
+        if @last_empty_column
+          @last_empty_column = false
+          @token.kind = Token::Kind::Cell
+          @token.value = ""
+          return @token
+        end
+
+        if @last_was_slash_r
+          if current_char == '\n'
+            next_char
+          end
+          @last_was_slash_r = false
+        elsif @last_was_slash_n
+          @last_was_slash_n = false
+        end
+
+        ch = current_char
+        case ch
+        when '\0'
+          @token.kind = Token::Kind::Eof
+          @token.value = ""
+        when @separator
+          @token.kind = Token::Kind::Cell
+          @token.value = ""
+          check_last_empty_column
+        when '\r'
+          @token.kind = Token::Kind::Newline
+          @token.value = ""
+          @last_was_slash_r = true
+          next_char
+        when '\n'
+          @token.kind = Token::Kind::Newline
+          @token.value = ""
+          @last_was_slash_n = true
+          next_char
+        when @quote_char
+          @token.kind = Token::Kind::Cell
+          @token.value = consume_quoted_cell
+        else
+          @token.kind = Token::Kind::Cell
+          @token.value = consume_unquoted_cell
+        end
+        @token
+      end
+
+      private def consume_quoted_cell : String
+        parts = [] of UInt8
+        quote_byte = @quote_char.ord.to_u8
+
+        while true
+          ch = next_char
+          if ch == '\0'
+            raise_malformed("Unclosed quote")
+          elsif ch == @quote_char
+            ch_next = next_char
+            if ch_next == @separator
+              check_last_empty_column
+              break
+            elsif ch_next == '\r' || ch_next == '\n' || ch_next == '\0'
+              break
+            elsif ch_next == @quote_char
+              parts << quote_byte
+            else
+              while current_char == ' ' || current_char == '\t'
+                next_char
+              end
+              if current_char == @separator
+                check_last_empty_column
+                break
+              elsif current_char == '\r' || current_char == '\n' || current_char == '\0'
+                break
+              else
+                raise_malformed("Expecting comma, newline or end, not #{current_char.inspect}")
+              end
+            end
+          else
+            parts << ch.ord.to_u8
+          end
+        end
+
+        String.new(parts.size) do |buf|
+          buf.copy_from(parts.to_unsafe, parts.size)
+        end
+      end
+
+      protected def consume_unquoted_cell : String
+        parts = [] of UInt8
+        while true
+          ch = current_char
+          if ch == @separator
+            check_last_empty_column
+            break
+          elsif ch == '\r' || ch == '\n' || ch == '\0'
+            break
+          elsif ch == @quote_char
+            raise_malformed("Unexpected quote")
+          else
+            parts << ch.ord.to_u8
+            next_char
+          end
+        end
+
+        String.new(parts.size) do |buf|
+          buf.copy_from(parts.to_unsafe, parts.size)
+        end
+      end
+    end
+  end
+
+  pub class Parser
+    @lexer : Lexer
+
+    def initialize(str : String, separator : Char = DEFAULT_SEPARATOR, quote_char : Char = DEFAULT_QUOTE_CHAR)
+      @lexer = Lexer::StringBased.new(str, separator, quote_char)
+    end
+
+    def initialize(io, separator : Char = DEFAULT_SEPARATOR, quote_char : Char = DEFAULT_QUOTE_CHAR)
+      if io.is_a?(String)
+        @lexer = Lexer::StringBased.new(io, separator, quote_char)
+      else
+        @lexer = Lexer::IOBased.new(io, separator, quote_char)
+      end
+    end
+
+    def parse : Array(Array(String))
+      rows = [] of Array(String)
+      while row = next_row
+        rows << row
+      end
+      rows
+    end
+
+    def each_row(&block : Array(String) -> Nil) : Nil
+      while row = next_row
+        block.call(row)
+      end
+    end
+
+    def next_row : Array(String)?
+      row = [] of String
+      token = @lexer.next_token
+      return nil if token.eof?
+
+      while true
+        if token.cell?
+          row << token.value
+          token = @lexer.next_token
+        else
+          break
+        end
+      end
+      row
+    end
+
+    def next_row(array : Array(String)) : Array(String)?
+      array.clear
+      token = @lexer.next_token
+      return nil if token.eof?
+
+      while true
+        if token.cell?
+          array << token.value
+          token = @lexer.next_token
+        else
+          break
+        end
+      end
+      array
+    end
+
+    def rewind : Nil
+      @lexer.rewind
+    end
+  end
+
+  pub class Builder
+    enum Quoting
+      NONE = 0
+      RFC  = 1
+      ALL  = 2
+
+      def none? : Bool
+        value == 0
+      end
+
+      def rfc? : Bool
+        value == 1
+      end
+
+      def all? : Bool
+        value == 2
+      end
+    end
+
+    @io : IyiIO?
+    @buffer : Array(String)
+    @sep : Char
+    @quote : Char
+    @quoting : Quoting
+    @first_cell_in_row : Bool
+
+    def initialize(@io : IyiIO? = nil, @separator : Char = DEFAULT_SEPARATOR, @quote_char : Char = DEFAULT_QUOTE_CHAR, @quoting : Quoting = Quoting::RFC)
+      @buffer = [] of String
+      @sep = @separator
+      @quote = @quote_char
+      @first_cell_in_row = true
+    end
+
+    def row(&block : Row -> Nil) : Nil
+      row_builder = Row.new(self, @sep, @quote, @quoting)
+      block.call(row_builder)
+      if out_io = @io
+        out_io.print("\n")
+      else
+        @buffer << "\n"
+      end
+      @first_cell_in_row = true
+    end
+
+    def row(values : Array(String)) : Nil
+      row do |r|
+        values.each do |val|
+          r << val
+        end
+      end
+    end
+
+    def row(*values) : Nil
+      strs = [] of String
+      i = 0
+      while i < values.size
+        strs << values[i].to_s
+        i = i + 1
+      end
+      row(strs)
+    end
+
+    def to_s : String
+      @buffer.join("")
+    end
+
+    # Internal cell append
+    def append_cell_str(val : String) : Nil
+      unless @first_cell_in_row
+        if out_io = @io
+          out_io.print(@sep.to_s)
+        else
+          @buffer << @sep.to_s
+        end
+      end
+      if out_io = @io
+        out_io.print(val)
+      else
+        @buffer << val
+      end
+      @first_cell_in_row = false
+    end
+
+    struct Row
+      @builder : Builder
+      @sep : Char
+      @quote : Char
+      @quoting : Quoting
+
+      def initialize(@builder : Builder, @sep : Char = DEFAULT_SEPARATOR, @quote : Char = DEFAULT_QUOTE_CHAR, @quoting : Quoting = Quoting::RFC)
+      end
+
+      def <<(value : String) : Nil
+        escaped = escape_cell(value)
+        @builder.append_cell_str(escaped)
+      end
+
+      def <<(value : Nil) : Nil
+        if @quoting.all?
+          @builder.append_cell_str("#{@quote}#{@quote}")
+        else
+          @builder.append_cell_str("")
+        end
+      end
+
+      def <<(value : Bool | Int32 | Int64 | Float64) : Nil
+        s = value.to_s
+        if @quoting.all?
+          @builder.append_cell_str("#{@quote}#{s}#{@quote}")
+        else
+          @builder.append_cell_str(s)
+        end
+      end
+
+      def <<(value) : Nil
+        self << value.to_s
+      end
+
+      def concat(values : Array(String)) : Nil
+        values.each { |v| self << v }
+      end
+
+      def concat(*values) : Nil
+        values.each { |v| self << v.to_s }
+      end
+
+      def skip_cell : Nil
+        self << nil
+      end
+
+      private def escape_cell(value : String) : String
+        if @quoting.none?
+          return value
+        end
+
+        if @quoting.all?
+          return quote_string(value)
+        end
+
+        # RFC mode: quotes if separator, quote_char, \r, or \n
+        len = value.bytesize
+        ptr = value.to_unsafe
+        sep_u8 = @sep.ord.to_u8
+        quote_u8 = @quote.ord.to_u8
+        needs_quote = false
+
+        i = 0
+        while i < len
+          b = ptr[i]
+          if b == sep_u8 || b == quote_u8 || b == 10_u8 || b == 13_u8
+            needs_quote = true
+            break
+          end
+          i += 1
+        end
+
+        needs_quote ? quote_string(value) : value
+      end
+
+      private def quote_string(value : String) : String
+        len = value.bytesize
+        ptr = value.to_unsafe
+        quote_u8 = @quote.ord.to_u8
+        escaped_bytes = [] of UInt8
+
+        i = 0
+        while i < len
+          b = ptr[i]
+          if b == quote_u8
+            escaped_bytes << quote_u8
+            escaped_bytes << quote_u8
+          else
+            escaped_bytes << b
+          end
+          i += 1
+        end
+
+        escaped_str = String.new(escaped_bytes.size) do |target|
+          target.copy_from(escaped_bytes.to_unsafe, escaped_bytes.size)
+        end
+        "#{@quote}#{escaped_str}#{@quote}"
+      end
+    end
+  end
+
+  pub struct Row
+    @csv : CSV
+    @row : Array(String)
+
+    def initialize(@csv : CSV, @row : Array(String))
+    end
+
+    def [](header : String) : String
+      val = self[header]?
+      raise "Missing header: #{header}" unless val
+      val
+    end
+
+    def []?(header : String) : String?
+      idx = @csv.indices[header]?
+      return nil unless idx
+      self[idx]?
+    end
+
+    def [](column : Int32) : String
+      val = self[column]?
+      raise "Missing column index: #{column}" unless val
+      val
+    end
+
+    def []?(column : Int32) : String?
+      c = column
+      c += size if c < 0
+      return nil if c < 0 || c >= size
+      val = @row[c]?
+      val ? maybe_strip(val) : nil
+    end
+
+    def [](header_pattern : Regex) : String
+      val = self[header_pattern]?
+      raise "Missing header pattern: #{header_pattern}" unless val
+      val
+    end
+
+    def []?(header_pattern : Regex) : String?
+      @csv.headers.each_with_index do |h, idx|
+        if header_pattern.match?(h)
+          return self[idx]?
+        end
+      end
+      nil
+    end
+
+    def size : Int32
+      @row.size
+    end
+
+    def to_a : Array(String)
+      if @csv.strip?
+        @row.map { |v| v.strip }
+      else
+        @row.dup
+      end
+    end
+
+    def to_h : Hash(String, String)
+      res = Hash(String, String).new
+      @csv.headers.each_with_index do |h, idx|
+        val = self[idx]? || ""
+        res[h] = val
+      end
+      res
+    end
+
+    def values_at(*columns : Int32) : Array(String)
+      res = [] of String
+      i = 0
+      while i < columns.size
+        res << self[columns[i]]
+        i = i + 1
+      end
+      res
+    end
+
+    def values_at(*headers : String) : Array(String)
+      res = [] of String
+      i = 0
+      while i < headers.size
+        res << self[headers[i]]
+        i = i + 1
+      end
+      res
+    end
+
+    def values_at(columns : Array(Int32)) : Array(String)
+      res = [] of String
+      columns.each { |c| res << self[c] }
+      res
+    end
+
+    def values_at(headers : Array(String)) : Array(String)
+      res = [] of String
+      headers.each { |h| res << self[h] }
+      res
+    end
+
+    private def maybe_strip(val : String) : String
+      @csv.strip? ? val.strip : val
+    end
+  end
+end

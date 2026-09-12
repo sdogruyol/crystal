@@ -1,0 +1,77 @@
+# YAML standard library demonstration: parsing and emitting application configuration.
+#
+#   ./bin/iyi run samples/iyi/std_yaml.iyi
+#
+# Reads a production-grade application configuration:
+# server settings, database connection pool, logging levels,
+# feature flags, environment variables, tags, and anchor-merged templates.
+
+import std/yaml
+using std/yaml::{YAML, Any}
+
+config_source = "
+# Production service configuration
+service:
+  name: billing-worker
+  environment: production
+  country: NO           # Demonstrates YAML 1.2 Core: 'NO' is a String, not boolean!
+  version: 2.4.1        # Version scalar is a String, not a float
+
+server:
+  host: 0.0.0.0
+  port: 8443
+  tls: true
+  workers: 8
+  timeout_seconds: 30
+
+database_defaults: &db_base
+  adapter: postgresql
+  host: db.internal.local
+  pool: 10
+  timeout_ms: 5000
+
+databases:
+  primary:
+    <<: *db_base
+    database: billing_prod
+    pool: 25
+  replica:
+    <<: *db_base
+    database: billing_replica
+    read_only: true
+
+queues:
+  - name: inbound_events
+    max_concurrency: 16
+  - name: payment_processing
+    max_concurrency: 32
+
+features:
+  audit_logging: true
+  beta_portal: false
+  webhook_retry: on     # Demonstrates YAML 1.2: 'on' is String, not boolean
+"
+
+puts "== Parsing Application Configuration =="
+config = YAML.parse(config_source)
+
+puts "Service: #{config["service"]["name"].as_s} (v#{config["service"]["version"].as_s})"
+puts "Country code: #{config["service"]["country"].as_s}"
+puts "Server listening: #{config["server"]["host"].as_s}:#{config["server"]["port"].as_i} (TLS: #{config["server"]["tls"].as_bool})"
+puts "Primary DB: #{config["databases"]["primary"]["database"].as_s} (pool size: #{config["databases"]["primary"]["pool"].as_i})"
+puts "Replica DB: #{config["databases"]["replica"]["database"].as_s} (pool size: #{config["databases"]["replica"]["pool"].as_i})"
+puts "Primary inherited host: #{config["databases"]["primary"]["host"].as_s}"
+
+puts "Queues configured: #{config["queues"].size}"
+config["queues"].as_a.each do |q|
+  puts "  - #{q["name"].as_s} (concurrency: #{q["max_concurrency"].as_i})"
+end
+
+puts "Features:"
+puts "  audit_logging: #{config["features"]["audit_logging"].as_bool}"
+puts "  webhook_retry: '#{config["features"]["webhook_retry"].as_s}'"
+
+puts
+puts "== Re-emitting Configuration as YAML =="
+dumped = YAML.dump(config)
+puts dumped

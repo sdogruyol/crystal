@@ -1,0 +1,190 @@
+# Datagram sockets: UDP standard library runtime verification exercise.
+#
+#   ./bin/iyi run bench/std_udp_exercise.iyi
+#   ./bin/iyi run bench/std_udp_exercise.iyi -- timeout
+#   ./bin/iyi run bench/std_udp_exercise.iyi -- would_block
+#
+# Exercised rather than asserted:
+# 1. loopback round trip on IPv4 with ephemeral port (port 0): client to server, server to client
+# 2. receive_from with caller buffer and Datagram struct with payload text decoder
+# 3. receive buffer and send buffer size configuration (SO_RCVBUF, SO_SNDBUF)
+# 4. non-blocking receive: returns nil when empty, raises on would block
+# 5. receive timeout (read_timeout=): returns nil when empty, raises on timeout
+# 6. poll_read on empty socket (false) and when datagram arrives (true)
+# 7. datagram truncation when payload exceeds receive buffer (remainder dropped by OS)
+# 8. send to closed port (completes without error, UDP is connectionless)
+# 9. connected socket mode (connect, send, receive)
+# 10. IPv6 loopback round trip on [::1] with ephemeral port
+
+import std/udp
+using std/udp::{UdpSocket, Datagram, Bytes}
+
+def bytes_to_s(b : Bytes) : String
+  String.new(b.size) do |dst|
+    dst.copy_from(b.to_unsafe, b.size)
+  end
+end
+
+args = Program.args
+if args.size > 0 && args[0] == "timeout"
+  s = UdpSocket.bind("127.0.0.1", 0)
+  s.read_timeout = 50 # 50 ms
+  # Must raise "receive timed out" and exit non-zero
+  s.receive_from(1024)
+  __iyi_exit(0)
+end
+
+if args.size > 0 && args[0] == "would_block"
+  s = UdpSocket.bind("127.0.0.1", 0)
+  s.non_blocking = true
+  # Must raise "receive would block" and exit non-zero
+  s.receive_from(1024)
+  __iyi_exit(0)
+end
+
+# 1. Ephemeral port bind and IPv4 round-trip
+server = UdpSocket.bind("127.0.0.1", 0)
+s_port = server.local_port
+raise "round_trip: server port must be positive" if s_port <= 0
+raise "round_trip: server address must be 127.0.0.1" if server.local_address != "127.0.0.1"
+
+client = UdpSocket.client
+raise "round_trip: client socket is closed" if client.closed?
+
+# Ping from client to server
+sent = client.send_to("ping-from-client", "127.0.0.1", s_port)
+raise "round_trip: client sent bytes mismatch" if sent != 16
+
+# Server receives from client
+payload, peer_host, peer_port = server.receive_from(1024)
+raise "round_trip: peer host mismatch: #{peer_host}" if peer_host != "127.0.0.1"
+raise "round_trip: peer port must be positive" if peer_port <= 0
+msg = bytes_to_s(payload)
+raise "round_trip: payload mismatch: #{msg}" if msg != "ping-from-client"
+
+# Pong from server back to client
+sent2 = server.send_to("pong-from-server", peer_host, peer_port)
+raise "round_trip: server sent bytes mismatch" if sent2 != 16
+
+# Client receives reply
+payload2, s_host, s_reply_port = client.receive_from(1024)
+raise "round_trip: server reply host mismatch" if s_host != "127.0.0.1"
+raise "round_trip: server reply port mismatch" if s_reply_port != s_port
+msg2 = bytes_to_s(payload2)
+raise "round_trip: reply payload mismatch: #{msg2}" if msg2 != "pong-from-server"
+puts "round_trip: ok"
+
+# 2. Datagram struct and caller buffer
+client.send_to("slice-datagram-test", "127.0.0.1", s_port)
+buf = Bytes.new(64, 0_u8)
+slice_res, from_h, from_p = server.receive_from(buf)
+slice_msg = bytes_to_s(slice_res)
+raise "datagram_struct: caller buffer mismatch: #{slice_msg}" if slice_msg != "slice-datagram-test"
+
+client.send_to("datagram-struct-test", "127.0.0.1", s_port)
+dgram = server.receive_datagram(1024)
+d_msg = dgram.text
+raise "datagram_struct: struct text mismatch: #{d_msg}" if d_msg != "datagram-struct-test"
+raise "datagram_struct: host mismatch" if dgram.host != "127.0.0.1"
+raise "datagram_struct: port mismatch" if dgram.port != peer_port
+puts "datagram_struct: ok"
+
+# 3. Buffer sizes configuration
+server.receive_buffer_size = 65536
+raise "buffer_sizes: receive buffer size not set" if server.receive_buffer_size <= 0
+
+server.send_buffer_size = 65536
+raise "buffer_sizes: send buffer size not set" if server.send_buffer_size <= 0
+puts "buffer_sizes: ok"
+
+# 4. Non-blocking mode
+server.non_blocking = true
+raise "non_blocking: flag not set" unless server.non_blocking?
+nb_res = server.receive_from?(1024)
+raise "non_blocking: expected nil on empty receive" unless nb_res.nil?
+
+nb_dgram = server.receive_datagram?(1024)
+raise "non_blocking: expected nil on empty receive_datagram" unless nb_dgram.nil?
+server.non_blocking = false
+puts "non_blocking: ok"
+
+# 5. Receive timeout mode
+server.read_timeout = 50 # 50 ms
+t_res = server.receive_from?(1024)
+raise "timeout_mode: expected nil on timed out receive_from?" unless t_res.nil?
+
+t_dgram = server.receive_datagram?(1024)
+raise "timeout_mode: expected nil on timed out receive_datagram?" unless t_dgram.nil?
+server.read_timeout = 0
+puts "timeout_mode: ok"
+
+# 6. Polling (poll_read)
+p_empty = server.poll_read(20) # 20 ms
+raise "poll_read: expected false on empty socket" if p_empty
+
+client.send_to("poll-test-packet", "127.0.0.1", s_port)
+p_ready = server.poll_read(50) # 50 ms
+raise "poll_read: expected true with packet waiting" unless p_ready
+
+drain_data, _, _ = server.receive_from(1024)
+raise "poll_read: drained packet mismatch" if bytes_to_s(drain_data) != "poll-test-packet"
+puts "poll_read: ok"
+
+# 7. Datagram truncation
+client.send_to("0123456789ABCDEF0123456789ABCDEF", "127.0.0.1", s_port) # 32 bytes
+trunc_payload, _, _ = server.receive_from(10)                           # buffer size 10
+raise "truncation: size mismatch #{trunc_payload.size}" if trunc_payload.size != 10
+trunc_str = bytes_to_s(trunc_payload)
+raise "truncation: content mismatch #{trunc_str}" if trunc_str != "0123456789"
+puts "truncation: ok"
+
+# 8. Send to closed port
+probe = UdpSocket.bind(0)
+closed_port = probe.local_port
+probe.close
+raise "closed_port_send: probe close failed" unless probe.closed?
+
+sent_closed = client.send_to("packet to nowhere", "127.0.0.1", closed_port)
+raise "closed_port_send: send to closed port failed" if sent_closed != 17
+puts "closed_port_send: ok"
+
+# 9. Connected socket mode
+c_conn = UdpSocket.client
+c_conn.connect("127.0.0.1", s_port)
+c_conn.send("connected-hello")
+c_recv, _, _ = server.receive_from(1024)
+raise "connected_mode: content mismatch" if bytes_to_s(c_recv) != "connected-hello"
+c_conn.close
+puts "connected_mode: ok"
+
+# 10. IPv6 loopback round-trip
+v6_server = UdpSocket.bind("::1", 0)
+v6_port = v6_server.local_port
+raise "ipv6_round_trip: v6 port must be positive" if v6_port <= 0
+raise "ipv6_round_trip: v6 address mismatch" if v6_server.local_address != "::1"
+
+v6_client = UdpSocket.client_v6
+v6_sent = v6_client.send_to("v6-ping", "::1", v6_port)
+raise "ipv6_round_trip: v6 sent bytes mismatch" if v6_sent != 7
+
+v6_payload, v6_peer_host, v6_peer_port = v6_server.receive_from(1024)
+v6_msg = bytes_to_s(v6_payload)
+raise "ipv6_round_trip: v6 message mismatch: #{v6_msg}" if v6_msg != "v6-ping"
+raise "ipv6_round_trip: v6 peer host mismatch" if v6_peer_host != "::1"
+raise "ipv6_round_trip: v6 peer port must be positive" if v6_peer_port <= 0
+
+v6_server.send_to("v6-pong", v6_peer_host, v6_peer_port)
+v6_reply, _, _ = v6_client.receive_from(1024)
+v6_reply_msg = bytes_to_s(v6_reply)
+raise "ipv6_round_trip: v6 reply mismatch: #{v6_reply_msg}" if v6_reply_msg != "v6-pong"
+
+v6_server.close
+v6_client.close
+puts "ipv6_round_trip: ok"
+
+server.close
+client.close
+raise "server close failed" unless server.closed?
+raise "client close failed" unless client.closed?
+
+puts "std_udp_exercise: all checks passed"

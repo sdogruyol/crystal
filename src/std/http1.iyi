@@ -1,0 +1,1681 @@
+# Standard HTTP/1.1 client, server, and wire protocol for iyi (RFC 9110 / RFC 9112).
+#
+# Provides:
+#   - Transport seam: abstract Transport with TcpTransport, MockTransport, TlsTransport (TLS 1.3)
+#   - BufferedTransportReader: streaming wire parser with strict RFC 9112 framing:
+#       * rejects bare LF where CRLF is required (RFC 9112 §2.2)
+#       * bounds request line length, header count, header section size, chunk size
+#       * 64-bit Content-Length bound check preventing 32-bit integer truncation wrap-around
+#       * rejects dual Content-Length and Transfer-Encoding (smuggling defense RFC 9112 §6.1)
+#       * rejects conflicting or duplicate Content-Length headers (smuggling defense)
+#       * rejects non-final or unsupported Transfer-Encoding (smuggling defense RFC 9112 §6.1)
+#       * rejects non-canonical chunk size strings (smuggling defense RFC 9112 §7.1)
+#       * rejects missing CRLF after chunk data (RFC 9112 §7.1)
+#       * rejects whitespace before header and trailer colons (smuggling defense RFC 9112 §5.1)
+#       * rejects obsolete line folding obs-fold in headers and trailers (RFC 9112 §5.2)
+#       * rejects forbidden trailer fields (Host, Content-Length, Transfer-Encoding, etc. RFC 9112 §7.1.2)
+#       * enforces mandatory single Host header on HTTP/1.1 requests (RFC 9112 §3.2)
+#       * prevents infinite hang on persistent connections lacking length delimiters (RFC 9112 §6.3 item 8)
+#       * handles empty body for CONNECT 2xx responses (RFC 9110 §6.4.1)
+#       * 100-continue exchange handling: server emits 100 Continue before body reading
+#   - Client: connection reuse, request write, response read, bounded redirects with
+#       cross-origin credential stripping (RFC 9110 §15.4), Content-Encoding decompression
+#       (gzip, deflate), socket timeouts, real TLS 1.3 over HTTPS
+#   - Server: concurrent accept loop, request parse, routing hook, keep-alive, pipelining,
+#       respects handler Connection: close, graceful shutdown closing active connections
+
+module std/http1
+
+import std/traits
+import std/slice
+import std/text
+import std/uri
+import std/http
+import std/compress
+import std/dns
+import std/socket
+import std/tls
+import std/base64
+
+using std/traits::{Cmp}
+using std/slice::{Slice, Bytes}
+using std/uri::{URI, Params}
+using std/http::{Headers, Status, Request, Response, HttpError, Cookies, Cookie, ServerResponse, ServerContext, Handler}
+using std/compress::{Gzip, Zlib, Inflate}
+using std/tls::{CertificateStore, Certificate}
+using std/socket::{IyiSocket, Socket, TCPSocket, TCPServer, UNIXSocket, UNIXServer, IPAddress, UNIXAddress, Address, Type}
+using std/base64::{Base64}
+pub alias TlsClient = Std::Tls::Client
+
+pub alias Headers = Std::Http::Headers
+pub alias Status = Std::Http::Status
+pub alias Request = Std::Http::Request
+pub alias Response = Std::Http::Response
+pub alias HttpError = Std::Http::HttpError
+pub alias Cookie = Std::Http::Cookie
+pub alias Cookies = Std::Http::Cookies
+pub alias ServerResponse = Std::Http::ServerResponse
+pub alias ServerContext = Std::Http::ServerContext
+pub alias Handler = Std::Http::Handler
+# Protocol limits matching RFC 9112 and std/http
+pub MAX_REQUEST_LINE_SIZE =     8192
+pub MAX_HEADER_COUNT      =      100
+pub MAX_HEADERS_SIZE      =    16384
+pub MAX_CHUNK_SIZE        = 16777216 # 16 MB
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+private def is_numeric_ipv4?(s : String) : Bool
+  dots = 0
+  i = 0
+  while i < s.bytesize
+    c = s[i]
+    if c == '.'
+      dots = dots + 1
+    elsif c < '0' || c > '9'
+      return false
+    end
+    i = i + 1
+  end
+  dots == 3
+end
+
+private def is_hex_digit?(b : UInt8) : Bool
+  (b >= 48_u8 && b <= 57_u8) || (b >= 97_u8 && b <= 102_u8) || (b >= 65_u8 && b <= 70_u8)
+end
+
+private def string_opt_eq(a : String?, b : String?) : Bool
+  if a.nil? && b.nil?
+    true
+  elsif a && b
+    a == b
+  else
+    false
+  end
+end
+
+pub def self.validate_no_crlf(str : String, field_name : String) : Nil | HttpError
+  i = 0
+  while i < str.bytesize
+    b = str.to_unsafe[i]
+    if b == 13_u8 || b == 10_u8
+      return HttpError.new("CRLF injection detected in " + field_name)
+    end
+    i = i + 1
+  end
+  nil
+end
+
+# ---------------------------------------------------------------------------
+# Transport Seam: Stream abstraction for TCP, Mock, and TLS
+# ---------------------------------------------------------------------------
+
+pub abstract class Transport
+  abstract def write(contents : String) : Int32
+  abstract def write(buffer : Pointer(UInt8), count : Int32) : Int32
+  abstract def read(max_bytes : Int32 = 4096) : String
+  abstract def close : Nil
+  abstract def closed? : Bool
+  abstract def local_port : Int32
+  abstract def local_address : String
+end
+
+# Plain TCP transport wrapping IyiSocket with timeout support
+pub class TcpTransport < Transport
+  @socket : IyiSocket
+  getter socket : IyiSocket
+
+  {% if flag?(:darwin) %}
+    SOL_SOCKET  = 0xffff_i32
+    SO_RCVTIMEO = 0x1006_i32
+    SO_SNDTIMEO = 0x1005_i32
+
+    def self.__set_sock_timeout(fd : Int32, ms : Int32) : Int32
+      sec = (ms // 1000).to_i64
+      usec = ((ms % 1000) * 1000).to_i32
+      tv = Pointer(UInt8).malloc(16_u64)
+      i = 0
+      while i < 16
+        tv[i] = 0_u8
+        i = i + 1
+      end
+      tv.as(Pointer(Int64)).value = sec
+      Pointer(Int32).new(tv.address + 8_u64).value = usec
+      IyiSocket::LibC.setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, tv.as(Void*), 16_u32)
+      IyiSocket::LibC.setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, tv.as(Void*), 16_u32)
+    end
+  {% elsif flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64)) %}
+    SOL_SOCKET  =  1_i32
+    SO_RCVTIMEO = 20_i32
+    SO_SNDTIMEO = 21_i32
+
+    def self.__set_sock_timeout(fd : Int32, ms : Int32) : Int32
+      sec = (ms // 1000).to_i64
+      usec = ((ms % 1000) * 1000).to_i64
+      tv = Pointer(UInt8).malloc(16_u64)
+      tv.as(Pointer(Int64)).value = sec
+      Pointer(Int64).new(tv.address + 8_u64).value = usec
+      IyiSocket.__sys5(IyiSocket::SYS_SETSOCKOPT, fd.to_i64, SOL_SOCKET.to_i64, SO_RCVTIMEO.to_i64, tv.address.to_i64, 16_i64)
+      IyiSocket.__sys5(IyiSocket::SYS_SETSOCKOPT, fd.to_i64, SOL_SOCKET.to_i64, SO_SNDTIMEO.to_i64, tv.address.to_i64, 16_i64).to_i32
+    end
+  {% else %}
+    def self.__set_sock_timeout(fd : Int32, ms : Int32) : Int32
+      0
+    end
+  {% end %}
+
+  def initialize(@socket : IyiSocket)
+  end
+
+  def self.connect(host : String, port : Int32, timeout_ms : Int32 = 0) : TcpTransport
+    ip_to_use = host
+    if host != "localhost" && !is_numeric_ipv4?(host)
+      resolver = Std::Dns::Resolver.new
+      addrs = resolver.resolve_a(host)
+      if addrs.empty?
+        raise "DNS resolution failed for " + host
+      end
+      ip_to_use = addrs[0]
+    end
+    sock = IyiSocket.connect(ip_to_use, port)
+    if timeout_ms > 0
+      __set_sock_timeout(sock.to_unsafe, timeout_ms)
+    end
+    TcpTransport.new(sock)
+  end
+
+  def timeout_ms=(ms : Int32) : Nil
+    if ms > 0
+      TcpTransport.__set_sock_timeout(@socket.to_unsafe, ms)
+    end
+  end
+
+  def write(contents : String) : Int32
+    @socket.write(contents)
+  end
+
+  def write(buffer : Pointer(UInt8), count : Int32) : Int32
+    @socket.write(buffer, count)
+  end
+
+  def read(max_bytes : Int32 = 4096) : String
+    @socket.read(max_bytes)
+  end
+
+  def close : Nil
+    @socket.close
+  end
+
+  def closed? : Bool
+    @socket.closed?
+  end
+
+  def local_port : Int32
+    @socket.local_port
+  end
+
+  def local_address : String
+    @socket.local_address
+  end
+end
+
+# Plain UNIX domain socket transport wrapping UNIXSocket
+pub class UnixTransport < Transport
+  @socket : UNIXSocket
+  getter socket : UNIXSocket
+  @path : String
+  getter path : String
+
+  def initialize(@path : String)
+    @socket = UNIXSocket.new(@path)
+  end
+
+  def initialize(@socket : UNIXSocket, @path : String = "")
+  end
+
+  def write(contents : String) : Int32
+    @socket.write(contents)
+  end
+
+  def write(buffer : Pointer(UInt8), count : Int32) : Int32
+    @socket.write(buffer, count)
+  end
+
+  def read(max_bytes : Int32 = 4096) : String
+    @socket.read(max_bytes)
+  end
+
+  def close : Nil
+    @socket.close
+  end
+
+  def closed? : Bool
+    @socket.closed?
+  end
+
+  def local_port : Int32
+    0
+  end
+
+  def local_address : String
+    @path
+  end
+end
+
+# In-memory mock transport for deterministic testing without sockets
+pub class MockTransport < Transport
+  property in_buffer : String
+  property out_buffer : String
+  property closed : Bool
+  property read_chunk_size : Int32
+
+  def initialize(@in_buffer : String = "", @read_chunk_size : Int32 = 4096)
+    @out_buffer = ""
+    @closed = false
+  end
+
+  def write(contents : String) : Int32
+    raise "cannot write to closed transport" if @closed
+    @out_buffer = @out_buffer + contents
+    contents.bytesize
+  end
+
+  def write(buffer : Pointer(UInt8), count : Int32) : Int32
+    raise "cannot write to closed transport" if @closed
+    s = String.new(count) { |b| b.copy_from(buffer, count) }
+    @out_buffer = @out_buffer + s
+    count
+  end
+
+  def read(max_bytes : Int32 = 4096) : String
+    return "" if @closed || @in_buffer.empty?
+    limit = max_bytes < @read_chunk_size ? max_bytes : @read_chunk_size
+    take = limit < @in_buffer.bytesize ? limit : @in_buffer.bytesize
+    chunk = @in_buffer[0, take]
+    @in_buffer = @in_buffer[take, @in_buffer.bytesize - take]
+    chunk
+  end
+
+  def close : Nil
+    @closed = true
+  end
+
+  def closed? : Bool
+    @closed
+  end
+
+  def local_port : Int32
+    8080
+  end
+
+  def local_address : String
+    "127.0.0.1"
+  end
+end
+
+# Real TLS 1.3 Transport wrapping Std::Tls::Client
+pub class TlsTransport < Transport
+  @tls : Std::Tls::Client
+  getter tls : Std::Tls::Client
+
+  def initialize(@tls : Std::Tls::Client)
+  end
+
+  def self.connect(
+    host : String,
+    port : Int32 = 443,
+    alpn : Array(String) = ["http/1.1"],
+    verify_peer : Bool = true,
+    ca_store : Std::Tls::CertificateStore? = nil,
+  ) : TlsTransport
+    client = Std::Tls::Client.connect(
+      host: host,
+      port: port,
+      alpn: alpn,
+      verify_peer: verify_peer,
+      ca_store: ca_store,
+    )
+    TlsTransport.new(client)
+  end
+
+  def timeout_ms=(ms : Int32) : Nil
+    TcpTransport.__set_sock_timeout(@tls.socket.to_unsafe, ms) if ms > 0
+  end
+
+  def write(contents : String) : Int32
+    @tls.write(contents)
+    contents.bytesize
+  end
+
+  def write(buffer : Pointer(UInt8), count : Int32) : Int32
+    s = String.new(count) { |b| b.copy_from(buffer, count) }
+    @tls.write(s)
+    count
+  end
+
+  def read(max_bytes : Int32 = 4096) : String
+    @tls.read_string(max_bytes)
+  end
+
+  def close : Nil
+    @tls.close
+  end
+
+  def closed? : Bool
+    @tls.closed?
+  end
+
+  def local_port : Int32
+    @tls.socket.local_port
+  end
+
+  def local_address : String
+    @tls.socket.local_address
+  end
+end
+
+# ---------------------------------------------------------------------------
+# BufferedTransportReader: Strict RFC 9112 Wire Reader
+# ---------------------------------------------------------------------------
+
+pub class BufferedTransportReader
+  @transport : Transport
+  @buffer : String
+  @pos : Int32
+  @eof : Bool
+
+  def initialize(@transport : Transport)
+    @buffer = ""
+    @pos = 0
+    @eof = false
+  end
+
+  def buffer : String
+    if @pos > 0
+      @buffer[@pos, @buffer.bytesize - @pos]
+    else
+      @buffer
+    end
+  end
+
+  def eof? : Bool
+    @eof && @pos >= @buffer.bytesize
+  end
+
+  private def compact_buffer : Nil
+    if @pos > 8192
+      @buffer = @buffer[@pos, @buffer.bytesize - @pos]
+      @pos = 0
+    end
+  end
+
+  # Reads a single line ending in CRLF.
+  # Rejects bare LF where CRLF is required per RFC 9112 Section 2.2.
+  def read_line(max_len : Int32) : String | HttpError | Nil
+    while true
+      raw_ptr = @buffer.to_unsafe
+      len = @buffer.bytesize
+      nl_idx = -1
+      i = @pos
+      while i < len
+        if raw_ptr[i] == 10_u8 # '\n'
+          nl_idx = i
+          break
+        end
+        i = i + 1
+      end
+
+      if nl_idx >= 0
+        line_len = nl_idx - @pos
+        if line_len > max_len
+          return HttpError.new("Line exceeds maximum length limit")
+        end
+
+        # RFC 9112 Section 2.2: Line MUST end in CRLF. Bare LF is forbidden.
+        if nl_idx == @pos || raw_ptr[nl_idx - 1] != 13_u8 # not preceded by '\r'
+          return HttpError.new("Invalid line ending: bare LF not permitted where CRLF required")
+        end
+
+        line = @buffer[@pos, nl_idx - 1 - @pos]
+        @pos = nl_idx + 1
+        compact_buffer
+        return line
+      end
+
+      if (@buffer.bytesize - @pos) > max_len
+        return HttpError.new("Line exceeds maximum length limit")
+      end
+
+      if @eof
+        if @pos >= @buffer.bytesize
+          return nil
+        else
+          return HttpError.new("Incomplete message: unexpected EOF before line ending")
+        end
+      end
+
+      compact_buffer
+      chunk = @transport.read(4096)
+      if chunk.empty?
+        @eof = true
+      else
+        @buffer = @buffer + chunk
+      end
+    end
+  end
+
+  # Reads exact count of bytes from transport buffer.
+  def read_bytes(count : Int32) : String | HttpError
+    return "" if count == 0
+    return HttpError.new("Negative byte count") if count < 0
+
+    while (@buffer.bytesize - @pos) < count
+      if @eof
+        available = @buffer.bytesize - @pos
+        return HttpError.new("Incomplete body: expected " + count.to_s + " bytes but got " + available.to_s)
+      end
+      compact_buffer
+      chunk = @transport.read(4096)
+      if chunk.empty?
+        @eof = true
+      else
+        @buffer = @buffer + chunk
+      end
+    end
+
+    res = @buffer[@pos, count]
+    @pos = @pos + count
+    compact_buffer
+    res
+  end
+
+  # Reads all available data until transport EOF.
+  def read_to_eof : String
+    while !@eof
+      chunk = @transport.read(4096)
+      if chunk.empty?
+        @eof = true
+      else
+        @buffer = @buffer + chunk
+      end
+    end
+    res = @buffer[@pos, @buffer.bytesize - @pos]
+    @pos = @buffer.bytesize
+    res
+  end
+
+  # Reads chunked transfer body and trailers per RFC 9112 Section 7.1.
+  def read_chunked_body : Tuple(String, Headers) | HttpError
+    body_parts = [] of String
+    trailers = Headers.new
+
+    while true
+      size_line_res = read_line(1024)
+      case size_line_res
+      in HttpError then return size_line_res
+      in Nil       then return HttpError.new("Incomplete chunked body: unexpected EOF before chunk size")
+      in String
+        size_line = size_line_res
+
+        semi = size_line.index(';')
+        size_token = semi ? size_line[0, semi] : size_line
+
+        # Canonical hex validation: no spaces, non-empty, only 0-9a-fA-F
+        if size_token.empty?
+          return HttpError.new("Invalid chunk size: not valid hex")
+        end
+
+        k = 0
+        while k < size_token.bytesize
+          unless is_hex_digit?(size_token.to_unsafe[k])
+            return HttpError.new("Invalid chunk size: not valid hex")
+          end
+          k = k + 1
+        end
+
+        chunk_size_opt = size_token.to_i64?(16)
+        if chunk_size_opt.nil?
+          return HttpError.new("Invalid chunk size: not valid hex")
+        end
+        chunk_size = chunk_size_opt
+
+        if chunk_size < 0
+          return HttpError.new("Invalid chunk size: negative")
+        end
+        if chunk_size > MAX_CHUNK_SIZE.to_i64
+          return HttpError.new("Chunk size exceeds maximum allowed limit")
+        end
+
+        # Final zero chunk
+        if chunk_size == 0
+          while true
+            t_line_res = read_line(MAX_HEADERS_SIZE)
+            case t_line_res
+            in HttpError then return t_line_res
+            in Nil       then break
+            in String
+              t_line = t_line_res
+              break if t_line.empty?
+
+              # RFC 9112 §5.2: Reject obsolete line folding (obs-fold) in trailers
+              if t_line.starts_with?(' ') || t_line.starts_with?('\t')
+                return HttpError.new("Request smuggling: obsolete line folding in trailer rejected")
+              end
+
+              colon = t_line.index(':')
+              if colon.nil?
+                return HttpError.new("Invalid trailer line: missing colon")
+              end
+
+              # RFC 9112 §5.1: No whitespace between field name and colon
+              if colon > 0 && (t_line[colon - 1] == ' ' || t_line[colon - 1] == '\t')
+                return HttpError.new("Request smuggling: whitespace between header name and colon")
+              end
+
+              t_name = t_line[0, colon].strip
+              t_val = t_line[colon + 1, t_line.bytesize - colon - 1].strip
+
+              # RFC 9112 §7.1.2: Forbidden trailer fields
+              t_lower = t_name.downcase
+              if t_lower == "host" || t_lower == "content-length" ||
+                 t_lower == "transfer-encoding" || t_lower == "trailer" ||
+                 t_lower == "connection" || t_lower == "keep-alive" ||
+                 t_lower == "upgrade" || t_lower == "te"
+                return HttpError.new("Forbidden field in trailer: " + t_name)
+              end
+
+              add_t = trailers.add(t_name, t_val)
+              case add_t
+              in HttpError then return add_t
+              in Headers   then nil
+              end
+            end
+          end
+          return {body_parts.join(""), trailers}
+        end
+
+        # Non-zero chunk
+        chunk_data = read_bytes(chunk_size.to_i32)
+        case chunk_data
+        in HttpError then return chunk_data
+        in String    then body_parts << chunk_data
+        end
+
+        crlf = read_bytes(2)
+        case crlf
+        in HttpError then return crlf
+        in String
+          if crlf != "\r\n"
+            return HttpError.new("Invalid chunked encoding: missing CRLF after chunk data")
+          end
+        end
+      end
+    end
+  end
+
+  # Reads and parses an HTTP/1.1 request from the transport stream.
+  def read_request : Request | HttpError | Nil
+    req_line = ""
+    while true
+      line_res = read_line(MAX_REQUEST_LINE_SIZE)
+      case line_res
+      in HttpError
+        if line_res.message.includes?("Line exceeds maximum length")
+          return HttpError.new("Request line exceeds maximum length (" + MAX_REQUEST_LINE_SIZE.to_s + " bytes)")
+        end
+        return line_res
+      in Nil
+        return nil
+      in String
+        if !line_res.empty?
+          req_line = line_res
+          break
+        end
+      end
+    end
+
+    parts = req_line.split(' ')
+    if parts.size != 3
+      return HttpError.new("Invalid request line: expected method, target, version")
+    end
+
+    method = parts[0]
+    target = parts[1]
+    version = parts[2]
+
+    if method.empty?
+      return HttpError.new("Invalid request method: cannot be empty")
+    end
+    m_idx = 0
+    while m_idx < method.bytesize
+      mb = method.to_unsafe[m_idx]
+      if mb <= 32_u8 || mb >= 127_u8
+        return HttpError.new("Invalid request method: contains control or whitespace")
+      end
+      m_idx = m_idx + 1
+    end
+
+    if target.empty?
+      return HttpError.new("Invalid request target: cannot be empty")
+    end
+
+    headers = Headers.new
+    total_headers_size = 0
+    header_count = 0
+
+    has_host = false
+    has_cl = false
+    first_cl_val = ""
+    has_te = false
+
+    while true
+      h_res = read_line(MAX_HEADERS_SIZE)
+      case h_res
+      in HttpError
+        if h_res.message.includes?("Line exceeds maximum length")
+          return HttpError.new("Headers size exceeds maximum limit (" + MAX_HEADERS_SIZE.to_s + " bytes)")
+        end
+        return h_res
+      in Nil
+        return HttpError.new("Incomplete request: missing header end")
+      in String
+        line = h_res
+        break if line.empty?
+
+        total_headers_size = total_headers_size + line.bytesize + 2
+        if total_headers_size > MAX_HEADERS_SIZE
+          return HttpError.new("Headers size exceeds maximum limit (" + MAX_HEADERS_SIZE.to_s + " bytes)")
+        end
+
+        header_count = header_count + 1
+        if header_count > MAX_HEADER_COUNT
+          return HttpError.new("Header count exceeds maximum limit (" + MAX_HEADER_COUNT.to_s + ")")
+        end
+
+        # RFC 9112 §5.2: Reject obsolete line folding (obs-fold)
+        if line.starts_with?(' ') || line.starts_with?('\t')
+          return HttpError.new("Request smuggling: obsolete line folding (obs-fold) rejected")
+        end
+
+        colon = line.index(':')
+        if colon.nil?
+          return HttpError.new("Invalid header line: missing colon")
+        end
+
+        # RFC 9112 §5.1: No whitespace between header name and colon
+        if colon > 0 && (line[colon - 1] == ' ' || line[colon - 1] == '\t')
+          return HttpError.new("Request smuggling: whitespace between header name and colon")
+        end
+
+        h_name = line[0, colon]
+        h_val = line[colon + 1, line.bytesize - colon - 1].strip
+
+        err_n = Headers.validate_header_name(h_name)
+        return err_n if err_n
+
+        err_v = Headers.validate_header_value(h_val)
+        return err_v if err_v
+
+        lower_name = h_name.downcase
+        if lower_name == "host"
+          # RFC 9112 §3.2: Reject duplicate Host headers
+          if has_host
+            return HttpError.new("Request smuggling: duplicate Host headers")
+          end
+          has_host = true
+        elsif lower_name == "content-length"
+          if h_val.empty?
+            return HttpError.new("Invalid Content-Length: cannot be empty")
+          end
+          v_i = 0
+          while v_i < h_val.bytesize
+            vb = h_val.to_unsafe[v_i]
+            if vb < 48_u8 || vb > 57_u8
+              return HttpError.new("Invalid Content-Length: must be non-negative integer digits")
+            end
+            v_i = v_i + 1
+          end
+
+          if has_cl
+            if first_cl_val != h_val
+              return HttpError.new("Request smuggling: conflicting Content-Length values")
+            else
+              return HttpError.new("Request smuggling: duplicate Content-Length headers")
+            end
+          end
+          has_cl = true
+          first_cl_val = h_val
+        elsif lower_name == "transfer-encoding"
+          has_te = true
+        end
+
+        add_res = headers.add(h_name, h_val)
+        case add_res
+        in HttpError then return add_res
+        in Headers   then nil
+        end
+      end
+    end
+
+    # RFC 9112 §3.2: HTTP/1.1 request MUST have a Host header
+    if version == "HTTP/1.1" && !has_host
+      return HttpError.new("Missing Host header in HTTP/1.1 request")
+    end
+
+    # RFC 9112 §6.1: Reject dual Content-Length and Transfer-Encoding
+    if has_cl && has_te
+      return HttpError.new("Request smuggling: both Content-Length and Transfer-Encoding present")
+    end
+
+    # RFC 9112 §6.1: Validate Transfer-Encoding final coding
+    if has_te
+      te_vals = headers.get("Transfer-Encoding")
+      te_tokens = [] of String
+      te_vals.each do |val|
+        parts_te = val.split(',')
+        parts_te.each do |p|
+          trimmed = p.strip.downcase
+          te_tokens << trimmed unless trimmed.empty?
+        end
+      end
+
+      if te_tokens.empty? || te_tokens.last != "chunked"
+        return HttpError.new("Request smuggling: unsupported or non-final Transfer-Encoding")
+      end
+
+      chunked_count = 0
+      te_tokens.each do |tok|
+        chunked_count = chunked_count + 1 if tok == "chunked"
+      end
+      if chunked_count > 1
+        return HttpError.new("Request smuggling: duplicate chunked Transfer-Encoding")
+      end
+    end
+
+    # RFC 9110 §10.1.1: Emit 100 Continue before attempting to read request body
+    if headers.has_key?("Expect")
+      expect_val = headers["Expect"].strip.downcase
+      if expect_val == "100-continue"
+        @transport.write("HTTP/1.1 100 Continue\r\n\r\n")
+      else
+        return HttpError.new("Expectation Failed: unsupported Expect header value")
+      end
+    end
+
+    # Read Body
+    body = ""
+    trailers = Headers.new
+    if headers.includes_word?("Transfer-Encoding", "chunked")
+      chunked_res = read_chunked_body
+      case chunked_res
+      in HttpError then return chunked_res
+      in Tuple(String, Headers)
+        body = chunked_res[0]
+        trailers = chunked_res[1]
+      end
+    elsif headers.has_key?("Content-Length")
+      cl_str = headers["Content-Length"].strip
+      cl = cl_str.to_i64?
+      return HttpError.new("Invalid Content-Length") unless cl
+      return HttpError.new("Invalid Content-Length: negative value") if cl < 0
+
+      # RFC 9112 §6.3: Guard against 64-bit to 32-bit truncation wrap-around
+      if cl > MAX_CHUNK_SIZE.to_i64 || cl > 2147483647_i64
+        return HttpError.new("Content-Length exceeds maximum allowed limit")
+      end
+
+      body_res = read_bytes(cl.to_i32)
+      case body_res
+      in HttpError then return body_res
+      in String    then body = body_res
+      end
+    end
+
+    req = Request.new(method, target, headers, body, version)
+    # Safe trailer integration: only non-forbidden trailers added to request headers
+    trailers.each_pair do |t_k, t_v|
+      req.headers.add(t_k, t_v)
+    end
+    req
+  end
+
+  # Reads and parses an HTTP/1.1 response from the transport stream.
+  def read_response(req_method : String = "GET") : Response | HttpError
+    status_line = ""
+    while true
+      line_res = read_line(MAX_REQUEST_LINE_SIZE)
+      case line_res
+      in HttpError
+        if line_res.message.includes?("Line exceeds maximum length")
+          return HttpError.new("Headers size exceeds maximum limit (" + MAX_HEADERS_SIZE.to_s + " bytes)")
+        end
+        return line_res
+      in Nil
+        return HttpError.new("Incomplete response: unexpected EOF before status line")
+      in String
+        if !line_res.empty?
+          status_line = line_res
+          break
+        end
+      end
+    end
+
+    parts = status_line.split(' ', 3)
+    if parts.size < 2
+      return HttpError.new("Invalid status line: expected version and status code")
+    end
+
+    version = parts[0]
+    code_int = parts[1].to_i?
+    return HttpError.new("Invalid HTTP status code: " + parts[1]) unless code_int
+    if code_int < 100 || code_int > 999
+      return HttpError.new("Invalid HTTP status code out of range: " + parts[1])
+    end
+
+    status = Status.new(code_int)
+    message = parts.size >= 3 ? parts[2] : status.description
+
+    headers = Headers.new
+    total_headers_size = 0
+    header_count = 0
+
+    has_cl = false
+    first_cl_val = ""
+    has_te = false
+
+    while true
+      h_res = read_line(MAX_HEADERS_SIZE)
+      case h_res
+      in HttpError
+        if h_res.message.includes?("Line exceeds maximum length")
+          return HttpError.new("Headers size exceeds maximum limit (" + MAX_HEADERS_SIZE.to_s + " bytes)")
+        end
+        return h_res
+      in Nil
+        return HttpError.new("Incomplete response: missing header end")
+      in String
+        line = h_res
+        break if line.empty?
+
+        total_headers_size = total_headers_size + line.bytesize + 2
+        if total_headers_size > MAX_HEADERS_SIZE
+          return HttpError.new("Headers size exceeds maximum limit (" + MAX_HEADERS_SIZE.to_s + " bytes)")
+        end
+
+        header_count = header_count + 1
+        if header_count > MAX_HEADER_COUNT
+          return HttpError.new("Header count exceeds maximum limit (" + MAX_HEADER_COUNT.to_s + ")")
+        end
+
+        if line.starts_with?(' ') || line.starts_with?('\t')
+          return HttpError.new("Request smuggling: obsolete line folding (obs-fold) rejected")
+        end
+
+        colon = line.index(':')
+        if colon.nil?
+          return HttpError.new("Invalid header line: missing colon")
+        end
+
+        if colon > 0 && (line[colon - 1] == ' ' || line[colon - 1] == '\t')
+          return HttpError.new("Request smuggling: whitespace between header name and colon")
+        end
+
+        h_name = line[0, colon]
+        h_val = line[colon + 1, line.bytesize - colon - 1].strip
+
+        err_n = Headers.validate_header_name(h_name)
+        return err_n if err_n
+
+        err_v = Headers.validate_header_value(h_val)
+        return err_v if err_v
+
+        lower_name = h_name.downcase
+        if lower_name == "content-length"
+          if h_val.empty?
+            return HttpError.new("Invalid Content-Length: cannot be empty")
+          end
+          v_i = 0
+          while v_i < h_val.bytesize
+            vb = h_val.to_unsafe[v_i]
+            if vb < 48_u8 || vb > 57_u8
+              return HttpError.new("Invalid Content-Length: must be non-negative integer digits")
+            end
+            v_i = v_i + 1
+          end
+
+          if has_cl
+            if first_cl_val != h_val
+              return HttpError.new("Request smuggling: conflicting Content-Length values")
+            else
+              return HttpError.new("Request smuggling: duplicate Content-Length headers")
+            end
+          end
+          has_cl = true
+          first_cl_val = h_val
+        elsif lower_name == "transfer-encoding"
+          has_te = true
+        end
+
+        add_res = headers.add(h_name, h_val)
+        case add_res
+        in HttpError then return add_res
+        in Headers   then nil
+        end
+      end
+    end
+
+    if has_cl && has_te
+      return HttpError.new("Request smuggling: both Content-Length and Transfer-Encoding present")
+    end
+
+    # Return 100 Continue immediately without reading body
+    if status.code == 100
+      return Response.new(status, headers, "", message, version)
+    end
+
+    # Read Body per RFC 9110 §6.4.1 & RFC 9112 §6.3
+    body = ""
+    trailers = Headers.new
+
+    if req_method == "HEAD" || status.code == 204 || status.code == 304 || status.informational? ||
+       (req_method == "CONNECT" && status.success?)
+      # RFC 9110 §6.4.1: HEAD, 204, 304, 1xx, and 2xx CONNECT responses have no body
+      body = ""
+    elsif headers.includes_word?("Transfer-Encoding", "chunked")
+      chunked_res = read_chunked_body
+      case chunked_res
+      in HttpError then return chunked_res
+      in Tuple(String, Headers)
+        body = chunked_res[0]
+        trailers = chunked_res[1]
+      end
+    elsif headers.has_key?("Content-Length")
+      cl_str = headers["Content-Length"].strip
+      cl = cl_str.to_i64?
+      return HttpError.new("Invalid Content-Length") unless cl
+      return HttpError.new("Invalid Content-Length: negative value") if cl < 0
+      if cl > MAX_CHUNK_SIZE.to_i64 || cl > 2147483647_i64
+        return HttpError.new("Content-Length exceeds maximum allowed limit")
+      end
+
+      body_res = read_bytes(cl.to_i32)
+      case body_res
+      in HttpError then return body_res
+      in String    then body = body_res
+      end
+    else
+      # RFC 9112 §6.3 item 8: Response without Content-Length or chunked on persistent connection is invalid
+      if headers.includes_word?("Connection", "close") || version == "HTTP/1.0"
+        body = read_to_eof
+      else
+        return HttpError.new("Invalid response framing: missing Content-Length or Transfer-Encoding on persistent connection")
+      end
+    end
+
+    resp = Response.new(status, headers, body, message, version)
+    resp.trailers = trailers unless trailers.empty?
+    resp
+  end
+end
+
+# ---------------------------------------------------------------------------
+# Strict Wire Parsing Shortcuts
+# ---------------------------------------------------------------------------
+
+pub def self.parse_request(raw : String) : Request | HttpError
+  reader = BufferedTransportReader.new(MockTransport.new(raw))
+  req = reader.read_request
+  case req
+  in HttpError then req
+  in Nil       then HttpError.new("Empty request")
+  in Request   then req
+  end
+end
+
+pub def self.parse_response(raw : String, req_method : String = "GET") : Response | HttpError
+  reader = BufferedTransportReader.new(MockTransport.new(raw))
+  reader.read_response(req_method)
+end
+
+# ---------------------------------------------------------------------------
+# Client: HTTP/1.1 Client with Connection Reuse, Redirects, Compression, TLS
+# ---------------------------------------------------------------------------
+
+pub class Client
+  property default_headers : Headers
+  property max_redirects : Int32
+  property timeout_ms : Int32
+  property verify_peer : Bool
+  property transport : Transport?
+  property before_request_handler : Proc(Request, Nil)?
+
+  @active_transport : Transport?
+  @active_reader : BufferedTransportReader?
+  @active_origin : String?
+
+  def before_request(&block : Request -> Nil) : Nil
+    @before_request_handler = block
+  end
+
+  def basic_auth(username : String, password : String) : Nil
+    token = Base64.encode(username + ":" + password)
+    @default_headers["Authorization"] = "Basic " + token
+  end
+
+  def self.unix(path : String) : Client
+    Client.new(transport: UnixTransport.new(path))
+  end
+
+  def initialize(@max_redirects : Int32 = 10,
+                 @timeout_ms : Int32 = 10000,
+                 @verify_peer : Bool = true,
+                 @transport : Transport? = nil)
+    @default_headers = Headers.new
+    @default_headers["User-Agent"] = "iyi-http1/1.0"
+    @default_headers["Accept"] = "*/*"
+    @default_headers["Accept-Encoding"] = "gzip, deflate"
+    @active_transport = nil
+    @active_reader = nil
+    @active_origin = nil
+  end
+
+  def close : Nil
+    if trans = @active_transport
+      trans.close unless trans.closed?
+    end
+    @active_transport = nil
+    @active_reader = nil
+    @active_origin = nil
+  end
+
+  # Executes an HTTP request with bounded redirect handling and decompression.
+  def execute(req : Request, url : String? = nil, max_redirects : Int32 = 10) : Response
+    current_url = url || req.target
+    uri = URI.parse(current_url)
+
+    # Set Host header if not already set
+    host_header = uri.host || "127.0.0.1"
+    if p = uri.port
+      if (uri.scheme == "http" && p != 80) || (uri.scheme == "https" && p != 443)
+        host_header = host_header + ":" + p.to_s
+      end
+    end
+    req.headers["Host"] = host_header unless req.headers.has_key?("Host")
+
+    # Set default headers if not present
+    @default_headers.each_pair do |name, val|
+      unless req.headers.has_key?(name)
+        req.headers.add(name, val)
+      end
+    end
+
+    # Determine request target path & query
+    target = uri.path.empty? ? "/" : uri.path
+    if q = uri.query
+      target = target + "?" + q
+    end
+    req.target = target
+
+    # Connection management: reuse connection if origin matches
+    origin = (uri.scheme || "http") + "://" + host_header
+    trans : Transport? = nil
+    reader : BufferedTransportReader? = nil
+    owns_transport = false
+
+    if hook = @before_request_handler
+      hook.call(req)
+    end
+
+    if user_trans = @transport
+      trans = user_trans
+      if @active_reader.nil?
+        @active_reader = BufferedTransportReader.new(user_trans)
+      end
+      reader = @active_reader
+    elsif (ao = @active_origin) && ao == origin && (cur_t = @active_transport) && !cur_t.closed?
+      trans = cur_t
+      reader = @active_reader
+    else
+      # Close previous connection if origin changed
+      close
+      port = uri.port || (uri.scheme == "https" ? 443 : 80)
+      host = uri.host || "127.0.0.1"
+
+      if uri.scheme == "https"
+        trans = TlsTransport.connect(host, port, alpn: ["http/1.1"], verify_peer: @verify_peer)
+      elsif uri.scheme == "http" || uri.scheme.nil?
+        trans = TcpTransport.connect(host, port, @timeout_ms)
+      else
+        raise "unsupported URI scheme: " + uri.scheme.to_s
+      end
+
+      owns_transport = true
+      reader = BufferedTransportReader.new(trans)
+      @active_transport = trans
+      @active_reader = reader
+      @active_origin = origin
+    end
+
+    begin
+      active_r = reader.as(BufferedTransportReader)
+      active_t = trans.as(Transport)
+
+      # 100-Continue handling: if Expect: 100-continue is set, send headers first
+      if req.headers["Expect"]? == "100-continue"
+        hdr_parts = [] of String
+        hdr_parts << (req.method + " " + req.target + " " + req.version + "\r\n")
+        h = req.headers.dup
+        if req.chunked?
+          h["Transfer-Encoding"] = "chunked"
+          h.delete("Content-Length")
+        elsif req.body.bytesize > 0 && !h.has_key?("Content-Length")
+          h["Content-Length"] = req.body.bytesize.to_s
+        end
+        ser_h = h.serialize
+        case ser_h
+        in HttpError then raise ser_h.message
+        in String    then hdr_parts << ser_h
+        end
+        hdr_parts << "\r\n"
+        active_t.write(hdr_parts.join(""))
+
+        # Wait for 100 Continue
+        resp100 = active_r.read_response(req.method)
+        case resp100
+        in HttpError then raise resp100.message
+        in Response
+          if resp100.status.code == 100
+            # Send body
+            if req.chunked?
+              if req.body.bytesize > 0
+                hex_len = req.body.bytesize.to_i64.to_s(16)
+                active_t.write(hex_len + "\r\n" + req.body + "\r\n")
+              end
+              active_t.write("0\r\n\r\n")
+            else
+              active_t.write(req.body)
+            end
+          else
+            return resp100
+          end
+        end
+      else
+        ser = req.serialize(chunked: req.chunked?)
+        case ser
+        in HttpError then raise ser.message
+        in String    then active_t.write(ser)
+        end
+      end
+
+      final_resp = active_r.read_response(req.method)
+      case final_resp
+      in HttpError then raise final_resp.message
+      in Response
+        decompress_response(final_resp)
+
+        # Connection closure management
+        if final_resp.headers.includes_word?("Connection", "close") || req.headers.includes_word?("Connection", "close")
+          close
+        end
+
+        # Handle Redirects (301, 302, 303, 307, 308)
+        if final_resp.status.redirection? && final_resp.headers.has_key?("Location")
+          loc = final_resp.headers["Location"]
+          if max_redirects <= 0
+            raise "Too many redirects: exceeded limit"
+          end
+
+          new_uri = uri.resolve(loc)
+          new_method = req.method
+          new_body = req.body
+          new_headers = req.headers.dup
+
+          # Ensure Host header is regenerated for the new URI target
+          new_headers.delete("Host")
+
+          # RFC 9110 §15.4: Strip credentials on cross-origin redirect
+          origin_changed = !string_opt_eq(new_uri.host, uri.host) || (new_uri.port != uri.port) || !string_opt_eq(new_uri.scheme, uri.scheme)
+          if origin_changed
+            new_headers.delete("Authorization")
+            new_headers.delete("Proxy-Authorization")
+            new_headers.delete("Cookie")
+          end
+
+          if final_resp.status.code == 303 || ((final_resp.status.code == 301 || final_resp.status.code == 302) && req.method == "POST")
+            new_method = "GET"
+            new_body = ""
+            new_headers.delete("Content-Length")
+            new_headers.delete("Content-Type")
+          end
+
+          new_req = Request.new(new_method, new_uri.to_s, new_headers, new_body, req.version)
+          return execute(new_req, new_uri.to_s, max_redirects - 1)
+        end
+
+        return final_resp
+      end
+    end
+  end
+
+  private def decompress_response(resp : Response) : Nil
+    return if resp.body.empty?
+    enc = resp.headers["Content-Encoding"]?
+    return if enc.nil?
+
+    lower_enc = enc.strip.downcase
+    if lower_enc == "gzip"
+      in_bytes = Bytes.new(resp.body.to_unsafe, resp.body.bytesize, read_only: true)
+      out_bytes = Gzip.decompress(in_bytes)
+      resp.body = String.new(out_bytes.size) { |b| b.copy_from(out_bytes.to_unsafe, out_bytes.size) }
+      resp.headers.delete("Content-Encoding")
+      resp.headers["Content-Length"] = resp.body.bytesize.to_s
+    elsif lower_enc == "deflate"
+      in_bytes = Bytes.new(resp.body.to_unsafe, resp.body.bytesize, read_only: true)
+      out_bytes = Zlib.decompress(in_bytes)
+      resp.body = String.new(out_bytes.size) { |b| b.copy_from(out_bytes.to_unsafe, out_bytes.size) }
+      resp.headers.delete("Content-Encoding")
+      resp.headers["Content-Length"] = resp.body.bytesize.to_s
+    end
+  end
+
+  def get(url : String, headers : Headers? = nil) : Response
+    req = Request.new("GET", url, headers)
+    execute(req, url, @max_redirects)
+  end
+
+  def post(url : String, body : String = "", headers : Headers? = nil) : Response
+    req = Request.new("POST", url, headers, body)
+    execute(req, url, @max_redirects)
+  end
+
+  def put(url : String, body : String = "", headers : Headers? = nil) : Response
+    req = Request.new("PUT", url, headers, body)
+    execute(req, url, @max_redirects)
+  end
+
+  def delete(url : String, headers : Headers? = nil) : Response
+    req = Request.new("DELETE", url, headers)
+    execute(req, url, @max_redirects)
+  end
+
+  def head(url : String, headers : Headers? = nil) : Response
+    req = Request.new("HEAD", url, headers)
+    execute(req, url, @max_redirects)
+  end
+
+  def self.get(url : String, headers : Headers? = nil, transport : Transport? = nil) : Response
+    client = Client.new(transport: transport)
+    client.get(url, headers)
+  end
+
+  def self.post(url : String, body : String = "", headers : Headers? = nil, transport : Transport? = nil) : Response
+    client = Client.new(transport: transport)
+    client.post(url, body, headers)
+  end
+end
+
+# ---------------------------------------------------------------------------
+# Server: HTTP/1.1 Server with Routing Hook, Keep-Alive, Pipelining
+# ---------------------------------------------------------------------------
+
+pub class Server
+  property host : String
+  property port : Int32
+  property handler : Proc(Request, Response)?
+  property context_handler : Proc(ServerContext, Nil)?
+  property handlers : Array(Handler)?
+  @socket : IyiSocket?
+  @unix_server : UNIXServer?
+  @addresses : Array(Address)
+  @stopped : Bool
+  @active_transports : Array(Transport)
+  {% if (flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64))) || (flag?(:darwin) && flag?(:aarch64)) || (flag?(:win32) && flag?(:x86_64)) %}
+    @conn_chan : Channel(IyiSocket)?
+    @group : IyiGroup?
+  {% end %}
+
+  def initialize(@host : String = "127.0.0.1", @port : Int32 = 0, &handler : Request -> Response)
+    @handler = handler
+    @context_handler = nil
+    @handlers = nil
+    @socket = nil
+    @unix_server = nil
+    @addresses = [] of Address
+    @stopped = false
+    @active_transports = [] of Transport
+    {% if (flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64))) || (flag?(:darwin) && flag?(:aarch64)) || (flag?(:win32) && flag?(:x86_64)) %}
+      @conn_chan = nil
+      @group = nil
+    {% end %}
+  end
+
+  def initialize(@host : String = "127.0.0.1", @port : Int32 = 0)
+    @handler = nil
+    @context_handler = nil
+    @handlers = nil
+    @socket = nil
+    @unix_server = nil
+    @addresses = [] of Address
+    @stopped = false
+    @active_transports = [] of Transport
+    {% if (flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64))) || (flag?(:darwin) && flag?(:aarch64)) || (flag?(:win32) && flag?(:x86_64)) %}
+      @conn_chan = nil
+      @group = nil
+    {% end %}
+  end
+
+  def initialize(@handlers : Array(Handler))
+    @handler = nil
+    @context_handler = nil
+    @socket = nil
+    @unix_server = nil
+    @addresses = [] of Address
+    @stopped = false
+    @active_transports = [] of Transport
+    @host = "127.0.0.1"
+    @port = 0
+    {% if (flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64))) || (flag?(:darwin) && flag?(:aarch64)) || (flag?(:win32) && flag?(:x86_64)) %}
+      @conn_chan = nil
+      @group = nil
+    {% end %}
+  end
+
+  def initialize(handler : Handler)
+    @handler = nil
+    @context_handler = nil
+    @handlers = [handler] of Handler
+    @socket = nil
+    @unix_server = nil
+    @addresses = [] of Address
+    @stopped = false
+    @active_transports = [] of Transport
+    @host = "127.0.0.1"
+    @port = 0
+    {% if (flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64))) || (flag?(:darwin) && flag?(:aarch64)) || (flag?(:win32) && flag?(:x86_64)) %}
+      @conn_chan = nil
+      @group = nil
+    {% end %}
+  end
+
+  def stopped? : Bool
+    @stopped
+  end
+
+  def closed? : Bool
+    @stopped
+  end
+
+  def listening? : Bool
+    !@stopped && (@socket != nil || @unix_server != nil)
+  end
+
+  def bind_tcp(host : String, port : Int32, reuse_port : Bool = false) : IPAddress
+    @host = host
+    @port = port
+    sock = IyiSocket.listen(@host, @port)
+    @socket = sock
+    @port = sock.local_port
+    addr = IPAddress.new(@host, @port)
+    @addresses << addr
+    addr
+  end
+
+  def bind_tcp(port : Int32, reuse_port : Bool = false) : IPAddress
+    bind_tcp("0.0.0.0", port, reuse_port)
+  end
+
+  def bind_tcp(address : IPAddress, reuse_port : Bool = false) : IPAddress
+    bind_tcp(address.address, address.port, reuse_port)
+  end
+
+  def bind_unused_port(host : String = "127.0.0.1", reuse_port : Bool = false) : IPAddress
+    bind_tcp(host, 0, reuse_port)
+  end
+
+  def bind_unix(path : String) : UNIXAddress
+    usrv = UNIXServer.new(path)
+    @unix_server = usrv
+    addr = UNIXAddress.new(path)
+    @addresses << addr
+    addr
+  end
+
+  def bind_unix(address : UNIXAddress) : UNIXAddress
+    bind_unix(address.path)
+  end
+
+  def bind(uri_str : String) : Address
+    addr = Address.parse(uri_str)
+    case addr
+    in IPAddress
+      bind_tcp(addr.address, addr.port)
+    in UNIXAddress
+      bind_unix(addr.path)
+    end
+  end
+
+  def addresses : Array(Address)
+    @addresses
+  end
+
+  def each_address(&block : Address -> Nil) : Nil
+    @addresses.each(&block)
+  end
+
+  def listen : Server
+    if @socket.nil? && @unix_server.nil?
+      bind_tcp(@host, @port)
+    end
+    self
+  end
+
+  private def track_transport(trans : Transport) : Nil
+    @active_transports << trans
+  end
+
+  private def untrack_transport(trans : Transport) : Nil
+    new_arr = [] of Transport
+    i = 0
+    while i < @active_transports.size
+      new_arr << @active_transports[i] unless @active_transports[i] == trans
+      i = i + 1
+    end
+    @active_transports = new_arr
+  end
+
+  def handle_connection(transport : Transport) : Nil
+    reader = BufferedTransportReader.new(transport)
+
+    while !@stopped && !transport.closed?
+      {% if (flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64))) || (flag?(:darwin) && flag?(:aarch64)) || (flag?(:win32) && flag?(:x86_64)) %}
+        if transport.is_a?(TcpTransport)
+          wait_res = wait_readable(transport.socket.to_unsafe)
+          break if wait_res.is_a?(Cancelled)
+        end
+      {% end %}
+      req_res = reader.read_request
+      case req_res
+      in Nil
+        break
+      in HttpError
+        err_resp = Response.new(400, body: req_res.message)
+        err_resp.headers["Connection"] = "close"
+        err_resp.headers["Content-Length"] = err_resp.body.bytesize.to_s
+        ser = err_resp.serialize
+        case ser
+        in String    then transport.write(ser)
+        in HttpError then nil
+        end
+        break
+      in Request
+        req = req_res
+
+        resp = if ch = @context_handler
+                 ctx = ServerContext.new(req)
+                 ch.call(ctx)
+                 ctx.response.to_response
+               elsif handlers = @handlers
+                 ctx = ServerContext.new(req)
+                 if !handlers.empty?
+                   i = 0
+                   while i < handlers.size - 1
+                     handlers[i].next = handlers[i + 1]
+                     i = i + 1
+                   end
+                   handlers[0].call(ctx)
+                 end
+                 ctx.response.to_response
+               elsif h = @handler
+                 h.call(req)
+               else
+                 Response.new(404, body: "Not Found")
+               end
+
+        # RFC 9112: Respect handler Connection: close as well as client keep-alive
+        handler_close = resp.headers.includes_word?("Connection", "close")
+        client_close = !req.keep_alive? || @stopped || handler_close
+        if client_close
+          resp.headers["Connection"] = "close"
+        elsif !resp.headers.has_key?("Connection")
+          resp.headers["Connection"] = "keep-alive"
+        end
+
+        if !resp.chunked? && !resp.headers.has_key?("Content-Length")
+          resp.headers["Content-Length"] = resp.body.bytesize.to_s
+        end
+
+        ser = resp.serialize(chunked: resp.chunked?, trailers: resp.trailers)
+        case ser
+        in String    then transport.write(ser)
+        in HttpError then break
+        end
+
+        break if client_close
+      end
+    end
+
+    transport.close unless transport.closed?
+    untrack_transport(transport)
+  end
+
+  def accept_one : Bool
+    return false if @stopped
+    if usrv = @unix_server
+      client_sock = usrv.accept?
+      if client_sock
+        trans = UnixTransport.new(client_sock, usrv.path || "")
+        track_transport(trans)
+        handle_connection(trans)
+        return true
+      end
+    end
+    if sock = @socket
+      client_sock = sock.accept
+      trans = TcpTransport.new(client_sock)
+      track_transport(trans)
+      handle_connection(trans)
+      return true
+    end
+    false
+  end
+
+  # Handles one connection synchronously for deterministic testing
+  def accept_one : Bool
+    return false if @stopped
+    sock = @socket
+    return false if sock.nil? || sock.closed?
+
+    client_sock = sock.accept
+    return false if client_sock.closed?
+
+    transport = TcpTransport.new(client_sock)
+    track_transport(transport)
+    handle_connection(transport)
+    true
+  end
+
+  # Starts concurrent accept loop spawning a fiber per incoming connection
+  def start : Nil
+    while !@stopped
+      break unless accept_one
+    end
+  end
+
+  {% if (flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64))) || (flag?(:darwin) && flag?(:aarch64)) || (flag?(:win32) && flag?(:x86_64)) %}
+    # Native concurrent server using III.4 structured concurrency runtime
+    def serve(concurrency : Int32 = 16) : Nil
+      sock = @socket
+      raise "server must call listen before serve" if sock.nil? || sock.closed?
+
+      conn_chan = Channel(IyiSocket).new(concurrency)
+      @conn_chan = conn_chan
+
+      group do |g|
+        @group = g
+        concurrency.times do
+          g.spawn do
+            loop do
+              case client_sock = conn_chan.receive
+              in IyiSocket
+                trans = TcpTransport.new(client_sock)
+                track_transport(trans)
+                handle_connection(trans)
+              in ChannelClosed
+                break
+              in Cancelled
+                break
+              end
+            end
+            0
+          end
+        end
+
+        g.spawn do
+          while !@stopped
+            break if sock.closed?
+            wait_readable(sock.to_unsafe)
+            break if sock.closed? || @stopped
+            client_sock = sock.accept
+            if @stopped || client_sock.closed? || sock.closed?
+              client_sock.close unless client_sock.closed?
+              break
+            end
+            conn_chan.send(client_sock)
+          end
+          conn_chan.close
+          0
+        end
+      end
+    end
+  {% end %}
+
+  def stop : Nil
+    return if @stopped
+    @stopped = true
+    if sock = @socket
+      sock.close unless sock.closed?
+    end
+    if usrv = @unix_server
+      usrv.close unless usrv.closed?
+      @unix_server = nil
+    end
+    @active_transports.each do |trans|
+      trans.close unless trans.closed?
+    end
+    @active_transports = [] of Transport
+    {% if (flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64))) || (flag?(:darwin) && flag?(:aarch64)) || (flag?(:win32) && flag?(:x86_64)) %}
+      if cc = @conn_chan
+        cc.close
+      end
+      if grp = @group
+        grp.cancel_children
+      end
+    {% end %}
+  end
+
+  def close : Nil
+    stop
+  end
+end

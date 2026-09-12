@@ -1,0 +1,67 @@
+# `std/deque`, `std/set`, and `std/tuple` collections sample.
+#
+# Demonstrates:
+#   * `Deque`: sliding window buffer and double-ended queue.
+#   * `Set`: deduplication and mathematical set algebra.
+#   * `Tuple` and `NamedTuple`: lightweight structured values and transformations.
+#
+# Run via:
+#     ./bin/iyi run samples/iyi/std_collections.iyi
+
+module samples/std_collections
+
+import std/format
+using std/format::{printf}
+
+import std/deque
+using std/deque::{Deque}
+import std/set
+using std/set::{Set}
+import std/tuple
+
+# 1. Deque as a sliding window buffer of fixed capacity
+puts "== Deque: sliding window"
+window = Deque(Int32).new(3)
+numbers = [10, 20, 30, 40, 50, 60]
+
+numbers.each do |num|
+  if window.size == 3
+    evicted = window.shift
+    printf "  pushed %d, evicted %d -> window: %s\n", num, evicted, window.to_s
+  else
+    printf "  pushed %d -> window: %s\n", num, window.to_s
+  end
+  window.push(num)
+end
+printf "final window: %s\n", window.to_s
+
+# 2. Set algebra: tags and categories
+puts "\n== Set: category algebra"
+alice_tags = Set(String).new(["systems", "compilers", "performance"])
+bob_tags = Set(String).new(["web", "compilers", "frontend"])
+
+shared = alice_tags & bob_tags
+all_tags = alice_tags | bob_tags
+unique_alice = alice_tags - bob_tags
+differing = alice_tags ^ bob_tags
+
+puts "alice:     #{alice_tags}"
+puts "bob:       #{bob_tags}"
+puts "shared:    #{shared}"
+puts "all:       #{all_tags}"
+puts "only alice: #{unique_alice}"
+puts "differing: #{differing}"
+puts "shared is subset of all: #{shared.subset_of?(all_tags)}"
+
+# 3. Tuple and NamedTuple
+puts "\n== Tuple and NamedTuple"
+point = {10, 20, 30}
+scaled = point.map { |coord| coord * 2 }
+puts "point:  #{point} (first=#{point.first}, last=#{point.last})"
+puts "scaled: #{scaled}"
+
+config = {host: "127.0.0.1", port: 8080, secure: false}
+puts "server config: #{config}"
+puts "keys: #{config.keys}"
+puts "values: #{config.values}"
+puts "has port: #{config.has_key?(:port)}"

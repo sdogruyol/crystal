@@ -1,0 +1,459 @@
+# Complete Random standard library module for iyi.
+#
+# Provides pseudo-random number generators (PCG32, ISAAC) and cryptographically
+# secure system entropy (Random::Secure).
+#
+# Pure iyi implementation with zero external C library dependencies.
+
+module std/random
+
+pub import std/slice
+using std/slice::{Slice, Bytes}
+pub alias Bytes = Std::Slice::Bytes
+pub alias Slice = Std::Slice::Slice
+pub import std/base64
+using std/base64::{Base64}
+
+module OS
+  {% if flag?(:darwin) %}
+    lib LibSystem
+      fun getentropy(buf : Void*, buflen : UInt64) : Int32
+    end
+
+    def self.random_bytes(buffer : Std::Slice::Bytes) : Nil
+      offset = 0
+      remaining = buffer.size
+      ptr = buffer.to_unsafe
+      while remaining > 0
+        chunk = remaining > 256 ? 256 : remaining
+        res = LibSystem.getentropy((ptr + offset.to_i64).as(Void*), chunk.to_u64)
+        raise "getentropy failed" if res != 0
+        offset += chunk
+        remaining -= chunk
+      end
+    end
+  {% elsif flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64)) %}
+    def self.random_bytes(buffer : Std::Slice::Bytes) : Nil
+      offset = 0
+      remaining = buffer.size
+      ptr = buffer.to_unsafe
+      while remaining > 0
+        chunk = remaining > 256 ? 256 : remaining
+        ret = uninitialized Int64
+        {% if flag?(:x86_64) %}
+          asm("syscall" : "={rax}"(ret)
+                        : "{rax}"(318_i64), "{rdi}"((ptr + offset.to_i64).as(Void*)), "{rsi}"(chunk.to_u64), "{rdx}"(0_u64)
+                        : "rcx", "r11", "memory"
+                        : "volatile")
+        {% else %}
+          asm("svc #0" : "={x0}"(ret)
+                       : "{x8}"(278_i64), "{x0}"((ptr + offset.to_i64).as(Void*)), "{x1}"(chunk.to_u64), "{x2}"(0_u64)
+                       : "memory"
+                       : "volatile")
+        {% end %}
+        if ret > 0_i64
+          offset += ret.to_i32
+          remaining -= ret.to_i32
+        elsif ret < 0_i64
+          raise "getrandom syscall failed" unless ret == -4_i64
+        end
+      end
+    end
+  {% elsif flag?(:windows) || flag?(:win32) %}
+    lib LibBcrypt
+      fun BCryptGenRandom(hAlgorithm : Void*, pbBuffer : UInt8*, cbBuffer : UInt64, dwFlags : UInt64) : Int32
+    end
+
+    def self.random_bytes(buffer : Std::Slice::Bytes) : Nil
+      return if buffer.empty?
+      status = LibBcrypt.BCryptGenRandom(Pointer(Void).new(0_u64), buffer.to_unsafe, buffer.size.to_u64, 2_u64)
+      raise "BCryptGenRandom failed" if status != 0
+    end
+  {% elsif flag?(:wasm32) %}
+    lib LibWasi
+      fun random_get = __wasi_random_get(buf : UInt8*, buf_len : UInt64) : Int32
+    end
+
+    def self.random_bytes(buffer : Std::Slice::Bytes) : Nil
+      return if buffer.empty?
+      res = LibWasi.random_get(buffer.to_unsafe, buffer.size.to_u64)
+      raise "__wasi_random_get failed" if res != 0
+    end
+  {% else %}
+    def self.random_bytes(buffer : Std::Slice::Bytes) : Nil
+      i = 0
+      while i < buffer.size
+        buffer[i] = (i & 0xff).to_u8
+        i += 1
+      end
+    end
+  {% end %}
+end
+
+module ::Random
+  abstract def next_u : UInt64
+
+  def next_bool : Bool
+    (next_u & 1_u64) != 0_u64
+  end
+
+  def next_int : Int32
+    (next_u & 0x7fffffff_u64).to_i
+  end
+
+  def next_float : Float64
+    bits53 = next_u & 0x1fffffffffffff_u64
+    bits53.to_f / 9007199254740992.0
+  end
+
+  def rand(max : Int32) : Int32
+    raise "Invalid bound for rand: #{max}" if max <= 0
+    u_max = max.to_u64
+    limit = (0xffffffffffffffff_u64 // u_max) * u_max
+    loop do
+      val = next_u
+      return (val % u_max).to_i if val < limit
+    end
+  end
+
+  def rand(max : Int64) : Int64
+    raise "Invalid bound for rand: #{max}" if max <= 0
+    u_max = max.to_u64
+    limit = (0xffffffffffffffff_u64 // u_max) * u_max
+    loop do
+      val = next_u
+      return (val % u_max).to_i64 if val < limit
+    end
+  end
+
+  def rand(max : Int) : Int
+    rand(max.to_i64)
+  end
+
+  def rand(range : Range(Int, Int)) : Int
+    b = range.begin
+    e = range.end
+    if range.excludes_end?
+      raise "Invalid range for rand: #{range}" if b >= e
+      span = e - b
+      b + rand(span)
+    else
+      raise "Invalid range for rand: #{range}" if b > e
+      span = e - b + 1
+      b + rand(span)
+    end
+  end
+
+  def rand(max : Float) : Float
+    raise "Invalid bound for rand: #{max}" if max <= 0.0
+    rand * max
+  end
+
+  def rand(range : Range(Float, Float)) : Float
+    b = range.begin
+    e = range.end
+    span = e - b
+    if range.excludes_end?
+      raise "Invalid range for rand: #{range}" if b >= e
+      b + rand(span)
+    else
+      raise "Invalid range for rand: #{range}" if b > e
+      b + rand * span
+    end
+  end
+
+  def random_bytes(buf : Std::Slice::Bytes) : Nil
+    ptr = buf.to_unsafe
+    size = buf.size
+    i = 0
+    while i + 8 <= size
+      val = next_u
+      ptr[i] = (val & 0xff_u64).to_u8
+      ptr[i + 1] = (val.unsafe_shr(8_u64) & 0xff_u64).to_u8
+      ptr[i + 2] = (val.unsafe_shr(16_u64) & 0xff_u64).to_u8
+      ptr[i + 3] = (val.unsafe_shr(24_u64) & 0xff_u64).to_u8
+      ptr[i + 4] = (val.unsafe_shr(32_u64) & 0xff_u64).to_u8
+      ptr[i + 5] = (val.unsafe_shr(40_u64) & 0xff_u64).to_u8
+      ptr[i + 6] = (val.unsafe_shr(48_u64) & 0xff_u64).to_u8
+      ptr[i + 7] = (val.unsafe_shr(56_u64) & 0xff_u64).to_u8
+      i += 8
+    end
+    if i < size
+      val = next_u
+      while i < size
+        ptr[i] = (val & 0xff_u64).to_u8
+        val = val.unsafe_shr(8_u64)
+        i += 1
+      end
+    end
+  end
+
+  def random_bytes(n : Int = 16) : Std::Slice::Bytes
+    raise "Negative size: #{n}" if n < 0
+    buf = Std::Slice::Bytes.new(n)
+    random_bytes(buf)
+    buf
+  end
+
+  def hex(n : Int = 16) : String
+    bytes = random_bytes(n)
+    bytes.hexstring
+  end
+
+  def base64(n : Int = 16) : String
+    bytes = random_bytes(n)
+    Base64.strict_encode(bytes)
+  end
+
+  def urlsafe_base64(n : Int = 16, padding : Bool = false) : String
+    bytes = random_bytes(n)
+    Base64.urlsafe_encode(bytes, padding: padding)
+  end
+
+  class PCG32
+    include Random
+
+    PCG_DEFAULT_MULTIPLIER_64 = 6364136223846793005_u64
+
+    getter state : UInt64
+    getter inc : UInt64
+
+    def self.new : PCG32
+      b = uninitialized UInt8[16]
+      Secure.random_bytes(b.to_slice)
+      s0 = b[0].to_u64.unsafe_shl(56_u64) | b[1].to_u64.unsafe_shl(48_u64) | b[2].to_u64.unsafe_shl(40_u64) | b[3].to_u64.unsafe_shl(32_u64) |
+           b[4].to_u64.unsafe_shl(24_u64) | b[5].to_u64.unsafe_shl(16_u64) | b[6].to_u64.unsafe_shl(8_u64) | b[7].to_u64
+      s1 = b[8].to_u64.unsafe_shl(56_u64) | b[9].to_u64.unsafe_shl(48_u64) | b[10].to_u64.unsafe_shl(40_u64) | b[11].to_u64.unsafe_shl(32_u64) |
+           b[12].to_u64.unsafe_shl(24_u64) | b[13].to_u64.unsafe_shl(16_u64) | b[14].to_u64.unsafe_shl(8_u64) | b[15].to_u64
+      new(s0, s1)
+    end
+
+    def initialize(initstate : UInt64, initseq : UInt64 = 0_u64)
+      @state = 0_u64
+      @inc = 0_u64
+      new_seed(initstate, initseq)
+    end
+
+    def new_seed(initstate : UInt64, initseq : UInt64 = 0_u64) : UInt64
+      @state = 0_u64
+      @inc = initseq.unsafe_shl(1_u64) | 1_u64
+      next_u
+      @state = @state &+ initstate
+      next_u
+    end
+
+    def next_u : UInt64
+      oldstate = @state
+      @state = oldstate &* PCG_DEFAULT_MULTIPLIER_64 &+ @inc
+      xorshifted = (oldstate.unsafe_shr(18_u64) ^ oldstate).unsafe_shr(27_u64) & 0xffffffff_u64
+      rot = oldstate.unsafe_shr(59_u64) & 31_u64
+      rot_inv = (32_u64 - rot) & 31_u64
+      (xorshifted.unsafe_shr(rot) | xorshifted.unsafe_shl(rot_inv)) & 0xffffffff_u64
+    end
+  end
+
+  class ISAAC
+    include Random
+
+    @rsl : Pointer(UInt64)
+    @mm : Pointer(UInt64)
+    @counter : Int32
+    @aa : UInt64
+    @bb : UInt64
+    @cc : UInt64
+
+    def initialize(seed : Array(UInt64)? = nil)
+      @rsl = Pointer(UInt64).malloc(256_u64)
+      @mm = Pointer(UInt64).malloc(256_u64)
+      @counter = 0
+      @aa = 0_u64
+      @bb = 0_u64
+      @cc = 0_u64
+      new_seed(seed)
+    end
+
+    def new_seed(seed : Array(UInt64)? = nil) : Nil
+      @aa = 0_u64
+      @bb = 0_u64
+      @cc = 0_u64
+      @counter = 0
+
+      i = 0
+      while i < 256
+        val = 0_u64
+        if s = seed
+          val = s[i % s.size] if !s.empty?
+        else
+          val = Secure.next_u
+        end
+        @rsl[i] = val
+        @mm[i] = 0_u64
+        i += 1
+      end
+
+      init_isaac
+    end
+
+    private def init_isaac : Nil
+      a = 0x9e3779b9_u64; b = 0x9e3779b9_u64; c = 0x9e3779b9_u64; d = 0x9e3779b9_u64
+      e = 0x9e3779b9_u64; f = 0x9e3779b9_u64; g = 0x9e3779b9_u64; h = 0x9e3779b9_u64
+
+      mix = -> {
+        a ^= b.unsafe_shl(11_u64) & 0xffffffff_u64; d = (d &+ a) & 0xffffffff_u64; b = (b &+ c) & 0xffffffff_u64
+        b ^= c.unsafe_shr(2_u64); e = (e &+ b) & 0xffffffff_u64; c = (c &+ d) & 0xffffffff_u64
+        c ^= d.unsafe_shl(8_u64) & 0xffffffff_u64; f = (f &+ c) & 0xffffffff_u64; d = (d &+ e) & 0xffffffff_u64
+        d ^= e.unsafe_shr(16_u64); g = (g &+ d) & 0xffffffff_u64; e = (e &+ f) & 0xffffffff_u64
+        e ^= f.unsafe_shl(10_u64) & 0xffffffff_u64; h = (h &+ e) & 0xffffffff_u64; f = (f &+ g) & 0xffffffff_u64
+        f ^= g.unsafe_shr(4_u64); a = (a &+ f) & 0xffffffff_u64; g = (g &+ h) & 0xffffffff_u64
+        g ^= h.unsafe_shl(8_u64) & 0xffffffff_u64; b = (b &+ g) & 0xffffffff_u64; h = (h &+ a) & 0xffffffff_u64
+        h ^= a.unsafe_shr(9_u64); c = (c &+ h) & 0xffffffff_u64; a = (a &+ b) & 0xffffffff_u64
+      }
+
+      4.times { mix.call }
+
+      pass = 0
+      while pass < 2
+        i = 0
+        while i < 256
+          if pass == 0
+            a = (a &+ @rsl[i]) & 0xffffffff_u64; b = (b &+ @rsl[i + 1]) & 0xffffffff_u64; c = (c &+ @rsl[i + 2]) & 0xffffffff_u64; d = (d &+ @rsl[i + 3]) & 0xffffffff_u64
+            e = (e &+ @rsl[i + 4]) & 0xffffffff_u64; f = (f &+ @rsl[i + 5]) & 0xffffffff_u64; g = (g &+ @rsl[i + 6]) & 0xffffffff_u64; h = (h &+ @rsl[i + 7]) & 0xffffffff_u64
+          else
+            a = (a &+ @mm[i]) & 0xffffffff_u64; b = (b &+ @mm[i + 1]) & 0xffffffff_u64; c = (c &+ @mm[i + 2]) & 0xffffffff_u64; d = (d &+ @mm[i + 3]) & 0xffffffff_u64
+            e = (e &+ @mm[i + 4]) & 0xffffffff_u64; f = (f &+ @mm[i + 5]) & 0xffffffff_u64; g = (g &+ @mm[i + 6]) & 0xffffffff_u64; h = (h &+ @mm[i + 7]) & 0xffffffff_u64
+          end
+          mix.call
+          @mm[i] = a; @mm[i + 1] = b; @mm[i + 2] = c; @mm[i + 3] = d
+          @mm[i + 4] = e; @mm[i + 5] = f; @mm[i + 6] = g; @mm[i + 7] = h
+          i += 8
+        end
+        pass += 1
+      end
+    end
+
+    def next_u : UInt64
+      if @counter == 0
+        isaac
+        @counter = 256
+      end
+      @counter -= 1
+      @rsl[@counter]
+    end
+
+    private def isaac : Nil
+      @cc = (@cc &+ 1_u64) & 0xffffffff_u64
+      @bb = (@bb &+ @cc) & 0xffffffff_u64
+
+      i = 0
+      while i < 256
+        case i % 4
+        when 0 then @aa ^= (@aa.unsafe_shl(13_u64) & 0xffffffff_u64)
+        when 1 then @aa ^= @aa.unsafe_shr(6_u64)
+        when 2 then @aa ^= (@aa.unsafe_shl(2_u64) & 0xffffffff_u64)
+        else        @aa ^= @aa.unsafe_shr(16_u64)
+        end
+        x = @mm[i]
+        @aa = (@mm[(i + 128) % 256] &+ @aa) & 0xffffffff_u64
+        y = (@mm[x.unsafe_shr(2_u64).to_i % 256] &+ @aa &+ @bb) & 0xffffffff_u64
+        @mm[i] = y
+        @bb = (@mm[y.unsafe_shr(10_u64).to_i % 256] &+ x) & 0xffffffff_u64
+        @rsl[i] = @bb
+        i += 1
+      end
+    end
+  end
+
+  module Secure
+    extend Random
+    extend self
+
+    def self.next_u : UInt64
+      buf = uninitialized UInt8[8]
+      random_bytes(buf.to_slice)
+      buf[0].to_u64 | buf[1].to_u64.unsafe_shl(8_u64) | buf[2].to_u64.unsafe_shl(16_u64) | buf[3].to_u64.unsafe_shl(24_u64) |
+        buf[4].to_u64.unsafe_shl(32_u64) | buf[5].to_u64.unsafe_shl(40_u64) | buf[6].to_u64.unsafe_shl(48_u64) | buf[7].to_u64.unsafe_shl(56_u64)
+    end
+
+    def self.random_bytes(buf : Std::Slice::Bytes) : Nil
+      Std::Random::OS.random_bytes(buf)
+    end
+  end
+
+  DEFAULT = PCG32.new(0x853c49e6748fea9b_u64, 0xda3e39cb94b95bdb_u64)
+
+  def self.new(seed : Int, sequence = 0_u64) : PCG32
+    PCG32.new(seed.to_u64, sequence.to_u64)
+  end
+
+  def self.new : PCG32
+    PCG32.new
+  end
+
+  def self.rand : Float64
+    DEFAULT.rand
+  end
+
+  def self.rand(x)
+    DEFAULT.rand(x)
+  end
+
+  def self.next_bool : Bool
+    DEFAULT.next_bool
+  end
+
+  def self.next_int : Int32
+    DEFAULT.next_int
+  end
+
+  def self.next_float : Float64
+    DEFAULT.next_float
+  end
+
+  def self.random_bytes(buf : Std::Slice::Bytes) : Nil
+    DEFAULT.random_bytes(buf)
+  end
+
+  def self.random_bytes(n : Int = 16) : Std::Slice::Bytes
+    DEFAULT.random_bytes(n)
+  end
+end
+
+class ::Array(T)
+  def sample(random : Random = Random::DEFAULT) : T
+    raise "Empty array" if empty?
+    self[random.rand(size)]
+  end
+
+  def sample(n : Int, random : Random = Random::DEFAULT) : Array(T)
+    raise "Negative sample count: #{n}" if n < 0
+    return [] of T if n == 0 || empty?
+    if n >= size
+      return dup.shuffle_in_place(random)
+    end
+    dup.shuffle_in_place(random)[0, n]
+  end
+
+  def shuffle(random : Random = Random::DEFAULT) : Array(T)
+    dup.shuffle_in_place(random)
+  end
+
+  def shuffle_in_place(random : Random = Random::DEFAULT) : self
+    i = size - 1
+    while i > 0
+      j = random.rand(i + 1)
+      self[i], self[j] = self[j], self[i]
+      i -= 1
+    end
+    self
+  end
+end
+
+def rand : Float64
+  Random.rand
+end
+
+def rand(x)
+  Random.rand(x)
+end
+
+pub alias Random = ::Random

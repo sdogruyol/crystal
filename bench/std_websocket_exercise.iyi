@@ -1,0 +1,1007 @@
+# RFC 6455 WebSocket standard library exercise.
+# Comprehensive verification of WebSocket handshake, framing, protocol rules,
+# incremental UTF-8 validation, control frame interleaving, close handshakes,
+# permessage-deflate compression, rejection suite, and live socket client/server.
+
+module bench/std_websocket_exercise
+
+import std/slice
+import std/digest
+import std/crypto
+import std/http
+import std/compress
+import std/websocket
+import std/socket
+
+using std/slice::{Slice, Bytes}
+using std/digest::{SHA1}
+using std/crypto::{random_bytes, constant_time_compare}
+using std/http::{Headers, Request, Response, Status, HttpError}
+using std/compress::{Deflate, Inflate}
+using std/websocket::{Base64, Handshake, Utf8Validator, Frame, Message, MemoryTransport, Session, valid_wire_close_code?, WebSocketError, OP_CONTINUATION, OP_TEXT, OP_BINARY, OP_CLOSE, OP_PING, OP_PONG, CLOSE_NORMAL, CLOSE_GOING_AWAY, CLOSE_PROTOCOL_ERROR, CLOSE_UNSUPPORTED_DATA, CLOSE_NO_STATUS_RCVD, CLOSE_ABNORMAL, CLOSE_INVALID_PAYLOAD, CLOSE_POLICY_VIOLATION, CLOSE_MESSAGE_TOO_BIG, CLOSE_MANDATORY_EXT, CLOSE_INTERNAL_ERROR}
+using std/socket::{IyiSocket}
+
+def assert_true(cond : Bool, msg : String) : Nil
+  unless cond
+    raise "assertion failed: #{msg}"
+  end
+end
+
+def make_bytes(arr : Array(Int32)) : Bytes
+  b = Bytes.new(arr.size)
+  i = 0
+  while i < arr.size
+    b[i] = arr[i].to_u8
+    i = i + 1
+  end
+  b
+end
+
+def string_to_bytes(s : String) : Bytes
+  b = Bytes.new(s.bytesize)
+  b.to_unsafe.copy_from(s.to_unsafe, s.bytesize)
+  b
+end
+
+# -----------------------------------------------------------------------------
+# 1. Base64 RFC 4648 Test Vectors
+# -----------------------------------------------------------------------------
+def test_base64 : Nil
+  puts "base64:"
+  assert_true(Base64.encode(string_to_bytes("")) == "", "RFC 4648 Base64 empty")
+  assert_true(Base64.encode(string_to_bytes("f")) == "Zg==", "RFC 4648 Base64 'f'")
+  assert_true(Base64.encode(string_to_bytes("fo")) == "Zm8=", "RFC 4648 Base64 'fo'")
+  assert_true(Base64.encode(string_to_bytes("foo")) == "Zm9v", "RFC 4648 Base64 'foo'")
+  assert_true(Base64.encode(string_to_bytes("foob")) == "Zm9vYg==", "RFC 4648 Base64 'foob'")
+  assert_true(Base64.encode(string_to_bytes("fooba")) == "Zm9vYmE=", "RFC 4648 Base64 'fooba'")
+  assert_true(Base64.encode(string_to_bytes("foobar")) == "Zm9vYmFy", "RFC 4648 Base64 'foobar'")
+
+  # Decode test
+  d = Base64.decode("Zm9vYmFy")
+  assert_true(d.size == 6, "Base64 decode length")
+  assert_true(String.new(d.size) { |buf| buf.copy_from(d.to_unsafe, d.size) } == "foobar", "Base64 decode content")
+  puts "  RFC 4648 base64 vectors passed"
+end
+
+# -----------------------------------------------------------------------------
+# 2. RFC 6455 Section 1.3 Handshake Vector
+# -----------------------------------------------------------------------------
+def test_handshake_vector : Nil
+  puts "handshake:"
+  # Published test vector from RFC 6455 Section 1.3:
+  # Sec-WebSocket-Key: "dGhlIHNhbXBsZSBub25jZQ=="
+  # Sec-WebSocket-Accept expected: "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+  key = "dGhlIHNhbXBsZSBub25jZQ=="
+  expected_accept = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+
+  accept = Handshake.compute_accept(key)
+  assert_true(accept == expected_accept, "RFC 6455 Section 1.3 accept vector")
+
+  # Full handshake request and response modeling
+  req = Handshake.build_client_request("/chat", "server.example.com", key, ["chat", "superchat"])
+  verified_key = Handshake.verify_client_request(req)
+  case verified_key
+  in WebSocketError then raise "client request verification failed: #{verified_key.message}"
+  in String
+    assert_true(verified_key == key, "verified key matches client key")
+    resp = Handshake.build_server_response(verified_key, "chat")
+    verify_err = Handshake.verify_server_response(resp, key, ["chat", "superchat"])
+    assert_true(verify_err == false, "server response verification passed (uncompressed)")
+  end
+
+  puts "  RFC 6455 Section 1.3 accept vector and handshake flow passed"
+end
+
+# -----------------------------------------------------------------------------
+# 3. Incremental UTF-8 Validation Across Fragments
+# -----------------------------------------------------------------------------
+def test_utf8_validation : Nil
+  puts "utf8_validator:"
+  v = Utf8Validator.new
+
+  # ASCII
+  assert_true(v.update(string_to_bytes("Hello, WebSocket!")) && v.complete?, "ASCII text")
+
+  # 2-byte UTF-8: Latin small letter e with acute (U+00E9): 0xC3 0xA9
+  v.reset
+  assert_true(v.update(make_bytes([0xC3, 0xA9])) && v.complete?, "2-byte UTF-8")
+
+  # 3-byte UTF-8: Euro sign (U+20AC): 0xE2 0x82 0xAC
+  v.reset
+  assert_true(v.update(make_bytes([0xE2, 0x82, 0xAC])) && v.complete?, "3-byte UTF-8")
+
+  # 4-byte UTF-8: Musical symbol G clef (U+1D11E): 0xF0 0x9D 0x84 0x9E
+  v.reset
+  assert_true(v.update(make_bytes([0xF0, 0x9D, 0x84, 0x9E])) && v.complete?, "4-byte UTF-8")
+
+  # Multibyte sequence split across fragment boundaries:
+  # 3-byte Euro split across 2 chunks: [0xE2], [0x82, 0xAC]
+  v.reset
+  assert_true(v.update(make_bytes([0xE2])), "chunk 1 accepted")
+  assert_true(!v.complete?, "chunk 1 incomplete")
+  assert_true(v.update(make_bytes([0x82, 0xAC])), "chunk 2 accepted")
+  assert_true(v.complete?, "sequence complete after chunk 2")
+
+  # 4-byte split across 3 chunks: [0xF0, 0x9D], [0x84], [0x9E]
+  v.reset
+  assert_true(v.update(make_bytes([0xF0, 0x9D])) && !v.complete?, "4-byte split chunk 1")
+  assert_true(v.update(make_bytes([0x84])) && !v.complete?, "4-byte split chunk 2")
+  assert_true(v.update(make_bytes([0x9E])) && v.complete?, "4-byte split chunk 3")
+
+  # Overlong 2-byte: 0xC0 0x80
+  v.reset
+  assert_true(!v.update(make_bytes([0xC0, 0x80])), "overlong 2-byte rejected")
+
+  # Overlong 3-byte: 0xE0 0x80 0x80
+  v.reset
+  assert_true(!v.update(make_bytes([0xE0, 0x80, 0x80])), "overlong 3-byte rejected")
+
+  # Overlong 4-byte: 0xF0 0x80 0x80 0x80
+  v.reset
+  assert_true(!v.update(make_bytes([0xF0, 0x80, 0x80, 0x80])), "overlong 4-byte rejected")
+
+  # Surrogates (U+D800..U+DFFF): 0xED 0xA0 0x80
+  v.reset
+  assert_true(!v.update(make_bytes([0xED, 0xA0, 0x80])), "surrogate U+D800 rejected")
+
+  # Exceeding Unicode range > U+10FFFF: 0xF4 0x90 0x80 0x80
+  v.reset
+  assert_true(!v.update(make_bytes([0xF4, 0x90, 0x80, 0x80])), "out-of-range codepoint rejected")
+
+  puts "  incremental UTF-8 validation passed"
+end
+
+# -----------------------------------------------------------------------------
+# 4. Client and Server Communication over MemoryTransport
+# -----------------------------------------------------------------------------
+def test_client_server_communication : Nil
+  puts "client_server:"
+  c_trans, s_trans = MemoryTransport.pair
+
+  client = Session.new(c_trans, is_server: false)
+  server = Session.new(s_trans, is_server: true)
+
+  # 1. Text Message (Unfragmented)
+  client.send_text("Hello from client!")
+  msg = server.receive
+  case msg
+  in Message
+    assert_true(msg.text? && msg.text == "Hello from client!", "server received unfragmented text")
+  in WebSocketError, Nil
+    raise "server failed to receive text message"
+  end
+
+  # Server reply unfragmented text
+  server.send_text("Hello from server!")
+  c_msg = client.receive
+  case c_msg
+  in Message
+    assert_true(c_msg.text? && c_msg.text == "Hello from server!", "client received server text")
+  in WebSocketError, Nil
+    raise "client failed to receive server text"
+  end
+
+  # 2. Fragmented Text Message
+  client.send_text("This is a fragmented text message sent in 5-byte chunks", fragment_size: 5)
+  s_frag = server.receive
+  case s_frag
+  in Message
+    assert_true(s_frag.text? && s_frag.text == "This is a fragmented text message sent in 5-byte chunks",
+      "server reassembled fragmented text")
+  in WebSocketError, Nil
+    raise "server failed to receive fragmented text"
+  end
+
+  # 3. Binary Message: 7-bit length (< 126)
+  b7 = make_bytes([10, 20, 30, 40, 50])
+  client.send_binary(b7)
+  m_b7 = server.receive
+  case m_b7
+  in Message
+    assert_true(m_b7.binary? && m_b7.payload.size == 5 && m_b7.payload[0] == 10_u8, "binary 7-bit payload")
+  in WebSocketError, Nil
+    raise "server failed to receive binary 7-bit"
+  end
+
+  # 4. Binary Message: 16-bit length (1024 bytes)
+  b16 = Bytes.new(1024)
+  i = 0
+  while i < 1024
+    b16[i] = (i & 255).to_u8
+    i = i + 1
+  end
+  client.send_binary(b16)
+  m_b16 = server.receive
+  case m_b16
+  in Message
+    assert_true(m_b16.binary? && m_b16.payload.size == 1024 && m_b16.payload[500] == (500 & 255).to_u8,
+      "binary 16-bit payload")
+  in WebSocketError, Nil
+    raise "server failed to receive binary 16-bit"
+  end
+
+  # 5. Binary Message: 64-bit length (70,000 bytes > 65535)
+  b64 = Bytes.new(70000)
+  b64[0] = 42_u8
+  b64[69999] = 99_u8
+  server.send_binary(b64)
+  m_b64 = client.receive
+  case m_b64
+  in Message
+    assert_true(m_b64.binary? && m_b64.payload.size == 70000 &&
+                m_b64.payload[0] == 42_u8 && m_b64.payload[69999] == 99_u8,
+      "binary 64-bit payload")
+  in WebSocketError, Nil
+    raise "client failed to receive binary 64-bit"
+  end
+
+  # 6. Fragmented Binary Message
+  client.send_binary(b16, fragment_size: 256)
+  m_frag_bin = server.receive
+  case m_frag_bin
+  in Message
+    assert_true(m_frag_bin.binary? && m_frag_bin.payload.size == 1024, "fragmented binary reassembled")
+  in WebSocketError, Nil
+    raise "server failed to receive fragmented binary"
+  end
+
+  # 7. Ping / Pong
+  ping_data = string_to_bytes("ping-payload-123")
+  client.send_ping(ping_data)
+  # Server processes ping in receive and sends pong
+  s_res = server.receive_frame
+  case s_res
+  in Frame
+    assert_true(s_res.opcode == OP_PING, "server read ping frame")
+    server.send_pong(s_res.payload)
+  in WebSocketError, Nil
+    raise "server failed to read ping frame"
+  end
+  # Client reads pong
+  c_res = client.receive_frame
+  case c_res
+  in Frame
+    assert_true(c_res.opcode == OP_PONG, "client read pong frame")
+    assert_true(c_res.payload.size == ping_data.size, "pong payload length match")
+  in WebSocketError, Nil
+    raise "client failed to read pong frame"
+  end
+
+  # 8. Clean Close Handshake
+  client.close(CLOSE_NORMAL, "Normal closure")
+
+  # Reject data frames after close initiated (@close_sent before peer reply)
+  err_while_closing = client.send_text("data while closing")
+  assert_true(err_while_closing.is_a?(WebSocketError), "data frame rejected after close initiated")
+
+  s_close = server.receive
+  assert_true(s_close.nil?, "server receive returned nil on close")
+  assert_true(server.closed?, "server is closed")
+  assert_true(server.close_code == CLOSE_NORMAL, "server recorded close code 1000")
+  assert_true(server.close_reason == "Normal closure", "server recorded close reason")
+
+  # Client drains server's close echo response
+  c_close = client.receive
+  assert_true(c_close.nil?, "client receive returned nil on close echo")
+  assert_true(client.closed?, "client is closed after peer response")
+  assert_true(client.close_code == CLOSE_NORMAL, "client recorded close code 1000")
+
+  puts "  client and server conversation, framing, ping/pong, and clean close passed"
+end
+
+# -----------------------------------------------------------------------------
+# 5. Interleaved Control Frames Between Message Fragments
+# -----------------------------------------------------------------------------
+def test_interleaved_control_frames : Nil
+  puts "interleaved_control:"
+  c_trans, s_trans = MemoryTransport.pair
+  client = Session.new(c_trans, is_server: false)
+  server = Session.new(s_trans, is_server: true)
+
+  # Client sends fragmented text: Fragment 1 (FIN=0, OP_TEXT)
+  f1 = Frame.new(OP_TEXT, string_to_bytes("Part 1 - "), fin: false, masked: true)
+  client.send_frame(f1)
+
+  # Client injects PING frame in the middle
+  ping_frame = Frame.new(OP_PING, string_to_bytes("heartbeat"), fin: true, masked: true)
+  client.send_frame(ping_frame)
+
+  # Client sends Fragment 2 (FIN=1, OP_CONTINUATION)
+  f2 = Frame.new(OP_CONTINUATION, string_to_bytes("Part 2"), fin: true, masked: true)
+  client.send_frame(f2)
+
+  # Server receives full message: receive will handle the PING internally (replying PONG)
+  # and reassemble Part 1 + Part 2
+  msg = server.receive
+  case msg
+  in Message
+    assert_true(msg.text == "Part 1 - Part 2", "interleaved text reassembled correctly")
+  in WebSocketError, Nil
+    raise "server failed to reassemble interleaved message"
+  end
+
+  # Client reads the PONG reply that server automatically sent
+  c_pong = client.receive_frame
+  case c_pong
+  in Frame
+    assert_true(c_pong.opcode == OP_PONG, "client received automatic pong from interleaved ping")
+  in WebSocketError, Nil
+    raise "client failed to receive pong"
+  end
+
+  puts "  interleaved control frames handled seamlessly"
+end
+
+# -----------------------------------------------------------------------------
+# 6. Permessage-Deflate Compression Seam (RFC 7692)
+# -----------------------------------------------------------------------------
+def test_permessage_deflate : Nil
+  puts "permessage_deflate:"
+  c_trans, s_trans = MemoryTransport.pair
+  client = Session.new(c_trans, is_server: false, deflate_enabled: true)
+  server = Session.new(s_trans, is_server: true, deflate_enabled: true)
+
+  # Send repetitive text that compresses well (> 128 bytes)
+  original_text = "Good news everyone! " * 20 # 400 bytes
+  client.send_text(original_text)
+
+  msg = server.receive
+  case msg
+  in Message
+    assert_true(msg.text == original_text, "permessage-deflate text roundtrip match")
+  in WebSocketError, Nil
+    raise "server failed to receive compressed message"
+  end
+
+  # Send compressed binary
+  bin_orig = Bytes.new(500)
+  i = 0
+  while i < 500
+    bin_orig[i] = (i % 10).to_u8
+    i = i + 1
+  end
+  server.send_binary(bin_orig)
+  c_bin = client.receive
+  case c_bin
+  in Message
+    assert_true(c_bin.binary? && c_bin.payload.size == 500 && c_bin.payload[499] == (499 % 10).to_u8,
+      "permessage-deflate binary roundtrip match")
+  in WebSocketError, Nil
+    raise "client failed to receive compressed binary"
+  end
+
+  puts "  permessage-deflate compression and decompression passed"
+end
+
+# -----------------------------------------------------------------------------
+# 7. The Rejection Suite (Fail Closed & Named Checks)
+# -----------------------------------------------------------------------------
+def test_rejection_suite : Nil
+  puts "rejection_suite:"
+
+  # 1. Unmasked client frame: server MUST reject with CLOSE_PROTOCOL_ERROR (1002)
+  trans1 = MemoryTransport.new
+  server1 = Session.new(trans1, is_server: true)
+  # Frame with masked = false fed to server
+  unmasked_frame = Frame.new(OP_TEXT, string_to_bytes("unmasked from client"), fin: true, masked: false)
+  trans1.feed(unmasked_frame.serialize(masked_override: false))
+  err1 = server1.receive_frame
+  case err1
+  in WebSocketError
+    assert_true(err1.code == CLOSE_PROTOCOL_ERROR, "unmasked client frame rejected with 1002")
+  in Frame, Nil
+    raise "assertion failed: unmasked client frame was not rejected"
+  end
+  puts "  unmasked client frame: rejected (code 1002)"
+
+  # 2. Oversized control frame: payload > 125 bytes must be rejected with 1002
+  trans2 = MemoryTransport.new
+  server2 = Session.new(trans2, is_server: true)
+  # Ping with 126 bytes
+  oversized_payload = Bytes.new(126)
+  oversized_frame = Frame.new(OP_PING, oversized_payload, fin: true, masked: true)
+  trans2.feed(oversized_frame.serialize)
+  err2 = server2.receive_frame
+  case err2
+  in WebSocketError
+    assert_true(err2.code == CLOSE_PROTOCOL_ERROR, "oversized control frame rejected with 1002")
+  in Frame, Nil
+    raise "assertion failed: oversized control frame was not rejected"
+  end
+  puts "  oversized control frame: rejected (code 1002)"
+
+  # 3. Fragmented control frame: control frame with FIN=0 must be rejected with 1002
+  trans3 = MemoryTransport.new
+  server3 = Session.new(trans3, is_server: true)
+  frag_ctrl = Frame.new(OP_PING, string_to_bytes("ping"), fin: false, masked: true)
+  trans3.feed(frag_ctrl.serialize)
+  err3 = server3.receive_frame
+  case err3
+  in WebSocketError
+    assert_true(err3.code == CLOSE_PROTOCOL_ERROR, "fragmented control frame rejected with 1002")
+  in Frame, Nil
+    raise "assertion failed: fragmented control frame was not rejected"
+  end
+  puts "  fragmented control frame: rejected (code 1002)"
+
+  # 4. Bad RSV: frame with RSV1/2/3 set without negotiated extension must be rejected with 1002
+  trans4 = MemoryTransport.new
+  server4 = Session.new(trans4, is_server: true, deflate_enabled: false)
+  bad_rsv_frame = Frame.new(OP_TEXT, string_to_bytes("bad rsv"), fin: true, masked: true, rsv2: true)
+  trans4.feed(bad_rsv_frame.serialize)
+  err4 = server4.receive_frame
+  case err4
+  in WebSocketError
+    assert_true(err4.code == CLOSE_PROTOCOL_ERROR, "bad RSV rejected with 1002")
+  in Frame, Nil
+    raise "assertion failed: bad RSV frame was not rejected"
+  end
+  puts "  bad RSV: rejected (code 1002)"
+
+  # 5. Invalid UTF-8 in a text frame split across fragments: must be rejected with 1007
+  trans5 = MemoryTransport.new
+  server5 = Session.new(trans5, is_server: true)
+  # Fragment 1: Text with start of 3-byte sequence [0xE2]
+  frag_utf_1 = Frame.new(OP_TEXT, make_bytes([72, 101, 108, 108, 111, 0xE2]), fin: false, masked: true)
+  trans5.feed(frag_utf_1.serialize)
+  frag_utf_2 = Frame.new(OP_CONTINUATION, make_bytes([0x20, 0x20]), fin: true, masked: true)
+  trans5.feed(frag_utf_2.serialize)
+  err5 = server5.receive
+  case err5
+  in WebSocketError
+    assert_true(err5.code == CLOSE_INVALID_PAYLOAD, "invalid UTF-8 in split text frame rejected with 1007")
+  in Message, Nil
+    raise "assertion failed: invalid UTF-8 in split text frame was not rejected"
+  end
+  puts "  invalid UTF-8 in split text frame: rejected (code 1007)"
+
+  # 6. Invalid close codes: must be rejected with 1002
+  # Forbidden wire codes: 1005, 1006, 999, 1015, 2000
+  forbidden_codes = [999, 1004, 1005, 1006, 1015, 2000]
+  idx = 0
+  while idx < forbidden_codes.size
+    fc = forbidden_codes[idx]
+    assert_true(!valid_wire_close_code?(fc), "forbidden code #{fc} is invalid")
+
+    t_close = MemoryTransport.new
+    s_close = Session.new(t_close, is_server: true)
+    close_payload = Bytes.new(2)
+    close_payload[0] = ((fc >> 8) & 255).to_u8
+    close_payload[1] = (fc & 255).to_u8
+    c_frame = Frame.new(OP_CLOSE, close_payload, fin: true, masked: true)
+    t_close.feed(c_frame.serialize)
+    err6 = s_close.receive_frame
+    case err6
+    in WebSocketError
+      assert_true(err6.code == CLOSE_PROTOCOL_ERROR, "forbidden close code #{fc} rejected with 1002")
+    in Frame, Nil
+      raise "assertion failed: forbidden close code #{fc} was not rejected"
+    end
+    idx = idx + 1
+  end
+
+  # Close frame payload length 1 byte: must be rejected with 1002
+  t_c1 = MemoryTransport.new
+  s_c1 = Session.new(t_c1, is_server: true)
+  c1_frame = Frame.new(OP_CLOSE, make_bytes([10]), fin: true, masked: true)
+  t_c1.feed(c1_frame.serialize)
+  err_c1 = s_c1.receive_frame
+  case err_c1
+  in WebSocketError
+    assert_true(err_c1.code == CLOSE_PROTOCOL_ERROR, "close payload length 1 rejected with 1002")
+  in Frame, Nil
+    raise "close payload length 1 was not rejected"
+  end
+
+  # Close reason with invalid UTF-8: must be rejected with 1007
+  t_cr = MemoryTransport.new
+  s_cr = Session.new(t_cr, is_server: true)
+  cr_payload = make_bytes([0x03, 0xE8, 0xFF, 0xFF]) # code 1000 + invalid UTF-8 0xFF 0xFF
+  cr_frame = Frame.new(OP_CLOSE, cr_payload, fin: true, masked: true)
+  t_cr.feed(cr_frame.serialize)
+  err_cr = s_cr.receive_frame
+  case err_cr
+  in WebSocketError
+    assert_true(err_cr.code == CLOSE_INVALID_PAYLOAD, "close reason invalid UTF-8 rejected with 1007")
+  in Frame, Nil
+    raise "close reason invalid UTF-8 was not rejected"
+  end
+  puts "  invalid close code: rejected (code 1002 / 1007)"
+
+  # 7. Minimal length encoding violations: must be rejected with 1002
+  # 16-bit encoding for payload < 126
+  raw_bad_len16 = Bytes.new(8)
+  raw_bad_len16[0] = 0x81_u8 # FIN, text
+  raw_bad_len16[1] = 0xFE_u8 # Masked + 126
+  raw_bad_len16[2] = 0x00_u8
+  raw_bad_len16[3] = 0x0A_u8 # Length 10 < 126 !
+  parsed_bad16 = Frame.parse(raw_bad_len16, is_server: true)
+  case parsed_bad16
+  in WebSocketError
+    assert_true(parsed_bad16.code == CLOSE_PROTOCOL_ERROR, "non-minimal 16-bit length rejected")
+  in Frame
+    raise "non-minimal 16-bit length not rejected"
+  end
+
+  # 8. Server masked frame: client must reject with 1002
+  raw_server_masked = Bytes.new(6)
+  raw_server_masked[0] = 0x81_u8 # FIN, text
+  raw_server_masked[1] = 0x80_u8 # Masked, length 0
+  parsed_server_masked = Frame.parse(raw_server_masked, is_server: false)
+  case parsed_server_masked
+  in WebSocketError
+    assert_true(parsed_server_masked.code == CLOSE_PROTOCOL_ERROR, "server masked frame rejected by client")
+  in Frame
+    raise "server masked frame not rejected"
+  end
+
+  # 9. Unexpected continuation frame: must be rejected with 1002
+  t_cont = MemoryTransport.new
+  s_cont = Session.new(t_cont, is_server: true)
+  cont_frame = Frame.new(OP_CONTINUATION, string_to_bytes("orphan continuation"), fin: true, masked: true)
+  t_cont.feed(cont_frame.serialize)
+  err_cont = s_cont.receive
+  case err_cont
+  in WebSocketError
+    assert_true(err_cont.code == CLOSE_PROTOCOL_ERROR, "unexpected continuation frame rejected with 1002")
+  in Message, Nil
+    raise "unexpected continuation frame not rejected"
+  end
+
+  # 10. Control frame with RSV1=1 rejected when deflate enabled (Finding 1)
+  t_rsv1_ctrl = MemoryTransport.new
+  s_rsv1_ctrl = Session.new(t_rsv1_ctrl, is_server: true, deflate_enabled: true)
+  rsv1_ctrl = Frame.new(OP_PING, string_to_bytes("ping"), fin: true, masked: true, rsv1: true)
+  t_rsv1_ctrl.feed(rsv1_ctrl.serialize)
+  err_rsv1_ctrl = s_rsv1_ctrl.receive_frame
+  case err_rsv1_ctrl
+  in WebSocketError
+    assert_true(err_rsv1_ctrl.code == CLOSE_PROTOCOL_ERROR, "control frame with RSV1 rejected with 1002")
+  in Frame, Nil
+    raise "assertion failed: control frame with RSV1 was not rejected"
+  end
+
+  # 11. Continuation frame with RSV1=1 rejected when deflate enabled (Finding 2)
+  t_cont_rsv1 = MemoryTransport.new
+  s_cont_rsv1 = Session.new(t_cont_rsv1, is_server: true, deflate_enabled: true)
+  f_frag1_ok = Frame.new(OP_TEXT, string_to_bytes("part1"), fin: false, masked: true, rsv1: false)
+  t_cont_rsv1.feed(f_frag1_ok.serialize)
+  f_frag2_bad = Frame.new(OP_CONTINUATION, string_to_bytes("part2"), fin: true, masked: true, rsv1: true)
+  t_cont_rsv1.feed(f_frag2_bad.serialize)
+  err_cont_rsv1 = s_cont_rsv1.receive
+  case err_cont_rsv1
+  in WebSocketError
+    assert_true(err_cont_rsv1.code == CLOSE_PROTOCOL_ERROR, "continuation frame with RSV1 rejected with 1002")
+  in Message, Nil
+    raise "assertion failed: continuation frame with RSV1 was not rejected"
+  end
+  # 12. Corrupted compressed payload returns 1007 rather than crashing (Finding 3)
+  # Adversarial cases: block type 3, truncated fixed Huffman, truncated dynamic Huffman,
+  # invalid back-reference distance, and invalid distance symbol > 29. None may unwind.
+  adv_corrupt_payloads = [
+    make_bytes([0xFF, 0xFF, 0xFF]), # Block type 3 (reserved)
+    make_bytes([0x03, 0xFF]),       # Truncated fixed Huffman
+    make_bytes([0xF5, 0x00]),       # Truncated dynamic Huffman after valid HLIT/HDIST
+    make_bytes([                    # Invalid back-reference distance exceeding buffer
+      (1 | (1 << 1) | (1 << 9) | (0b01100 << 10)) & 0xFF,
+      ((1 | (1 << 1) | (1 << 9) | (0b01100 << 10)) >> 8) & 0xFF,
+      ((1 | (1 << 1) | (1 << 9) | (0b01100 << 10)) >> 16) & 0xFF,
+    ]),
+    make_bytes([ # Invalid distance symbol 30 (> 29)
+      ((3_i64 | (0b10001110_i64 << 3) | (0b1000000_i64 << 11) | (0b01111_i64 << 18)) & 0xFF).to_i32,
+      (((3_i64 | (0b10001110_i64 << 3) | (0b1000000_i64 << 11) | (0b01111_i64 << 18)) >> 8) & 0xFF).to_i32,
+      (((3_i64 | (0b10001110_i64 << 3) | (0b1000000_i64 << 11) | (0b01111_i64 << 18)) >> 16) & 0xFF).to_i32,
+      (((3_i64 | (0b10001110_i64 << 3) | (0b1000000_i64 << 11) | (0b01111_i64 << 18)) >> 24) & 0xFF).to_i32,
+    ]),
+  ]
+
+  adv_i = 0
+  while adv_i < adv_corrupt_payloads.size
+    adv_payload = adv_corrupt_payloads[adv_i]
+    t_corrupt_comp = MemoryTransport.new
+    s_corrupt_comp = Session.new(t_corrupt_comp, is_server: true, deflate_enabled: true)
+    corrupt_comp_frame = Frame.new(OP_TEXT, adv_payload, fin: true, masked: true, rsv1: true)
+    t_corrupt_comp.feed(corrupt_comp_frame.serialize)
+    err_decomp = s_corrupt_comp.receive
+    case err_decomp
+    in WebSocketError
+      assert_true(err_decomp.code == CLOSE_INVALID_PAYLOAD, "adversarial corrupt compressed frame rejected with 1007")
+    in Message, Nil
+      raise "assertion failed: corrupt compressed frame was not rejected"
+    end
+    adv_i = adv_i + 1
+  end
+  # 13. Decompression bomb exceeding max_message_size returns 1009 (Finding 4)
+  t_bomb = MemoryTransport.new
+  s_bomb = Session.new(t_bomb, is_server: true, deflate_enabled: true)
+  s_bomb.max_message_size = 50_i64
+  rep_text = "A" * 200
+  raw_rep = string_to_bytes(rep_text)
+  comp_bomb = Deflate.compress(raw_rep)
+  c_len = comp_bomb.size
+  if c_len >= 4 &&
+     comp_bomb[c_len - 4] == 0x00_u8 && comp_bomb[c_len - 3] == 0x00_u8 &&
+     comp_bomb[c_len - 2] == 0xFF_u8 && comp_bomb[c_len - 1] == 0xFF_u8
+    c_len = c_len - 4
+  end
+  bomb_frame = Frame.new(OP_TEXT, Slice(UInt8).new(comp_bomb.to_unsafe, c_len), fin: true, masked: true, rsv1: true)
+  t_bomb.feed(bomb_frame.serialize)
+  err_bomb = s_bomb.receive
+  case err_bomb
+  in WebSocketError
+    assert_true(err_bomb.code == CLOSE_MESSAGE_TOO_BIG, "decompression bomb rejected with 1009")
+  in Message, Nil
+    raise "assertion failed: decompression bomb was not rejected"
+  end
+
+  # 14. Close reason > 123 bytes truncated at UTF-8 boundary so close frame payload <= 125 (Finding 5)
+  t_long_reason = MemoryTransport.new
+  s_long_reason = Session.new(t_long_reason, is_server: false)
+  s_long_reason.close(CLOSE_NORMAL, "R" * 200)
+  sent_close_bytes = t_long_reason.take_all
+  parsed_sent_close = Frame.parse(sent_close_bytes, is_server: true)
+  case parsed_sent_close
+  in Frame
+    assert_true(parsed_sent_close.payload.size <= 125, "truncated close frame payload <= 125 bytes")
+  in WebSocketError
+    raise "assertion failed: valid truncated close frame could not be parsed"
+  end
+
+  # Close reason where byte 123 falls inside a 4-byte code point (musical G clef U+1D11E)
+  # 121 bytes of ASCII + 4-byte character + extra
+  g_clef_bytes = make_bytes([0xF0, 0x9D, 0x84, 0x9E])
+  reason_4byte = ("A" * 121) + String.new(4) { |buf| buf.copy_from(g_clef_bytes.to_unsafe, 4) } + "extra-tail"
+  t_4b = MemoryTransport.new
+  s_4b = Session.new(t_4b, is_server: false)
+  s_4b.close(CLOSE_NORMAL, reason_4byte)
+  wire_4b = t_4b.take_all
+  parsed_4b = Frame.parse(wire_4b, is_server: true)
+  case parsed_4b
+  in Frame
+    # Payload must be exactly 2 bytes code + 121 bytes (the incomplete 4-byte char dropped)
+    assert_true(parsed_4b.payload.size == 123, "payload truncated to 123 bytes without split codepoint")
+    r_slice = Slice(UInt8).new(parsed_4b.payload.to_unsafe + 2, parsed_4b.payload.size - 2)
+    assert_true(Utf8Validator.valid?(r_slice), "emitted close reason is 100% valid UTF-8")
+  in WebSocketError
+    raise "assertion failed: close frame with 4-byte split code point rejected by parser"
+  end
+  # 15. Pipelined WebSocket frame following HTTP 101 preserved in PrefixedTransport (Finding 6)
+  raw_http_101 = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n"
+  pipeline_text = Frame.new(OP_TEXT, string_to_bytes("pipelined"), fin: true, masked: false)
+  pipe_wire = pipeline_text.serialize(masked_override: false)
+  combined = raw_http_101 + String.new(pipe_wire.size) { |b| b.copy_from(pipe_wire.to_unsafe, pipe_wire.size) }
+  trailing = Handshake.extract_trailing_bytes(combined)
+  assert_true(trailing.size == pipe_wire.size, "trailing pipelined frame extracted")
+
+  # 16. Missing Host header rejected during handshake (Finding 7)
+  req_no_host = Request.new("GET", "/chat", Headers.new)
+  req_no_host.headers["Upgrade"] = "websocket"
+  req_no_host.headers["Connection"] = "Upgrade"
+  req_no_host.headers["Sec-WebSocket-Key"] = "dGhlIHNhbXBsZSBub25jZQ=="
+  req_no_host.headers["Sec-WebSocket-Version"] = "13"
+  err_host = Handshake.verify_client_request(req_no_host)
+  case err_host
+  in WebSocketError
+    assert_true(err_host.code == CLOSE_PROTOCOL_ERROR, "missing Host header rejected")
+  in String
+    raise "assertion failed: missing Host header was not rejected"
+  end
+
+  # 17. Malformed / unpadded Base64 nonce key rejected during handshake (Finding 8)
+  req_bad_key = Request.new("GET", "/chat", Headers.new)
+  req_bad_key.headers["Host"] = "example.com"
+  req_bad_key.headers["Upgrade"] = "websocket"
+  req_bad_key.headers["Connection"] = "Upgrade"
+  req_bad_key.headers["Sec-WebSocket-Key"] = "AAAAAAAAAAAAAAAAAAAAAA"
+  req_bad_key.headers["Sec-WebSocket-Version"] = "13"
+  err_bad_key = Handshake.verify_client_request(req_bad_key)
+  case err_bad_key
+  in WebSocketError
+    assert_true(err_bad_key.code == CLOSE_PROTOCOL_ERROR, "unpadded Sec-WebSocket-Key rejected")
+  in String
+    raise "assertion failed: unpadded Sec-WebSocket-Key was not rejected"
+  end
+
+  # 18. Unrequested subprotocol rejected on client verification (Finding 9)
+  resp_bad_sp = Response.new(101, Headers.new, status_message: "Switching Protocols")
+  resp_bad_sp.headers["Upgrade"] = "websocket"
+  resp_bad_sp.headers["Connection"] = "Upgrade"
+  resp_bad_sp.headers["Sec-WebSocket-Accept"] = Handshake.compute_accept("dGhlIHNhbXBsZSBub25jZQ==")
+  resp_bad_sp.headers["Sec-WebSocket-Protocol"] = "unrequested_proto"
+  err_bad_sp = Handshake.verify_server_response(resp_bad_sp, "dGhlIHNhbXBsZSBub25jZQ==", ["chat"])
+  case err_bad_sp
+  in WebSocketError
+    assert_true(err_bad_sp.code == CLOSE_PROTOCOL_ERROR, "unrequested subprotocol rejected")
+  in Bool
+    raise "assertion failed: unrequested subprotocol was not rejected"
+  end
+
+  # 19. Non-minimal 64-bit length rejected (Finding 13 item 1)
+  raw_bad_len64 = Bytes.new(14)
+  raw_bad_len64[0] = 0x81_u8
+  raw_bad_len64[1] = 0xFF_u8
+  raw_bad_len64[2] = 0_u8
+  raw_bad_len64[3] = 0_u8
+  raw_bad_len64[4] = 0_u8
+  raw_bad_len64[5] = 0_u8
+  raw_bad_len64[6] = 0_u8
+  raw_bad_len64[7] = 0_u8
+  raw_bad_len64[8] = 0x03_u8
+  raw_bad_len64[9] = 0xE8_u8 # 1000 <= 65535
+  parsed_bad64 = Frame.parse(raw_bad_len64, is_server: true)
+  case parsed_bad64
+  in WebSocketError
+    assert_true(parsed_bad64.code == CLOSE_PROTOCOL_ERROR, "non-minimal 64-bit length rejected")
+  in Frame
+    raise "assertion failed: non-minimal 64-bit length was not rejected"
+  end
+
+  # 20. 64-bit length with MSB set rejected (Finding 13 item 2)
+  raw_msb64 = Bytes.new(14)
+  raw_msb64[0] = 0x81_u8
+  raw_msb64[1] = 0xFF_u8
+  raw_msb64[2] = 0x80_u8 # MSB=1!
+  parsed_msb64 = Frame.parse(raw_msb64, is_server: true)
+  case parsed_msb64
+  in WebSocketError
+    assert_true(parsed_msb64.code == CLOSE_PROTOCOL_ERROR, "64-bit MSB=1 rejected")
+  in Frame
+    raise "assertion failed: 64-bit MSB=1 was not rejected"
+  end
+
+  # 21. New data frame mid-fragmentation rejected (Finding 13 item 3)
+  t_mid_frag = MemoryTransport.new
+  s_mid_frag = Session.new(t_mid_frag, is_server: true)
+  f_mid1 = Frame.new(OP_TEXT, string_to_bytes("frag1"), fin: false, masked: true)
+  t_mid_frag.feed(f_mid1.serialize)
+  f_mid2_bad = Frame.new(OP_BINARY, string_to_bytes("illegal"), fin: true, masked: true)
+  t_mid_frag.feed(f_mid2_bad.serialize)
+  err_mid_frag = s_mid_frag.receive
+  case err_mid_frag
+  in WebSocketError
+    assert_true(err_mid_frag.code == CLOSE_PROTOCOL_ERROR, "new data frame mid-fragmentation rejected")
+  in Message, Nil
+    raise "assertion failed: new data frame mid-fragmentation was not rejected"
+  end
+  # 22. Server selects bare permessage-deflate without client_no_context_takeover (rejected with 1002)
+  resp_bare1 = Response.new(101, Headers.new, status_message: "Switching Protocols")
+  resp_bare1.headers["Upgrade"] = "websocket"
+  resp_bare1.headers["Connection"] = "Upgrade"
+  resp_bare1.headers["Sec-WebSocket-Accept"] = Handshake.compute_accept("dGhlIHNhbXBsZSBub25jZQ==")
+  resp_bare1.headers["Sec-WebSocket-Extensions"] = "permessage-deflate; server_no_context_takeover"
+  err_bare1 = Handshake.verify_server_response(resp_bare1, "dGhlIHNhbXBsZSBub25jZQ==",
+    requested_extensions: ["permessage-deflate"])
+  case err_bare1
+  in WebSocketError
+    assert_true(err_bare1.code == CLOSE_PROTOCOL_ERROR, "omitted client_no_context_takeover rejected with 1002")
+  in Bool
+    raise "assertion failed: server omitted client_no_context_takeover was not rejected"
+  end
+
+  # 23. Server selects bare permessage-deflate without server_no_context_takeover (rejected with 1002)
+  resp_bare2 = Response.new(101, Headers.new, status_message: "Switching Protocols")
+  resp_bare2.headers["Upgrade"] = "websocket"
+  resp_bare2.headers["Connection"] = "Upgrade"
+  resp_bare2.headers["Sec-WebSocket-Accept"] = Handshake.compute_accept("dGhlIHNhbXBsZSBub25jZQ==")
+  resp_bare2.headers["Sec-WebSocket-Extensions"] = "permessage-deflate; client_no_context_takeover"
+  err_bare2 = Handshake.verify_server_response(resp_bare2, "dGhlIHNhbXBsZSBub25jZQ==",
+    requested_extensions: ["permessage-deflate"])
+  case err_bare2
+  in WebSocketError
+    assert_true(err_bare2.code == CLOSE_PROTOCOL_ERROR, "omitted server_no_context_takeover rejected with 1002")
+  in Bool
+    raise "assertion failed: server omitted server_no_context_takeover was not rejected"
+  end
+
+  # 24. Server selects unsupported window bits parameter (rejected with 1002)
+  resp_win = Response.new(101, Headers.new, status_message: "Switching Protocols")
+  resp_win.headers["Upgrade"] = "websocket"
+  resp_win.headers["Connection"] = "Upgrade"
+  resp_win.headers["Sec-WebSocket-Accept"] = Handshake.compute_accept("dGhlIHNhbXBsZSBub25jZQ==")
+  resp_win.headers["Sec-WebSocket-Extensions"] = "permessage-deflate; client_no_context_takeover; server_no_context_takeover; client_max_window_bits=10"
+  err_win = Handshake.verify_server_response(resp_win, "dGhlIHNhbXBsZSBub25jZQ==",
+    requested_extensions: ["permessage-deflate"])
+  case err_win
+  in WebSocketError
+    assert_true(err_win.code == CLOSE_PROTOCOL_ERROR, "unsupported window bits rejected with 1002")
+  in Bool
+    raise "assertion failed: unsupported window bits was not rejected"
+  end
+
+  # 25. Client offering bare permessage-deflate without no-context parameters is declined by server
+  _, srv_declined_active = Handshake.negotiate_server_extensions("permessage-deflate", true)
+  assert_true(!srv_declined_active, "server declined bare permessage-deflate offer")
+
+  puts "  rejection suite passed completely"
+end
+
+# -----------------------------------------------------------------------------
+# 8. Live TCP Socket Client & Server over Loopback
+# -----------------------------------------------------------------------------
+def test_live_socket : Nil
+  puts "live_socket:"
+  server_sock = IyiSocket.listen(0)
+  port = server_sock.local_port
+  assert_true(port > 0, "server bound to ephemeral port")
+
+  client_sock = IyiSocket.connect("127.0.0.1", port)
+  accepted_sock = server_sock.accept
+
+  # Perform WebSocket handshake over live TCP sockets
+  key = Handshake.generate_key
+  req = Handshake.build_client_request("/", "127.0.0.1:#{port}", key)
+  ser_req = req.serialize
+  case ser_req
+  in String    then client_sock.write(ser_req)
+  in HttpError then raise "failed to serialize client request: #{ser_req.message}"
+  end
+
+  raw_req = accepted_sock.read(4096)
+  parsed_req = Request.parse(raw_req)
+  case parsed_req
+  in Request
+    v_key = Handshake.verify_client_request(parsed_req)
+    case v_key
+    in String
+      resp = Handshake.build_server_response(v_key)
+      ser_resp = resp.serialize
+      case ser_resp
+      in String    then accepted_sock.write(ser_resp)
+      in HttpError then raise "failed to serialize server response"
+      end
+    in WebSocketError
+      raise "server failed to verify client request: #{v_key.message}"
+    end
+  in HttpError
+    raise "server failed to parse request: #{parsed_req.message}"
+  end
+
+  raw_resp = client_sock.read(4096)
+  parsed_resp = Response.parse(raw_resp)
+  case parsed_resp
+  in Response
+    h_err = Handshake.verify_server_response(parsed_resp, key)
+    assert_true(h_err == false, "client verified server 101 response")
+  in HttpError
+    raise "client failed to parse response: #{parsed_resp.message}"
+  end
+
+  # Create live sessions
+  client = Session.new(client_sock, is_server: false)
+  server = Session.new(accepted_sock, is_server: true)
+
+  # Live text transfer
+  client.send_text("Hello over live TCP socket!")
+  msg = server.receive
+  case msg
+  in Message
+    assert_true(msg.text == "Hello over live TCP socket!", "server received live TCP text")
+  in WebSocketError, Nil
+    raise "server failed to receive live text"
+  end
+
+  server.send_text("Echo over live TCP socket!")
+  c_msg = client.receive
+  case c_msg
+  in Message
+    assert_true(c_msg.text == "Echo over live TCP socket!", "client received live TCP echo")
+  in WebSocketError, Nil
+    raise "client failed to receive live echo"
+  end
+
+  # Live clean close
+  client.close(CLOSE_NORMAL, "TCP session done")
+  s_close = server.receive
+  assert_true(s_close.nil?, "server closed on live close")
+  assert_true(server.closed?, "server is marked closed")
+
+  server_sock.close
+
+  # Test Server.upgrade HTTP error response (Finding 10)
+  s_sock_err = IyiSocket.listen(0)
+  err_port = s_sock_err.local_port
+  c_sock_err = IyiSocket.connect("127.0.0.1", err_port)
+  a_sock_err = s_sock_err.accept
+
+  bad_ver_req = "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 8\r\n\r\n"
+  c_sock_err.write(bad_ver_req)
+  up_res = Std::Websocket::Server.upgrade(a_sock_err)
+  assert_true(up_res.is_a?(WebSocketError), "Server.upgrade returned error on version 8")
+  http_resp = c_sock_err.read(4096)
+  assert_true(http_resp.includes?("426 Upgrade Required"), "server emitted 426 Upgrade Required")
+  assert_true(http_resp.includes?("Sec-WebSocket-Version: 13"), "server included Sec-WebSocket-Version: 13 in 426 response")
+
+  s_sock_err.close
+  c_sock_err.close
+  a_sock_err.close
+
+  # 2. Live TCP test with permessage-deflate (no-context-takeover)
+  s_sock_deflate = IyiSocket.listen(0)
+  def_port = s_sock_deflate.local_port
+  c_sock_deflate = IyiSocket.connect("127.0.0.1", def_port)
+  a_sock_deflate = s_sock_deflate.accept
+
+  # Client sends handshake offering permessage-deflate with both no-context parameters
+  c_deflate_key = Handshake.generate_key
+  c_deflate_req = Handshake.build_client_request("/", "127.0.0.1:#{def_port}", c_deflate_key,
+    extensions: ["permessage-deflate; client_no_context_takeover; server_no_context_takeover"])
+  ser_def_req = c_deflate_req.serialize
+  case ser_def_req
+  in String    then c_sock_deflate.write(ser_def_req)
+  in HttpError then raise "failed to serialize deflate client request"
+  end
+
+  # Server upgrades via Server.upgrade with permessage-deflate enabled
+  s_up_res = Std::Websocket::Server.upgrade(a_sock_deflate, extensions: ["permessage-deflate"])
+  case s_up_res
+  in WebSocketError then raise "server failed to upgrade with permessage-deflate: #{s_up_res.message}"
+  in Session(Std::Websocket::PrefixedTransport(IyiSocket))
+    assert_true(s_up_res.deflate_enabled, "server negotiated deflate_enabled: true")
+
+    raw_c_resp = c_sock_deflate.read(4096)
+    parsed_c_resp = Response.parse(raw_c_resp)
+    case parsed_c_resp
+    in Response
+      c_ver = Handshake.verify_server_response(parsed_c_resp, c_deflate_key,
+        requested_extensions: ["permessage-deflate; client_no_context_takeover; server_no_context_takeover"])
+      case c_ver
+      in WebSocketError then raise "client failed to verify server deflate response: #{c_ver.message}"
+      in Bool
+        assert_true(c_ver, "client verified deflate_enabled: true")
+        c_trans = Std::Websocket::PrefixedTransport.new(c_sock_deflate, Handshake.extract_trailing_bytes(raw_c_resp))
+        c_sess = Session.new(c_trans, is_server: false, deflate_enabled: true)
+
+        # Send Message 1: repetitive text that compresses
+        rep_msg = "The quick brown fox jumps over the lazy dog repeatedly! " * 5
+        c_sess.send_text(rep_msg)
+        s_m1 = s_up_res.receive
+        case s_m1
+        in Message
+          assert_true(s_m1.text == rep_msg, "server received message 1 independently")
+        in WebSocketError, Nil
+          raise "server failed to receive message 1"
+        end
+
+        # Send Message 2: identical content (under context-takeover, would back-reference message 1)
+        # Under stateless no-context-takeover, each message encodes/decodes independently
+        c_sess.send_text(rep_msg)
+        s_m2 = s_up_res.receive
+        case s_m2
+        in Message
+          assert_true(s_m2.text == rep_msg, "server received message 2 independently without dictionary drift")
+        in WebSocketError, Nil
+          raise "server failed to receive message 2 independently"
+        end
+
+        c_sess.close(CLOSE_NORMAL, "deflate done")
+        s_up_res.receive # drain close
+      end
+    in HttpError
+      raise "client failed to parse server deflate response"
+    end
+  end
+
+  s_sock_deflate.close
+  c_sock_deflate.close
+  a_sock_deflate.close
+
+  puts "  TCP loopback handshake, exchange, and close passed"
+end
+
+# -----------------------------------------------------------------------------
+# Main Entry Point
+# -----------------------------------------------------------------------------
+def main
+  puts "== std/websocket exercise =="
+  test_base64
+  test_handshake_vector
+  test_utf8_validation
+  test_client_server_communication
+  test_interleaved_control_frames
+  test_permessage_deflate
+  test_rejection_suite
+  test_live_socket
+  puts "all std/websocket checks passed"
+end
+
+main

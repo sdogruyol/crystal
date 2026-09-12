@@ -1,0 +1,48 @@
+module std/pubprobe
+
+# Every declaration iyi lets `pub` attach to, in one file. The formatter has
+# now failed on four of these one at a time: `pub macro`, `pub struct`,
+# `pub alias`, and `pub import`. Each was fixed alone, and the next one was
+# found by a person writing the syntax rather than by anything checking.
+#
+# This file is that check. If a new declaration gains `pub` and the formatter
+# is not taught it, formatting this file raises rather than waiting for
+# somebody to hit it in real code.
+
+pub import std/traits
+
+pub alias Words = Array(String)
+
+pub annotation Marker
+end
+
+pub enum Colour
+  Red
+  Green
+end
+
+pub trait Named
+  abstract def name : String
+end
+
+pub struct Holder
+  @w : Words
+
+  def initialize(@w : Words)
+  end
+
+  pub def count : Int32
+    @w.size
+  end
+end
+
+pub class Box
+  @v : Int32
+
+  def initialize(@v : Int32)
+  end
+end
+
+pub macro twice(x)
+  ({{x}}) + ({{x}})
+end

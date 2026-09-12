@@ -1,0 +1,1859 @@
+# RFC 6455 WebSocket protocol implementation for iyi.
+# Zero C dependencies. Pure native standard library.
+#
+# Covers:
+#   * Handshake: Sec-WebSocket-Key, Sec-WebSocket-Accept (RFC 6455 Section 1.3 & 4)
+#   * Framing: FIN, RSV1-3, Opcodes, 7/16/64-bit lengths, 4-byte masking
+#   * Protocol enforcement:
+#       - Client frames MUST be masked; server MUST reject unmasked with 1002
+#       - Server frames MUST NOT be masked; client MUST reject masked with 1002
+#       - Control frames MUST have FIN=1 and payload <= 125 bytes
+#       - Reserved bits (RSV1-3) MUST be 0 unless negotiated extension
+#       - Minimal length encoding strictly enforced (16-bit for <126 rejected, 64-bit for <=65535 rejected)
+#       - Close codes must be valid wire codes (RFC 6455 7.4.1), reason must be valid UTF-8
+#   * Incremental UTF-8 validation across fragmented text frames
+#   * Interleaved control frames between message fragments
+#   * Bidirectional close handshake and ping/pong
+#   * Permessage-deflate compression seam (RFC 7692) using std/compress
+#   * In-memory transport and IyiSocket transport support
+
+module std/websocket
+
+import std/slice
+import std/digest
+import std/crypto
+import std/http
+import std/uri
+import std/compress
+import std/socket
+
+using std/slice::{Slice, Bytes}
+using std/digest::{SHA1}
+using std/crypto::{random_bytes, constant_time_compare}
+using std/http::{Headers, Request, Response, Status, HttpError}
+using std/uri::{URI}
+using std/compress::{Deflate, Inflate, DecompressError, DecompressLimitExceeded}
+using std/socket::{IyiSocket}
+
+pub alias Bytes = Std::Slice::Bytes
+
+# =============================================================================
+# Protocol Constants
+# =============================================================================
+
+pub GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+# Frame Opcodes (RFC 6455 Section 5.2)
+pub OP_CONTINUATION = 0x0_u8
+pub OP_TEXT         = 0x1_u8
+pub OP_BINARY       = 0x2_u8
+pub OP_CLOSE        = 0x8_u8
+pub OP_PING         = 0x9_u8
+pub OP_PONG         = 0xA_u8
+
+# Close Status Codes (RFC 6455 Section 7.4.1)
+pub CLOSE_NORMAL           = 1000 # Normal closure
+pub CLOSE_GOING_AWAY       = 1001 # Going away (browser tab closed, server restart)
+pub CLOSE_PROTOCOL_ERROR   = 1002 # Protocol error
+pub CLOSE_UNSUPPORTED_DATA = 1003 # Unsupported data type (e.g. text-only received binary)
+pub CLOSE_NO_STATUS_RCVD   = 1005 # Reserved: No status received (internal only)
+pub CLOSE_ABNORMAL         = 1006 # Reserved: Abnormal closure (internal only)
+pub CLOSE_INVALID_PAYLOAD  = 1007 # Invalid frame payload data (e.g. invalid UTF-8)
+pub CLOSE_POLICY_VIOLATION = 1008 # Policy violation
+pub CLOSE_MESSAGE_TOO_BIG  = 1009 # Message too big
+pub CLOSE_MANDATORY_EXT    = 1010 # Mandatory extension missing
+pub CLOSE_INTERNAL_ERROR   = 1011 # Internal server error
+pub CLOSE_SERVICE_RESTART  = 1012 # Service restart (registered)
+pub CLOSE_TRY_AGAIN_LATER  = 1013 # Try again later (registered)
+pub CLOSE_BAD_GATEWAY      = 1014 # Bad gateway (registered)
+pub CLOSE_TLS_HANDSHAKE    = 1015 # Reserved: TLS handshake failure (internal only)
+
+pub enum CloseCode : Int32
+  NormalClosure           = 1000
+  GoingAway               = 1001
+  ProtocolError           = 1002
+  UnsupportedData         = 1003
+  NoStatusReceived        = 1005
+  AbnormalClosure         = 1006
+  InvalidFramePayloadData = 1007
+  PolicyViolation         = 1008
+  MessageTooBig           = 1009
+  MandatoryExtension      = 1010
+  InternalServerError     = 1011
+  ServiceRestart          = 1012
+  TryAgainLater           = 1013
+  BadGateway              = 1014
+  TLSHandshake            = 1015
+
+  def to_i32 : Int32
+    self.value
+  end
+
+  def to_i : Int32
+    self.value
+  end
+end
+
+# Checks if a close code is permitted on the wire per RFC 6455 Section 7.4.
+# Codes < 1000, 1004, 1005, 1006, 1015, and 1016..2999 are forbidden on the wire.
+pub def valid_wire_close_code?(code : Int32) : Bool
+  return false if code < 1000 || code > 4999
+  return false if code == 1004 || code == 1005 || code == 1006 || code == 1015
+  return false if code >= 1016 && code <= 2999
+  true
+end
+
+# Checks if an opcode is a defined control opcode
+pub def control_opcode?(opcode : UInt8) : Bool
+  opcode == OP_CLOSE || opcode == OP_PING || opcode == OP_PONG
+end
+
+# Checks if an opcode is a valid defined opcode
+pub def valid_opcode?(opcode : UInt8) : Bool
+  opcode == OP_CONTINUATION || opcode == OP_TEXT || opcode == OP_BINARY ||
+    opcode == OP_CLOSE || opcode == OP_PING || opcode == OP_PONG
+end
+
+# =============================================================================
+# WebSocketError
+# =============================================================================
+
+pub struct WebSocketError
+  getter code : Int32
+  getter message : String
+
+  def initialize(@code : Int32, @message : String)
+  end
+
+  def to_s : String
+    "WebSocketError(#{@code}): #{@message}"
+  end
+end
+
+# =============================================================================
+# Base64: RFC 4648 Standard Base64 Encoding and Decoding
+# =============================================================================
+
+pub struct Base64
+  CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+  pub def self.encode(bytes : Bytes) : String
+    len = bytes.size
+    return "" if len == 0
+
+    out_len = ((len + 2) // 3) * 4
+    chars_ptr = CHARS.to_unsafe
+    data_ptr = bytes.to_unsafe
+
+    String.new(out_len) do |buf|
+      src_i = 0
+      dst_i = 0
+      while src_i + 2 < len
+        b0 = data_ptr[src_i].to_i32
+        b1 = data_ptr[src_i + 1].to_i32
+        b2 = data_ptr[src_i + 2].to_i32
+        triple = (b0 << 16) | (b1 << 8) | b2
+
+        buf[dst_i] = chars_ptr[(triple >> 18) & 63]
+        buf[dst_i + 1] = chars_ptr[(triple >> 12) & 63]
+        buf[dst_i + 2] = chars_ptr[(triple >> 6) & 63]
+        buf[dst_i + 3] = chars_ptr[triple & 63]
+
+        src_i = src_i + 3
+        dst_i = dst_i + 4
+      end
+
+      rem = len - src_i
+      if rem == 1
+        b0 = data_ptr[src_i].to_i32
+        triple = b0 << 16
+        buf[dst_i] = chars_ptr[(triple >> 18) & 63]
+        buf[dst_i + 1] = chars_ptr[(triple >> 12) & 63]
+        buf[dst_i + 2] = 61_u8 # '='
+        buf[dst_i + 3] = 61_u8 # '='
+      elsif rem == 2
+        b0 = data_ptr[src_i].to_i32
+        b1 = data_ptr[src_i + 1].to_i32
+        triple = (b0 << 16) | (b1 << 8)
+        buf[dst_i] = chars_ptr[(triple >> 18) & 63]
+        buf[dst_i + 1] = chars_ptr[(triple >> 12) & 63]
+        buf[dst_i + 2] = chars_ptr[(triple >> 6) & 63]
+        buf[dst_i + 3] = 61_u8 # '='
+      end
+    end
+  end
+
+  pub def self.decode(str : String) : Bytes
+    bytesize = str.bytesize
+    return Bytes.new(0) if bytesize == 0 || (bytesize & 3) != 0
+
+    s_ptr = str.to_unsafe
+    pad = 0
+    pad = pad + 1 if bytesize > 0 && s_ptr[bytesize - 1] == 61_u8
+    pad = pad + 1 if bytesize > 1 && s_ptr[bytesize - 2] == 61_u8
+
+    out_len = (bytesize * 3) // 4 - pad
+    out_len = 0 if out_len < 0
+    out = Bytes.new(out_len)
+    out_ptr = out.to_unsafe
+
+    src_i = 0
+    dst_i = 0
+    while src_i + 3 < bytesize
+      v0 = decode_char(s_ptr[src_i])
+      v1 = decode_char(s_ptr[src_i + 1])
+      v2 = decode_char(s_ptr[src_i + 2])
+      v3 = decode_char(s_ptr[src_i + 3])
+
+      triple = (v0 << 18) | (v1 << 12) | (v2 << 6) | v3
+
+      out_ptr[dst_i] = ((triple >> 16) & 255).to_u8 if dst_i < out_len
+      out_ptr[dst_i + 1] = ((triple >> 8) & 255).to_u8 if dst_i + 1 < out_len
+      out_ptr[dst_i + 2] = (triple & 255).to_u8 if dst_i + 2 < out_len
+
+      src_i = src_i + 4
+      dst_i = dst_i + 3
+    end
+    out
+  end
+
+  private def self.decode_char(c : UInt8) : Int32
+    if c >= 65_u8 && c <= 90_u8
+      (c - 65_u8).to_i32
+    elsif c >= 97_u8 && c <= 122_u8
+      (c - 97_u8 + 26_u8).to_i32
+    elsif c >= 48_u8 && c <= 57_u8
+      (c - 48_u8 + 52_u8).to_i32
+    elsif c == 43_u8
+      62
+    elsif c == 47_u8
+      63
+    elsif c == 61_u8
+      0
+    else
+      raise "Invalid base64 character: #{c.to_i32}"
+    end
+  end
+end
+
+# =============================================================================
+# Utf8Validator: Incremental UTF-8 Validation Across Frame Fragments
+# =============================================================================
+
+pub struct Utf8Validator
+  @needed : Int32
+  @min_byte : UInt8
+  @max_byte : UInt8
+
+  def initialize
+    @needed = 0
+    @min_byte = 0x80_u8
+    @max_byte = 0xBF_u8
+  end
+
+  def reset : Nil
+    @needed = 0
+    @min_byte = 0x80_u8
+    @max_byte = 0xBF_u8
+  end
+
+  def complete? : Bool
+    @needed == 0
+  end
+
+  def update(bytes : Bytes) : Bool
+    i = 0
+    len = bytes.size
+    ptr = bytes.to_unsafe
+    while i < len
+      b = ptr[i]
+      if @needed > 0
+        if b < @min_byte || b > @max_byte
+          return false
+        end
+        @min_byte = 0x80_u8
+        @max_byte = 0xBF_u8
+        @needed = @needed - 1
+      else
+        if b <= 0x7F_u8
+          # 1-byte ASCII
+        elsif b >= 0xC2_u8 && b <= 0xDF_u8
+          @needed = 1
+          @min_byte = 0x80_u8
+          @max_byte = 0xBF_u8
+        elsif b == 0xE0_u8
+          # Overlong 3-byte guard (second byte must be 0xA0..0xBF)
+          @needed = 2
+          @min_byte = 0xA0_u8
+          @max_byte = 0xBF_u8
+        elsif (b >= 0xE1_u8 && b <= 0xEC_u8) || b == 0xEE_u8 || b == 0xEF_u8
+          @needed = 2
+          @min_byte = 0x80_u8
+          @max_byte = 0xBF_u8
+        elsif b == 0xED_u8
+          # Surrogate guard: U+D800..U+DFFF (second byte 0xA0..0xBF is forbidden)
+          @needed = 2
+          @min_byte = 0x80_u8
+          @max_byte = 0x9F_u8
+        elsif b == 0xF0_u8
+          # Overlong 4-byte guard (second byte must be 0x90..0xBF)
+          @needed = 3
+          @min_byte = 0x90_u8
+          @max_byte = 0xBF_u8
+        elsif b >= 0xF1_u8 && b <= 0xF3_u8
+          @needed = 3
+          @min_byte = 0x80_u8
+          @max_byte = 0xBF_u8
+        elsif b == 0xF4_u8
+          # Exceeds U+10FFFF guard (second byte must be 0x80..0x8F)
+          @needed = 3
+          @min_byte = 0x80_u8
+          @max_byte = 0x8F_u8
+        else
+          return false
+        end
+      end
+      i = i + 1
+    end
+    true
+  end
+
+  def self.valid?(bytes : Bytes) : Bool
+    v = Utf8Validator.new
+    v.update(bytes) && v.complete?
+  end
+end
+
+# =============================================================================
+# ExtensionOffer: Parsed Sec-WebSocket-Extensions offer and parameters (RFC 7692)
+# =============================================================================
+
+pub struct ExtensionOffer
+  getter name : String
+  getter client_no_context_takeover : Bool
+  getter server_no_context_takeover : Bool
+  getter has_window_bits : Bool
+  getter unknown_params : Array(String)
+
+  def initialize(@name : String, @client_no_context_takeover : Bool,
+                 @server_no_context_takeover : Bool,
+                 @has_window_bits : Bool,
+                 @unknown_params : Array(String))
+  end
+end
+
+# =============================================================================
+# Handshake: RFC 6455 Section 1.3, 4.1, 4.2
+# =============================================================================
+
+pub struct Handshake
+  # Computes the Sec-WebSocket-Accept response value from the client's Sec-WebSocket-Key.
+  # Matches RFC 6455 Section 1.3 test vector:
+  #   "dGhlIHNhbXBsZSBub25jZQ==" -> "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+  pub def self.compute_accept(key : String) : String
+    digest = SHA1.digest(key + GUID)
+    Base64.encode(digest)
+  end
+
+  # Generates a random 16-byte base64-encoded client key.
+  pub def self.generate_key : String
+    buf = Bytes.new(16)
+    random_bytes(buf)
+    Base64.encode(buf)
+  end
+
+  # Constructs a client handshake Request.
+  pub def self.build_client_request(target : String, host : String, key : String,
+                                    subprotocols : Array(String)? = nil,
+                                    extensions : Array(String)? = nil) : Request
+    headers = Headers.new
+    headers["Host"] = host
+    headers["Upgrade"] = "websocket"
+    headers["Connection"] = "Upgrade"
+    headers["Sec-WebSocket-Key"] = key
+    headers["Sec-WebSocket-Version"] = "13"
+    if sp = subprotocols
+      headers["Sec-WebSocket-Protocol"] = sp.join(", ")
+    end
+    if ext = extensions
+      headers["Sec-WebSocket-Extensions"] = ext.join("; ")
+    end
+    Request.new("GET", target, headers)
+  end
+
+  # Validates an incoming client handshake Request on the server side.
+  # Returns the client key on success, or a WebSocketError on failure.
+  pub def self.verify_client_request(req : Request) : String | WebSocketError
+    return WebSocketError.new(CLOSE_PROTOCOL_ERROR, "HTTP method must be GET") if req.method != "GET"
+    return WebSocketError.new(CLOSE_PROTOCOL_ERROR, "HTTP version must be >= 1.1") if req.version < "HTTP/1.1"
+    host = req.headers["Host"]?
+    if host.nil? || host.empty?
+      return WebSocketError.new(CLOSE_PROTOCOL_ERROR, "Missing Host header")
+    end
+
+    unless req.headers.includes_word?("Upgrade", "websocket")
+      return WebSocketError.new(CLOSE_PROTOCOL_ERROR, "Missing or invalid Upgrade header")
+    end
+
+    unless req.headers.includes_word?("Connection", "upgrade")
+      return WebSocketError.new(CLOSE_PROTOCOL_ERROR, "Missing or invalid Connection header")
+    end
+
+    version = req.headers["Sec-WebSocket-Version"]?
+    unless version == "13"
+      return WebSocketError.new(CLOSE_PROTOCOL_ERROR, "Sec-WebSocket-Version must be 13")
+    end
+
+    key = req.headers["Sec-WebSocket-Key"]?
+    return WebSocketError.new(CLOSE_PROTOCOL_ERROR, "Missing Sec-WebSocket-Key header") unless key
+
+    if key.bytesize != 24 || !key.ends_with?("==")
+      return WebSocketError.new(CLOSE_PROTOCOL_ERROR, "Sec-WebSocket-Key must be 24-character base64 ending in ==")
+    end
+
+    begin
+      decoded = Base64.decode(key)
+      if decoded.size != 16
+        return WebSocketError.new(CLOSE_PROTOCOL_ERROR, "Sec-WebSocket-Key must decode to 16 bytes")
+      end
+    rescue
+      return WebSocketError.new(CLOSE_PROTOCOL_ERROR, "Invalid base64 in Sec-WebSocket-Key")
+    end
+
+    key
+  end
+
+  # Constructs the server's 101 Switching Protocols response.
+  pub def self.build_server_response(key : String, subprotocol : String? = nil,
+                                     extensions : Array(String)? = nil) : Response
+    headers = Headers.new
+    headers["Upgrade"] = "websocket"
+    headers["Connection"] = "Upgrade"
+    headers["Sec-WebSocket-Accept"] = compute_accept(key)
+    if sp = subprotocol
+      headers["Sec-WebSocket-Protocol"] = sp
+    end
+    if ext = extensions
+      headers["Sec-WebSocket-Extensions"] = ext.join("; ")
+    end
+    Response.new(101, headers, status_message: "Switching Protocols")
+  end
+
+  # Parses extension offers and parameters from a Sec-WebSocket-Extensions header.
+  pub def self.parse_extension_offers(header_value : String) : Array(ExtensionOffer)
+    offers = [] of ExtensionOffer
+    ext_clauses = header_value.split(',')
+    i = 0
+    while i < ext_clauses.size
+      clause = ext_clauses[i].strip
+      unless clause.empty?
+        parts = clause.split(';')
+        ext_name = parts[0].strip.downcase
+        c_no_ctx = false
+        s_no_ctx = false
+        win_bits = false
+        unknowns = [] of String
+
+        p_idx = 1
+        while p_idx < parts.size
+          param = parts[p_idx].strip.downcase
+          param_name = param
+          eq_idx = param.index('=')
+          if eq_idx
+            param_name = param[0, eq_idx].strip
+          end
+
+          if param_name == "client_no_context_takeover"
+            c_no_ctx = true
+          elsif param_name == "server_no_context_takeover"
+            s_no_ctx = true
+          elsif param_name == "client_max_window_bits" || param_name == "server_max_window_bits"
+            win_bits = true
+          else
+            unknowns << param_name unless param_name.empty?
+          end
+          p_idx = p_idx + 1
+        end
+
+        offers << ExtensionOffer.new(ext_name, c_no_ctx, s_no_ctx, win_bits, unknowns)
+      end
+      i = i + 1
+    end
+    offers
+  end
+
+  # Server-side negotiation: checks if client offered permessage-deflate with both
+  # client_no_context_takeover and server_no_context_takeover.
+  # If server also enables deflate and client offered both no-context parameters without
+  # unsupported window-bit requirements, returns the negotiated response header.
+  # Otherwise returns nil (declining deflate, continuing uncompressed).
+  pub def self.negotiate_server_extensions(client_header : String?,
+                                           server_allows_deflate : Bool) : Tuple(Array(String)?, Bool)
+    return {nil, false} unless client_header && server_allows_deflate
+
+    offers = parse_extension_offers(client_header)
+    i = 0
+    while i < offers.size
+      offer = offers[i]
+      if offer.name == "permessage-deflate"
+        # Decline if client demands unsupported window-bits or unknown params
+        if offer.has_window_bits || !offer.unknown_params.empty?
+          return {nil, false}
+        end
+        # Require client_no_context_takeover and server_no_context_takeover
+        # because our compressor/inflater are stateless per-message
+        if offer.client_no_context_takeover && offer.server_no_context_takeover
+          resp_ext = ["permessage-deflate; client_no_context_takeover; server_no_context_takeover"]
+          return {resp_ext, true}
+        else
+          # Client offered bare permessage-deflate or omitted one no-context parameter;
+          # decline context-takeover deflate to prevent dictionary drift errors
+          return {nil, false}
+        end
+      end
+      i = i + 1
+    end
+
+    {nil, false}
+  end
+
+  # Validates the server's response on the client side against the expected client key,
+  # requested subprotocols, and requested extensions (RFC 6455 & RFC 7692).
+  # Returns true if permessage-deflate was negotiated, false if uncompressed, or WebSocketError.
+  pub def self.verify_server_response(res : Response, expected_key : String,
+                                      requested_subprotocols : Array(String)? = nil,
+                                      requested_extensions : Array(String)? = nil) : Bool | WebSocketError
+    if res.status.code != 101
+      return WebSocketError.new(CLOSE_PROTOCOL_ERROR, "Server response status is not 101: #{res.status.code}")
+    end
+
+    unless res.headers.includes_word?("Upgrade", "websocket")
+      return WebSocketError.new(CLOSE_PROTOCOL_ERROR, "Server response missing Upgrade: websocket")
+    end
+
+    unless res.headers.includes_word?("Connection", "upgrade")
+      return WebSocketError.new(CLOSE_PROTOCOL_ERROR, "Server response missing Connection: upgrade")
+    end
+
+    accept = res.headers["Sec-WebSocket-Accept"]?
+    return WebSocketError.new(CLOSE_PROTOCOL_ERROR, "Server response missing Sec-WebSocket-Accept") unless accept
+
+    expected = compute_accept(expected_key)
+    unless accept == expected
+      return WebSocketError.new(CLOSE_PROTOCOL_ERROR, "Sec-WebSocket-Accept mismatch: got #{accept}, expected #{expected}")
+    end
+
+    server_proto = res.headers["Sec-WebSocket-Protocol"]?
+    if sp = server_proto
+      if req_sp = requested_subprotocols
+        found = false
+        i = 0
+        while i < req_sp.size
+          if req_sp[i] == sp
+            found = true
+            break
+          end
+          i = i + 1
+        end
+        unless found
+          return WebSocketError.new(CLOSE_PROTOCOL_ERROR, "Server selected unrequested subprotocol: #{sp}")
+        end
+      else
+        return WebSocketError.new(CLOSE_PROTOCOL_ERROR, "Server returned Sec-WebSocket-Protocol but none requested")
+      end
+    end
+
+    # Extension negotiation verification (RFC 7692)
+    deflate_negotiated = false
+    server_ext = res.headers["Sec-WebSocket-Extensions"]?
+    if s_ext = server_ext
+      s_offers = parse_extension_offers(s_ext)
+      s_idx = 0
+      while s_idx < s_offers.size
+        s_off = s_offers[s_idx]
+        if s_off.name == "permessage-deflate"
+          client_offered_deflate = false
+          if req_exts = requested_extensions
+            k = 0
+            while k < req_exts.size
+              if req_exts[k].includes?("permessage-deflate")
+                client_offered_deflate = true
+                break
+              end
+              k = k + 1
+            end
+          end
+
+          unless client_offered_deflate
+            return WebSocketError.new(CLOSE_PROTOCOL_ERROR, "Server selected permessage-deflate but client did not offer it")
+          end
+
+          unless s_off.client_no_context_takeover
+            return WebSocketError.new(CLOSE_PROTOCOL_ERROR, "Server omitted client_no_context_takeover parameter")
+          end
+
+          unless s_off.server_no_context_takeover
+            return WebSocketError.new(CLOSE_PROTOCOL_ERROR, "Server omitted server_no_context_takeover parameter")
+          end
+
+          if s_off.has_window_bits
+            return WebSocketError.new(CLOSE_PROTOCOL_ERROR, "Server selected unsupported window bits parameter")
+          end
+
+          unless s_off.unknown_params.empty?
+            return WebSocketError.new(CLOSE_PROTOCOL_ERROR, "Server selected unknown extension parameter: #{s_off.unknown_params[0]}")
+          end
+
+          deflate_negotiated = true
+        else
+          return WebSocketError.new(CLOSE_PROTOCOL_ERROR, "Server selected unsupported extension: #{s_off.name}")
+        end
+        s_idx = s_idx + 1
+      end
+    end
+
+    deflate_negotiated
+  end
+
+  # Extracts any bytes following the HTTP header terminator (\r\n\r\n or \n\n)
+  pub def self.extract_trailing_bytes(raw : String) : Bytes
+    idx = raw.index("\r\n\r\n")
+    header_end = idx ? idx + 4 : nil
+    unless header_end
+      idx2 = raw.index("\n\n")
+      header_end = idx2 ? idx2 + 2 : nil
+    end
+    if h_end = header_end
+      rem = raw.bytesize - h_end
+      if rem > 0
+        b = Bytes.new(rem)
+        b.to_unsafe.copy_from(raw.to_unsafe + h_end, rem)
+        return b
+      end
+    end
+    Bytes.new(0)
+  end
+end
+
+# =============================================================================
+# Frame: RFC 6455 Frame Model, Serialization and Wire Parser
+# =============================================================================
+
+pub struct Frame
+  property fin : Bool
+  property rsv1 : Bool
+  property rsv2 : Bool
+  property rsv3 : Bool
+  property opcode : UInt8
+  property masked : Bool
+  property mask_key : Bytes?
+  property payload : Bytes
+
+  def initialize(@opcode : UInt8, @payload : Bytes, @fin : Bool = true,
+                 @masked : Bool = false, @mask_key : Bytes? = nil,
+                 @rsv1 : Bool = false, @rsv2 : Bool = false, @rsv3 : Bool = false)
+  end
+
+  def control? : Bool
+    @opcode >= 0x8_u8
+  end
+
+  # Serializes this frame to RFC 6455 wire format.
+  pub def serialize(masked_override : Bool? = nil, mask_key_override : Bytes? = nil) : Bytes
+    is_masked = masked_override.nil? ? @masked : masked_override
+    key = mask_key_override || @mask_key
+
+    if is_masked && (key.nil? || key.size != 4)
+      gen_key = Bytes.new(4)
+      random_bytes(gen_key)
+      key = gen_key
+    end
+
+    payload_len = @payload.size
+    header_size = 2
+    if payload_len <= 125
+      # header_size remains 2
+    elsif payload_len <= 65535
+      header_size = header_size + 2
+    else
+      header_size = header_size + 8
+    end
+    header_size = header_size + 4 if is_masked
+
+    total_size = header_size + payload_len
+    out = Bytes.new(total_size)
+    out_ptr = out.to_unsafe
+
+    # Byte 0: FIN, RSV1-3, Opcode
+    b0 = (@fin ? 0x80_u8 : 0x00_u8) |
+         (@rsv1 ? 0x40_u8 : 0x00_u8) |
+         (@rsv2 ? 0x20_u8 : 0x00_u8) |
+         (@rsv3 ? 0x10_u8 : 0x00_u8) |
+         (@opcode & 0x0F_u8)
+    out_ptr[0] = b0
+
+    # Byte 1: Mask bit + 7-bit length
+    mask_flag = is_masked ? 0x80_u8 : 0x00_u8
+    offset = 2
+
+    if payload_len <= 125
+      out_ptr[1] = mask_flag | payload_len.to_u8
+    elsif payload_len <= 65535
+      out_ptr[1] = mask_flag | 126_u8
+      out_ptr[offset] = ((payload_len >> 8) & 255).to_u8
+      out_ptr[offset + 1] = (payload_len & 255).to_u8
+      offset = offset + 2
+    else
+      out_ptr[1] = mask_flag | 127_u8
+      # 64-bit big endian length
+      out_ptr[offset] = 0_u8
+      out_ptr[offset + 1] = 0_u8
+      out_ptr[offset + 2] = 0_u8
+      out_ptr[offset + 3] = 0_u8
+      out_ptr[offset + 4] = ((payload_len >> 24) & 255).to_u8
+      out_ptr[offset + 5] = ((payload_len >> 16) & 255).to_u8
+      out_ptr[offset + 6] = ((payload_len >> 8) & 255).to_u8
+      out_ptr[offset + 7] = (payload_len & 255).to_u8
+      offset = offset + 8
+    end
+
+    if is_masked
+      if k = key
+        k_ptr = k.to_unsafe
+        out_ptr[offset] = k_ptr[0]
+        out_ptr[offset + 1] = k_ptr[1]
+        out_ptr[offset + 2] = k_ptr[2]
+        out_ptr[offset + 3] = k_ptr[3]
+        offset = offset + 4
+
+        # Apply mask
+        p_ptr = @payload.to_unsafe
+        i = 0
+        while i < payload_len
+          out_ptr[offset + i] = p_ptr[i] ^ k_ptr[i & 3]
+          i = i + 1
+        end
+      end
+    else
+      # Unmasked payload copy
+      (out_ptr + offset).copy_from(@payload.to_unsafe, payload_len)
+    end
+
+    out
+  end
+
+  # Parses a Frame from raw wire bytes with full RFC 6455 verification.
+  pub def self.parse(raw : Bytes, is_server : Bool = false,
+                     deflate_enabled : Bool = false,
+                     max_payload : Int64 = 16777216_i64) : Frame | WebSocketError
+    return WebSocketError.new(CLOSE_PROTOCOL_ERROR, "Frame too short") if raw.size < 2
+
+    raw_ptr = raw.to_unsafe
+    b0 = raw_ptr[0]
+    b1 = raw_ptr[1]
+
+    fin = (b0 & 0x80_u8) != 0_u8
+    rsv1 = (b0 & 0x40_u8) != 0_u8
+    rsv2 = (b0 & 0x20_u8) != 0_u8
+    rsv3 = (b0 & 0x10_u8) != 0_u8
+    opcode = b0 & 0x0F_u8
+
+    masked = (b1 & 0x80_u8) != 0_u8
+    len7 = b1 & 0x7F_u8
+
+    # 1. Opcode validity check
+    unless valid_opcode?(opcode)
+      return WebSocketError.new(CLOSE_PROTOCOL_ERROR, "Invalid or reserved opcode: #{opcode.to_i32}")
+    end
+
+    # 2. RSV bits check: MUST be 0 unless negotiated extension (e.g. permessage-deflate uses RSV1)
+    if deflate_enabled
+      if (opcode >= 0x8_u8 && rsv1) || rsv2 || rsv3
+        return WebSocketError.new(CLOSE_PROTOCOL_ERROR, "RSV bit set on control frame or unnegotiated RSV bit set")
+      end
+    else
+      if rsv1 || rsv2 || rsv3
+        return WebSocketError.new(CLOSE_PROTOCOL_ERROR, "RSV bits set without negotiated extension")
+      end
+    end
+
+    # 3. Control frame rules (opcode >= 0x8)
+    if opcode >= 0x8_u8
+      unless fin
+        return WebSocketError.new(CLOSE_PROTOCOL_ERROR, "Control frame cannot be fragmented (FIN=0)")
+      end
+      if len7 > 125_u8
+        return WebSocketError.new(CLOSE_PROTOCOL_ERROR, "Control frame payload exceeds 125 bytes")
+      end
+    end
+
+    # 4. Masking enforcement (RFC 6455 Section 5.1):
+    # Client MUST mask every frame. Server MUST reject unmasked frame with 1002.
+    # Server MUST NOT mask any frame. Client MUST reject masked frame with 1002.
+    if is_server
+      unless masked
+        return WebSocketError.new(CLOSE_PROTOCOL_ERROR, "Client frame must be masked")
+      end
+    else
+      if masked
+        return WebSocketError.new(CLOSE_PROTOCOL_ERROR, "Server frame must not be masked")
+      end
+    end
+
+    offset = 2
+
+    # 5. Payload length decoding & minimal length encoding check
+    payload_len = 0_i64
+    if len7 <= 125_u8
+      payload_len = len7.to_i64
+    elsif len7 == 126_u8
+      return WebSocketError.new(CLOSE_PROTOCOL_ERROR, "Incomplete 16-bit payload length") if raw.size < offset + 2
+      high = raw_ptr[offset].to_i64
+      low = raw_ptr[offset + 1].to_i64
+      payload_len = (high << 8) | low
+      offset = offset + 2
+
+      # Minimal encoding rule: 16-bit format MUST NOT be used for lengths < 126
+      if payload_len < 126_i64
+        return WebSocketError.new(CLOSE_PROTOCOL_ERROR, "Payload length not minimally encoded (16-bit for length < 126)")
+      end
+    elsif len7 == 127_u8
+      return WebSocketError.new(CLOSE_PROTOCOL_ERROR, "Incomplete 64-bit payload length") if raw.size < offset + 8
+      # MSB MUST be 0
+      if (raw_ptr[offset] & 0x80_u8) != 0_u8
+        return WebSocketError.new(CLOSE_PROTOCOL_ERROR, "64-bit payload length MSB must be 0")
+      end
+
+      payload_len = 0_i64
+      i = 0
+      while i < 8
+        payload_len = (payload_len << 8) | raw_ptr[offset + i].to_i64
+        i = i + 1
+      end
+      offset = offset + 8
+
+      # Minimal encoding rule: 64-bit format MUST NOT be used for lengths <= 65535
+      if payload_len <= 65535_i64
+        return WebSocketError.new(CLOSE_PROTOCOL_ERROR, "Payload length not minimally encoded (64-bit for length <= 65535)")
+      end
+    end
+
+    if payload_len > max_payload
+      return WebSocketError.new(CLOSE_MESSAGE_TOO_BIG, "Message payload size exceeds maximum limit")
+    end
+
+    # 6. Masking key
+    mask_key : Bytes? = nil
+    if masked
+      return WebSocketError.new(CLOSE_PROTOCOL_ERROR, "Incomplete masking key") if raw.size < offset + 4
+      mk = Bytes.new(4)
+      mk_ptr = mk.to_unsafe
+      mk_ptr[0] = raw_ptr[offset]
+      mk_ptr[1] = raw_ptr[offset + 1]
+      mk_ptr[2] = raw_ptr[offset + 2]
+      mk_ptr[3] = raw_ptr[offset + 3]
+      mask_key = mk
+      offset = offset + 4
+    end
+
+    # 7. Payload
+    available_payload = raw.size - offset
+    if available_payload.to_i64 < payload_len
+      return WebSocketError.new(CLOSE_PROTOCOL_ERROR, "Incomplete frame payload: expected #{payload_len}, got #{available_payload}")
+    end
+
+    payload_int = payload_len.to_i32
+    payload = Bytes.new(payload_int)
+    p_ptr = payload.to_unsafe
+
+    if masked
+      if k = mask_key
+        k_ptr = k.to_unsafe
+        i = 0
+        while i < payload_int
+          p_ptr[i] = raw_ptr[offset + i] ^ k_ptr[i & 3]
+          i = i + 1
+        end
+      end
+    else
+      p_ptr.copy_from(raw_ptr + offset, payload_int)
+    end
+
+    # 8. Close frame payload verification (RFC 6455 Section 5.5.1 & 7.4)
+    if opcode == OP_CLOSE
+      if payload_int == 1
+        return WebSocketError.new(CLOSE_PROTOCOL_ERROR, "Close frame payload size cannot be 1 byte")
+      elsif payload_int >= 2
+        close_code = (p_ptr[0].to_i32 << 8) | p_ptr[1].to_i32
+        unless Std::Websocket.valid_wire_close_code?(close_code)
+          return WebSocketError.new(CLOSE_PROTOCOL_ERROR, "Invalid close code on wire: #{close_code}")
+        end
+        if payload_int > 2
+          reason_slice = Slice(UInt8).new(p_ptr + 2, payload_int - 2)
+          unless Utf8Validator.valid?(reason_slice)
+            return WebSocketError.new(CLOSE_INVALID_PAYLOAD, "Close reason is not valid UTF-8")
+          end
+        end
+      end
+    end
+
+    Frame.new(opcode, payload, fin: fin, masked: masked, mask_key: mask_key,
+      rsv1: rsv1, rsv2: rsv2, rsv3: rsv3)
+  end
+
+  # Reads a single frame from an IO stream with full RFC 6455 enforcement.
+  pub def self.read_from(io, is_server : Bool = false,
+                         deflate_enabled : Bool = false,
+                         max_payload : Int64 = 16777216_i64) : Frame | WebSocketError | Nil
+    header2 = Bytes.new(2)
+    h2_ptr = header2.to_unsafe
+    unless read_exact(io, h2_ptr, 2)
+      return nil # EOF
+    end
+
+    b0 = h2_ptr[0]
+    b1 = h2_ptr[1]
+
+    fin = (b0 & 0x80_u8) != 0_u8
+    rsv1 = (b0 & 0x40_u8) != 0_u8
+    rsv2 = (b0 & 0x20_u8) != 0_u8
+    rsv3 = (b0 & 0x10_u8) != 0_u8
+    opcode = b0 & 0x0F_u8
+
+    masked = (b1 & 0x80_u8) != 0_u8
+    len7 = b1 & 0x7F_u8
+
+    unless valid_opcode?(opcode)
+      return WebSocketError.new(CLOSE_PROTOCOL_ERROR, "Invalid or reserved opcode: #{opcode.to_i32}")
+    end
+
+    if deflate_enabled
+      if (opcode >= 0x8_u8 && rsv1) || rsv2 || rsv3
+        return WebSocketError.new(CLOSE_PROTOCOL_ERROR, "RSV bit set on control frame or unnegotiated RSV bit set")
+      end
+    else
+      if rsv1 || rsv2 || rsv3
+        return WebSocketError.new(CLOSE_PROTOCOL_ERROR, "RSV bits set without negotiated extension")
+      end
+    end
+
+    if opcode >= 0x8_u8
+      unless fin
+        return WebSocketError.new(CLOSE_PROTOCOL_ERROR, "Control frame cannot be fragmented (FIN=0)")
+      end
+      if len7 > 125_u8
+        return WebSocketError.new(CLOSE_PROTOCOL_ERROR, "Control frame payload exceeds 125 bytes")
+      end
+    end
+
+    if is_server
+      unless masked
+        return WebSocketError.new(CLOSE_PROTOCOL_ERROR, "Client frame must be masked")
+      end
+    else
+      if masked
+        return WebSocketError.new(CLOSE_PROTOCOL_ERROR, "Server frame must not be masked")
+      end
+    end
+
+    payload_len = 0_i64
+    if len7 <= 125_u8
+      payload_len = len7.to_i64
+    elsif len7 == 126_u8
+      len_buf = Bytes.new(2)
+      return WebSocketError.new(CLOSE_PROTOCOL_ERROR, "Unexpected EOF reading 16-bit length") unless read_exact(io, len_buf.to_unsafe, 2)
+      high = len_buf[0].to_i64
+      low = len_buf[1].to_i64
+      payload_len = (high << 8) | low
+      if payload_len < 126_i64
+        return WebSocketError.new(CLOSE_PROTOCOL_ERROR, "Payload length not minimally encoded (16-bit for length < 126)")
+      end
+    elsif len7 == 127_u8
+      len_buf = Bytes.new(8)
+      return WebSocketError.new(CLOSE_PROTOCOL_ERROR, "Unexpected EOF reading 64-bit length") unless read_exact(io, len_buf.to_unsafe, 8)
+      if (len_buf[0] & 0x80_u8) != 0_u8
+        return WebSocketError.new(CLOSE_PROTOCOL_ERROR, "64-bit payload length MSB must be 0")
+      end
+      payload_len = 0_i64
+      i = 0
+      while i < 8
+        payload_len = (payload_len << 8) | len_buf[i].to_i64
+        i = i + 1
+      end
+      if payload_len <= 65535_i64
+        return WebSocketError.new(CLOSE_PROTOCOL_ERROR, "Payload length not minimally encoded (64-bit for length <= 65535)")
+      end
+    end
+
+    if payload_len > max_payload
+      return WebSocketError.new(CLOSE_MESSAGE_TOO_BIG, "Message payload size exceeds maximum limit")
+    end
+
+    mask_key : Bytes? = nil
+    if masked
+      mk = Bytes.new(4)
+      return WebSocketError.new(CLOSE_PROTOCOL_ERROR, "Unexpected EOF reading masking key") unless read_exact(io, mk.to_unsafe, 4)
+      mask_key = mk
+    end
+
+    payload_int = payload_len.to_i32
+    payload = Bytes.new(payload_int)
+    p_ptr = payload.to_unsafe
+
+    if payload_int > 0
+      return WebSocketError.new(CLOSE_PROTOCOL_ERROR, "Unexpected EOF reading payload") unless read_exact(io, p_ptr, payload_int)
+    end
+
+    if masked
+      if k = mask_key
+        k_ptr = k.to_unsafe
+        i = 0
+        while i < payload_int
+          p_ptr[i] = p_ptr[i] ^ k_ptr[i & 3]
+          i = i + 1
+        end
+      end
+    end
+
+    if opcode == OP_CLOSE
+      if payload_int == 1
+        return WebSocketError.new(CLOSE_PROTOCOL_ERROR, "Close frame payload size cannot be 1 byte")
+      elsif payload_int >= 2
+        close_code = (p_ptr[0].to_i32 << 8) | p_ptr[1].to_i32
+        unless Std::Websocket.valid_wire_close_code?(close_code)
+          return WebSocketError.new(CLOSE_PROTOCOL_ERROR, "Invalid close code on wire: #{close_code}")
+        end
+        if payload_int > 2
+          reason_slice = Slice(UInt8).new(p_ptr + 2, payload_int - 2)
+          unless Utf8Validator.valid?(reason_slice)
+            return WebSocketError.new(CLOSE_INVALID_PAYLOAD, "Close reason is not valid UTF-8")
+          end
+        end
+      end
+    end
+
+    Frame.new(opcode, payload, fin: fin, masked: masked, mask_key: mask_key,
+      rsv1: rsv1, rsv2: rsv2, rsv3: rsv3)
+  end
+
+  private def self.read_exact(io, buffer : Pointer(UInt8), count : Int32) : Bool
+    total = 0
+    while total < count
+      n = io.read(buffer + total, count - total)
+      return false if n <= 0
+      total = total + n
+    end
+    true
+  end
+end
+
+# =============================================================================
+# Message: Reassembled WebSocket Message (Text or Binary)
+# =============================================================================
+
+pub struct Message
+  property opcode : UInt8
+  property payload : Bytes
+
+  def initialize(@opcode : UInt8, @payload : Bytes)
+  end
+
+  def text? : Bool
+    @opcode == OP_TEXT
+  end
+
+  def binary? : Bool
+    @opcode == OP_BINARY
+  end
+
+  def text : String
+    String.new(@payload.size) do |buf|
+      buf.copy_from(@payload.to_unsafe, @payload.size)
+    end
+  end
+
+  def to_s : String
+    text
+  end
+end
+
+# =============================================================================
+# MemoryTransport: High-Performance In-Memory Transport for Tests & Automation
+# =============================================================================
+
+pub class MemoryTransport
+  @buffer : Pointer(UInt8)
+  @capacity : Int32
+  @head : Int32
+  @tail : Int32
+  @closed : Bool
+  @peer : MemoryTransport?
+
+  property peer : MemoryTransport?
+
+  def initialize(capacity : Int32 = 65536)
+    @capacity = capacity
+    @buffer = Pointer(UInt8).malloc(capacity.to_u64)
+    @head = 0
+    @tail = 0
+    @closed = false
+    @peer = nil
+  end
+
+  pub def self.pair(capacity : Int32 = 65536) : Tuple(MemoryTransport, MemoryTransport)
+    t1 = MemoryTransport.new(capacity)
+    t2 = MemoryTransport.new(capacity)
+    t1.peer = t2
+    t2.peer = t1
+    {t1, t2}
+  end
+
+  pub def feed(bytes : Bytes) : Nil
+    return if bytes.empty?
+    ensure_capacity(bytes.size)
+    (@buffer + @tail).copy_from(bytes.to_unsafe, bytes.size)
+    @tail = @tail + bytes.size
+  end
+
+  pub def read(dest : Pointer(UInt8), count : Int32) : Int32
+    available = @tail - @head
+    return 0 if available <= 0
+    to_read = count < available ? count : available
+    dest.copy_from(@buffer + @head, to_read)
+    @head = @head + to_read
+    if @head == @tail
+      @head = 0
+      @tail = 0
+    end
+    to_read
+  end
+
+  pub def write(src : Pointer(UInt8), count : Int32) : Int32
+    return -1 if @closed
+    if p = @peer
+      p.feed(Bytes.new(src, count))
+    else
+      ensure_capacity(count)
+      (@buffer + @tail).copy_from(src, count)
+      @tail = @tail + count
+    end
+    count
+  end
+
+  pub def close : Nil
+    @closed = true
+  end
+
+  pub def closed? : Bool
+    @closed
+  end
+
+  pub def take_all : Bytes
+    available = @tail - @head
+    return Bytes.new(0) if available <= 0
+    b = Bytes.new(available)
+    b.to_unsafe.copy_from(@buffer + @head, available)
+    @head = 0
+    @tail = 0
+    b
+  end
+
+  private def ensure_capacity(needed : Int32) : Nil
+    available_space = @capacity - @tail
+    return if available_space >= needed
+
+    alive = @tail - @head
+    if (@capacity - alive) >= needed
+      if alive > 0
+        @buffer.copy_from(@buffer + @head, alive)
+      end
+      @head = 0
+      @tail = alive
+      return
+    end
+
+    new_cap = @capacity * 2
+    new_cap = new_cap + needed if new_cap < @tail + needed
+    new_buf = Pointer(UInt8).malloc(new_cap.to_u64)
+    if alive > 0
+      new_buf.copy_from(@buffer + @head, alive)
+    end
+    @buffer = new_buf
+    @capacity = new_cap
+    @head = 0
+    @tail = alive
+  end
+end
+
+# =============================================================================
+# Session: Bidirectional WebSocket Session with Fragmentation and Control Handling
+# =============================================================================
+
+pub class Session(T)
+  @io : T
+  @is_server : Bool
+  @deflate_enabled : Bool
+
+  @closed : Bool
+  @close_sent : Bool
+  @close_received : Bool
+  @close_code : Int32?
+  @close_reason : String?
+
+  @current_opcode : UInt8?
+  @current_fragments : Array(Bytes)
+  @current_compressed : Bool
+  @utf8_validator : Utf8Validator
+  @max_message_size : Int64
+
+  getter is_server : Bool
+  getter deflate_enabled : Bool
+  getter closed : Bool
+  getter close_sent : Bool
+  getter close_received : Bool
+  getter close_code : Int32?
+  getter close_reason : String?
+  property max_message_size : Int64
+
+  def initialize(@io : T, @is_server : Bool = false, @deflate_enabled : Bool = false)
+    @closed = false
+    @close_sent = false
+    @close_received = false
+    @close_code = nil
+    @close_reason = nil
+
+    @current_opcode = nil
+    @current_fragments = [] of Bytes
+    @current_compressed = false
+    @utf8_validator = Utf8Validator.new
+    @max_message_size = 16777216_i64 # 16 MB default
+  end
+
+  pub def closed? : Bool
+    @closed
+  end
+
+  # Reads a single frame from the transport.
+  pub def receive_frame : Frame | WebSocketError | Nil
+    Frame.read_from(@io, is_server: @is_server, deflate_enabled: @deflate_enabled, max_payload: @max_message_size)
+  end
+
+  # Receives the next complete message (reassembling fragments, handling interleaved
+  # control frames, and performing incremental UTF-8 validation).
+  pub def receive : Message | WebSocketError | Nil
+    while !@closed
+      res = receive_frame
+      case res
+      in WebSocketError
+        # Protocol error on receive: initiate closure with the error code and return error
+        fail_connection(res.code, res.message)
+        return res
+      in Nil
+        @closed = true
+        return nil
+      in Frame
+        frame = res
+        if frame.control?
+          # Control frames (Ping, Pong, Close) are handled immediately without disturbing
+          # ongoing fragmented data message reassembly
+          case frame.opcode
+          when OP_PING
+            send_pong(frame.payload)
+          when OP_PONG
+            # Unsolicited pong or ping reply; continue receiving
+          when OP_CLOSE
+            @close_received = true
+            code = CLOSE_NO_STATUS_RCVD
+            reason = ""
+            if frame.payload.size >= 2
+              code = (frame.payload[0].to_i32 << 8) | frame.payload[1].to_i32
+              if frame.payload.size > 2
+                reason = String.new(frame.payload.size - 2) do |buf|
+                  buf.copy_from(frame.payload.to_unsafe + 2, frame.payload.size - 2)
+                end
+              end
+            end
+            @close_code = code
+            @close_reason = reason
+
+            unless @close_sent
+              # Echo close response back
+              reply_code = Std::Websocket.valid_wire_close_code?(code) ? code : CLOSE_NORMAL
+              send_close(reply_code, reason)
+            end
+            @closed = true
+            @io.close
+            return nil
+          end
+        else
+          # Data frame or Continuation frame
+          if frame.opcode == OP_CONTINUATION
+            if @current_opcode.nil?
+              err = WebSocketError.new(CLOSE_PROTOCOL_ERROR, "Continuation frame without preceding data frame")
+              fail_connection(err.code, err.message)
+              return err
+            end
+            if frame.rsv1
+              err = WebSocketError.new(CLOSE_PROTOCOL_ERROR, "Continuation frame cannot have RSV1 bit set")
+              fail_connection(err.code, err.message)
+              return err
+            end
+          else
+            unless @current_opcode.nil?
+              err = WebSocketError.new(CLOSE_PROTOCOL_ERROR, "New data frame arrived before fragmented message completed")
+              fail_connection(err.code, err.message)
+              return err
+            end
+            @current_opcode = frame.opcode
+            @current_compressed = frame.rsv1
+            @current_fragments = [] of Bytes
+            @utf8_validator.reset if frame.opcode == OP_TEXT
+          end
+
+          # Incremental UTF-8 validation on text frames
+          if @current_opcode == OP_TEXT && !@current_compressed
+            unless @utf8_validator.update(frame.payload)
+              err = WebSocketError.new(CLOSE_INVALID_PAYLOAD, "Invalid UTF-8 in text frame")
+              fail_connection(err.code, err.message)
+              return err
+            end
+          end
+
+          @current_fragments << frame.payload
+
+          # Check accumulated message size
+          total_size = 0_i64
+          i = 0
+          while i < @current_fragments.size
+            total_size = total_size + @current_fragments[i].size.to_i64
+            i = i + 1
+          end
+          if total_size > @max_message_size
+            err = WebSocketError.new(CLOSE_MESSAGE_TOO_BIG, "Message exceeds maximum size limit")
+            fail_connection(err.code, err.message)
+            return err
+          end
+
+          if frame.fin
+            # Final fragment of the message
+            if @current_opcode == OP_TEXT && !@current_compressed
+              unless @utf8_validator.complete?
+                err = WebSocketError.new(CLOSE_INVALID_PAYLOAD, "Incomplete UTF-8 sequence at end of message")
+                fail_connection(err.code, err.message)
+                return err
+              end
+            end
+
+            # Reassemble full payload
+            full_payload = Bytes.new(total_size.to_i32)
+            dest_ptr = full_payload.to_unsafe
+            copied = 0
+            i = 0
+            while i < @current_fragments.size
+              frag = @current_fragments[i]
+              (dest_ptr + copied).copy_from(frag.to_unsafe, frag.size)
+              copied = copied + frag.size
+              i = i + 1
+            end
+
+            final_opcode = @current_opcode || OP_TEXT
+
+            # Permessage-deflate decompression seam (RFC 7692)
+            if @current_compressed
+              # Append 4-byte octet 0x00 0x00 0xFF 0xFF
+              decomp_input = Bytes.new(full_payload.size + 4)
+              decomp_input.to_unsafe.copy_from(full_payload.to_unsafe, full_payload.size)
+              decomp_input[full_payload.size] = 0x00_u8
+              decomp_input[full_payload.size + 1] = 0x00_u8
+              decomp_input[full_payload.size + 2] = 0xFF_u8
+              decomp_input[full_payload.size + 3] = 0xFF_u8
+
+              decomp_res = Inflate.decompress(decomp_input, @max_message_size)
+              case decomp_res
+              in DecompressLimitExceeded
+                err = WebSocketError.new(CLOSE_MESSAGE_TOO_BIG, "Decompressed message exceeds maximum size limit")
+                fail_connection(err.code, err.message)
+                return err
+              in DecompressError
+                err = WebSocketError.new(CLOSE_INVALID_PAYLOAD, "Failed to decompress frame: #{decomp_res.message}")
+                fail_connection(err.code, err.message)
+                return err
+              in Bytes
+                full_payload = decomp_res
+              end
+
+              if final_opcode == OP_TEXT
+                unless Utf8Validator.valid?(full_payload)
+                  err = WebSocketError.new(CLOSE_INVALID_PAYLOAD, "Decompressed text frame is not valid UTF-8")
+                  fail_connection(err.code, err.message)
+                  return err
+                end
+              end
+            end
+
+            @current_opcode = nil
+            @current_fragments = [] of Bytes
+            @current_compressed = false
+
+            return Message.new(final_opcode, full_payload)
+          end
+        end
+      end
+    end
+    nil
+  end
+
+  # Sends a raw Frame over the transport.
+  pub def send_frame(frame : Frame) : Nil | WebSocketError
+    return WebSocketError.new(CLOSE_PROTOCOL_ERROR, "Session already closed") if @closed
+    if @close_sent && frame.opcode != OP_CLOSE && frame.opcode != OP_PONG
+      return WebSocketError.new(CLOSE_PROTOCOL_ERROR, "Cannot send data frames after close initiated")
+    end
+    wire = frame.serialize(masked_override: !@is_server)
+    unless write_exact(@io, wire.to_unsafe, wire.size)
+      @closed = true
+      return WebSocketError.new(CLOSE_ABNORMAL, "Failed to write frame to transport")
+    end
+    nil
+  end
+
+  # Sends a text message, optionally fragmented by `fragment_size`.
+  pub def send_text(text : String, fragment_size : Int32 = 0) : Nil | WebSocketError
+    text_len = text.bytesize
+    payload = Bytes.new(text_len)
+    payload.to_unsafe.copy_from(text.to_unsafe, text_len)
+
+    if @deflate_enabled && text_len > 128
+      # Permessage-deflate compression
+      compressed = Deflate.compress(payload)
+      # Strip trailing 0x00 0x00 0xFF 0xFF if present
+      c_len = compressed.size
+      if c_len >= 4 &&
+         compressed[c_len - 4] == 0x00_u8 && compressed[c_len - 3] == 0x00_u8 &&
+         compressed[c_len - 2] == 0xFF_u8 && compressed[c_len - 1] == 0xFF_u8
+        c_len = c_len - 4
+      end
+      payload = Slice(UInt8).new(compressed.to_unsafe, c_len)
+      send_data_fragments(OP_TEXT, payload, fragment_size, rsv1: true)
+    else
+      send_data_fragments(OP_TEXT, payload, fragment_size, rsv1: false)
+    end
+  end
+
+  # Sends a binary message, optionally fragmented by `fragment_size`.
+  pub def send_binary(data : Bytes, fragment_size : Int32 = 0) : Nil | WebSocketError
+    if @deflate_enabled && data.size > 128
+      compressed = Deflate.compress(data)
+      c_len = compressed.size
+      if c_len >= 4 &&
+         compressed[c_len - 4] == 0x00_u8 && compressed[c_len - 3] == 0x00_u8 &&
+         compressed[c_len - 2] == 0xFF_u8 && compressed[c_len - 1] == 0xFF_u8
+        c_len = c_len - 4
+      end
+      data_comp = Slice(UInt8).new(compressed.to_unsafe, c_len)
+      send_data_fragments(OP_BINARY, data_comp, fragment_size, rsv1: true)
+    else
+      send_data_fragments(OP_BINARY, data, fragment_size, rsv1: false)
+    end
+  end
+
+  # Sends a Ping control frame (payload <= 125 bytes).
+  pub def send_ping(payload : Bytes = Bytes.new(0)) : Nil | WebSocketError
+    if payload.size > 125
+      return WebSocketError.new(CLOSE_PROTOCOL_ERROR, "Ping payload exceeds 125 bytes")
+    end
+    frame = Frame.new(OP_PING, payload, fin: true, masked: !@is_server)
+    send_frame(frame)
+  end
+
+  # Sends a Pong control frame (payload <= 125 bytes).
+  pub def send_pong(payload : Bytes = Bytes.new(0)) : Nil | WebSocketError
+    if payload.size > 125
+      return WebSocketError.new(CLOSE_PROTOCOL_ERROR, "Pong payload exceeds 125 bytes")
+    end
+    frame = Frame.new(OP_PONG, payload, fin: true, masked: !@is_server)
+    send_frame(frame)
+  end
+
+  # Initiates a clean close handshake with close code and optional reason.
+  pub def close(code : Int32 = CLOSE_NORMAL, reason : String = "") : Nil | WebSocketError
+    return nil if @closed || @close_sent
+    send_close(code, reason)
+    @close_sent = true
+    nil
+  end
+
+  private def send_close(code : Int32, reason : String = "") : Nil | WebSocketError
+    reason_bytesize = reason.bytesize
+    if reason_bytesize > 123
+      # Truncate at the last complete UTF-8 code point boundary <= 123 bytes
+      ptr = reason.to_unsafe
+      limit = 123
+      while limit > 0 && (ptr[limit] & 0xC0_u8) == 0x80_u8
+        limit = limit - 1
+      end
+      char_len = 1
+      if limit < reason_bytesize
+        b = ptr[limit]
+        if b <= 0x7F_u8
+          char_len = 1
+        elsif (b & 0xE0_u8) == 0xC0_u8
+          char_len = 2
+        elsif (b & 0xF0_u8) == 0xE0_u8
+          char_len = 3
+        elsif (b & 0xF8_u8) == 0xF0_u8
+          char_len = 4
+        end
+      end
+      if limit + char_len <= 123
+        reason_bytesize = limit + char_len
+      else
+        reason_bytesize = limit
+      end
+    end
+    payload_size = 2 + reason_bytesize
+    payload = Bytes.new(payload_size)
+    payload[0] = ((code >> 8) & 255).to_u8
+    payload[1] = (code & 255).to_u8
+    if reason_bytesize > 0
+      (payload.to_unsafe + 2).copy_from(reason.to_unsafe, reason_bytesize)
+    end
+    frame = Frame.new(OP_CLOSE, payload, fin: true, masked: !@is_server)
+    send_frame(frame)
+  end
+
+  private def fail_connection(code : Int32, reason : String) : Nil
+    unless @close_sent
+      send_close(code, reason)
+      @close_sent = true
+    end
+    @closed = true
+    @io.close
+  end
+
+  private def send_data_fragments(opcode : UInt8, payload : Bytes,
+                                  fragment_size : Int32, rsv1 : Bool) : Nil | WebSocketError
+    total_len = payload.size
+    if fragment_size <= 0 || total_len <= fragment_size
+      frame = Frame.new(opcode, payload, fin: true, masked: !@is_server, rsv1: rsv1)
+      return send_frame(frame)
+    end
+
+    # Fragmented send
+    offset = 0
+    first = true
+    while offset < total_len
+      chunk_len = total_len - offset
+      chunk_len = fragment_size if chunk_len > fragment_size
+      is_final = (offset + chunk_len) >= total_len
+
+      chunk = Slice(UInt8).new(payload.to_unsafe + offset, chunk_len)
+      chunk_opcode = first ? opcode : OP_CONTINUATION
+      chunk_rsv1 = first ? rsv1 : false
+
+      frame = Frame.new(chunk_opcode, chunk, fin: is_final, masked: !@is_server, rsv1: chunk_rsv1)
+      err = send_frame(frame)
+      return err if err
+
+      offset = offset + chunk_len
+      first = false
+    end
+    nil
+  end
+
+  private def write_exact(io, buffer : Pointer(UInt8), count : Int32) : Bool
+    total = 0
+    while total < count
+      n = io.write(buffer + total, count - total)
+      return false if n <= 0
+      total = total + n
+    end
+    true
+  end
+end
+
+# =============================================================================
+# PrefixedTransport: Transparent wrapper preserving pipelined initial bytes
+# =============================================================================
+
+pub class PrefixedTransport(T)
+  @io : T
+  @prefix : Bytes
+  @prefix_pos : Int32
+
+  def initialize(@io : T, @prefix : Bytes)
+    @prefix_pos = 0
+  end
+
+  pub def read(buffer : Pointer(UInt8), count : Int32) : Int32
+    avail = @prefix.size - @prefix_pos
+    if avail > 0
+      to_read = count < avail ? count : avail
+      buffer.copy_from(@prefix.to_unsafe + @prefix_pos, to_read)
+      @prefix_pos = @prefix_pos + to_read
+      return to_read
+    end
+    @io.read(buffer, count)
+  end
+
+  pub def write(buffer : Pointer(UInt8), count : Int32) : Int32
+    @io.write(buffer, count)
+  end
+
+  pub def close : Nil
+    @io.close
+  end
+
+  pub def closed? : Bool
+    @io.closed?
+  end
+end
+
+# =============================================================================
+# Client and Server Helpers for IyiSocket
+# =============================================================================
+
+pub struct Client
+  # Connects to a WebSocket endpoint at `host:port/path` over TCP.
+  pub def self.connect(host : String, port : Int32, path : String = "/",
+                       subprotocols : Array(String)? = nil,
+                       extensions : Array(String)? = nil) : Session(PrefixedTransport(IyiSocket)) | WebSocketError
+    client_exts = extensions
+    if exts = extensions
+      c_list = [] of String
+      i = 0
+      while i < exts.size
+        ext_item = exts[i]
+        if ext_item == "permessage-deflate"
+          c_list << "permessage-deflate; client_no_context_takeover; server_no_context_takeover"
+        else
+          c_list << ext_item
+        end
+        i = i + 1
+      end
+      client_exts = c_list
+    end
+
+    socket = IyiSocket.connect(host, port)
+    key = Handshake.generate_key
+    req = Handshake.build_client_request(path, "#{host}:#{port}", key, subprotocols, client_exts)
+
+    ser = req.serialize
+    case ser
+    in HttpError then return WebSocketError.new(CLOSE_PROTOCOL_ERROR, ser.message)
+    in String
+      socket.write(ser)
+    end
+
+    raw_resp = socket.read(4096)
+    parsed = Response.parse(raw_resp)
+    case parsed
+    in HttpError then return WebSocketError.new(CLOSE_PROTOCOL_ERROR, parsed.message)
+    in Response
+      ver_res = Handshake.verify_server_response(parsed, key, subprotocols, client_exts)
+      case ver_res
+      in WebSocketError then return ver_res
+      in Bool
+        trailing = Handshake.extract_trailing_bytes(raw_resp)
+        transport = PrefixedTransport.new(socket, trailing)
+        return Session.new(transport, is_server: false, deflate_enabled: ver_res)
+      end
+    end
+  end
+end
+
+pub struct Server
+  # Performs the server-side upgrade handshake on an accepted IyiSocket.
+  pub def self.upgrade(socket : IyiSocket,
+                       subprotocol : String? = nil,
+                       extensions : Array(String)? = nil) : Session(PrefixedTransport(IyiSocket)) | WebSocketError
+    raw_req = socket.read(4096)
+    parsed = Request.parse(raw_req)
+    case parsed
+    in HttpError
+      socket.write("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+      return WebSocketError.new(CLOSE_PROTOCOL_ERROR, parsed.message)
+    in Request
+      key_or_err = Handshake.verify_client_request(parsed)
+      case key_or_err
+      in WebSocketError
+        if key_or_err.message.includes?("Sec-WebSocket-Version")
+          socket.write("HTTP/1.1 426 Upgrade Required\r\nSec-WebSocket-Version: 13\r\nContent-Length: 0\r\n\r\n")
+        else
+          socket.write("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+        end
+        return key_or_err
+      in String
+        server_allows_deflate = false
+        if ext_list = extensions
+          i = 0
+          while i < ext_list.size
+            if ext_list[i].includes?("permessage-deflate")
+              server_allows_deflate = true
+              break
+            end
+            i = i + 1
+          end
+        end
+
+        client_ext_header = parsed.headers["Sec-WebSocket-Extensions"]?
+        resp_exts, deflate_active = Handshake.negotiate_server_extensions(client_ext_header, server_allows_deflate)
+
+        resp = Handshake.build_server_response(key_or_err, subprotocol, resp_exts)
+        ser = resp.serialize
+        case ser
+        in HttpError
+          socket.write("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+          return WebSocketError.new(CLOSE_PROTOCOL_ERROR, ser.message)
+        in String
+          socket.write(ser)
+        end
+
+        trailing = Handshake.extract_trailing_bytes(raw_req)
+        transport = PrefixedTransport.new(socket, trailing)
+        return Session.new(transport, is_server: true, deflate_enabled: deflate_active)
+      end
+    end
+  end
+end
+
+# =============================================================================
+# High-Level WebSocket Wrapper and Handlers (Crystal Parity)
+# =============================================================================
+
+pub class WebSocket(T)
+  getter session : Session(T)
+
+  def initialize(@session : Session(T))
+  end
+
+  def self.new(io : T, is_server : Bool = false, deflate_enabled : Bool = false) : WebSocket(T)
+    s = Session(T).new(io, is_server: is_server, deflate_enabled: deflate_enabled)
+    WebSocket(T).new(s)
+  end
+
+  def self.connect(host : String, port : Int32, path : String = "/",
+                   subprotocols : Array(String)? = nil,
+                   extensions : Array(String)? = nil) : WebSocket(PrefixedTransport(IyiSocket)) | WebSocketError
+    res = Client.connect(host, port, path, subprotocols, extensions)
+    case res
+    in WebSocketError                        then res
+    in Session(PrefixedTransport(IyiSocket)) then WebSocket(PrefixedTransport(IyiSocket)).new(res)
+    end
+  end
+
+  def self.upgrade(socket : IyiSocket,
+                   subprotocol : String? = nil,
+                   extensions : Array(String)? = nil) : WebSocket(PrefixedTransport(IyiSocket)) | WebSocketError
+    res = Server.upgrade(socket, subprotocol, extensions)
+    case res
+    in WebSocketError                        then res
+    in Session(PrefixedTransport(IyiSocket)) then WebSocket(PrefixedTransport(IyiSocket)).new(res)
+    end
+  end
+
+  def closed? : Bool
+    @session.closed?
+  end
+
+  def close_code : Int32?
+    @session.close_code
+  end
+
+  def close_reason : String?
+    @session.close_reason
+  end
+
+  def close(code : CloseCode | Int32 = CloseCode::NormalClosure, message : String = "") : Nil | WebSocketError
+    c_int = code.is_a?(CloseCode) ? code.value : code
+    @session.close(c_int, message)
+  end
+
+  def send(message : String) : Nil | WebSocketError
+    @session.send_text(message)
+  end
+
+  def send(message : Bytes) : Nil | WebSocketError
+    @session.send_binary(message)
+  end
+
+  def ping(message : String = "") : Nil | WebSocketError
+    b = Bytes.new(message.bytesize) { |i| message.to_unsafe[i] }
+    @session.send_ping(b)
+  end
+
+  def ping(message : Bytes) : Nil | WebSocketError
+    @session.send_ping(message)
+  end
+
+  def pong(message : String = "") : Nil | WebSocketError
+    b = Bytes.new(message.bytesize) { |i| message.to_unsafe[i] }
+    @session.send_pong(b)
+  end
+
+  def pong(message : Bytes) : Nil | WebSocketError
+    @session.send_pong(message)
+  end
+
+  def receive : Message | WebSocketError | Nil
+    @session.receive
+  end
+
+  def receive? : Message | Nil
+    res = @session.receive
+    if res.is_a?(Message)
+      res
+    else
+      nil
+    end
+  end
+end
+
+pub class WebSocketHandler
+  getter subprotocols : Array(String)?
+
+  def initialize(@subprotocols : Array(String)? = nil)
+  end
+
+  def upgrade(socket : IyiSocket, request : Request) : Session(PrefixedTransport(IyiSocket)) | WebSocketError
+    key_or_err = Handshake.verify_client_request(request)
+    case key_or_err
+    in WebSocketError
+      if key_or_err.message.includes?("Sec-WebSocket-Version")
+        socket.write("HTTP/1.1 426 Upgrade Required\r\nSec-WebSocket-Version: 13\r\nContent-Length: 0\r\n\r\n")
+      else
+        socket.write("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+      end
+      return key_or_err
+    in String
+      subproto = nil
+      if subprotos = @subprotocols
+        if req_sub = request.headers["Sec-WebSocket-Protocol"]?
+          i = 0
+          while i < subprotos.size
+            if req_sub.includes?(subprotos[i])
+              subproto = subprotos[i]
+              break
+            end
+            i = i + 1
+          end
+        end
+      end
+
+      resp = Handshake.build_server_response(key_or_err, subproto, nil)
+      ser = resp.serialize
+      case ser
+      in HttpError
+        socket.write("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+        return WebSocketError.new(CLOSE_PROTOCOL_ERROR, ser.message)
+      in String
+        socket.write(ser)
+      end
+
+      transport = PrefixedTransport.new(socket, Bytes.new(0))
+      return Session.new(transport, is_server: true, deflate_enabled: false)
+    end
+  end
+end
+
+pub alias Protocol = Handshake

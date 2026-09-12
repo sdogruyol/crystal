@@ -1811,9 +1811,12 @@ module Iyi::IyiMod
     bodies = artifact.mono_bodies
 
     # First, because a macro has to be defined before the code that calls it is
-    # read, and the bodies below are full of code that calls them.
+    # read, and the bodies below are full of code that calls them. Crystal has
+    # no visibility marker, so its artifacts export ordinary macros here. iyi's
+    # formatter already preserved each macro's own `pub`, or its absence.
     artifact.macro_bodies.each do |source|
-      io << '\n' << exported_macro(source) << '\n'
+      replayed = artifact.crystal_library ? exported_macro(source) : source
+      io << '\n' << replayed << '\n'
     end
 
     # Before the functions, because one of them reads it: `Backtracer.configure`

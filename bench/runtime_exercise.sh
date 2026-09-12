@@ -137,7 +137,7 @@ fi
 
 # 7. Failure proof: IO cancellation assert can fail
 step "failure proof: an uncaught IO block fails rather than silently passing"
-sed 's/outcome.is_a?(Cancelled) ? "cancelled" : "read"/outcome.is_a?(Cancelled) ? "bogus" : "read"/' "$REPO/bench/runtime_exercise.iyi" > uncancelled.iyi
+sed 's/outcome\.is_a[?](Cancelled) [?] "cancelled" : "read"/outcome.is_a?(Cancelled) ? "bogus" : "read"/' "$REPO/bench/runtime_exercise.iyi" > uncancelled.iyi
 if ! "$IYI" build uncancelled.iyi -o uncancelled > build-uncancelled.log 2>&1; then
   echo "uncancelled probe failed to build:"
   cat build-uncancelled.log

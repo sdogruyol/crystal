@@ -1,0 +1,271 @@
+# HTTP/3 Standard Library Exercise (RFC 9114, RFC 9204, RFC 9297)
+#
+# Verifies:
+# 1. HTTP/3 Constants, Stream Types, Frame Types, and Error Codes
+# 2. Settings Dictionary encoding and decoding (RFC 9114 Section 7.2.4.1)
+# 3. HTTP/3 Frame Codecs (DATA, HEADERS, SETTINGS, GOAWAY, CANCEL_PUSH, MAX_PUSH_ID)
+# 4. Unidirectional Control Stream Handshake (Finding 15)
+# 5. QPACK Header Compression & Request/Response Round-Trip (Finding 18)
+# 6. Extended CONNECT & WebTransport Session Contract (Finding 19)
+# 7. HTTP Datagrams (RFC 9297) & Quarter Stream ID Mapping
+# 8. Finding 15: Duplicate SETTINGS Frame Rejection on Control Stream
+# 9. Finding 16: Forbidden HTTP/2 Frame Rejection on Request Stream
+# 10. Finding 17: Reserved HTTP/2 Settings and Duplicate Settings Rejection
+
+import std/slice
+import std/capsule
+import std/qpack
+import std/quic
+import std/http3
+
+using std/slice::{Slice, Bytes}
+using std/capsule::{VarInt}
+using std/qpack::{FieldLine, Encoder, Decoder}
+using std/quic::{ConnectionRole}
+using std/http3::{H3StreamType, H3FrameType, H3Setting, H3Error, SettingEntry, SettingsDictionary, H3FrameCodec, H3Message, H3Request, H3Response, H3Session}
+
+def bytes_equal(a : Bytes, b : Bytes) : Bool
+  return false unless a.size == b.size
+  i = 0
+  while i < a.size
+    return false unless a[i] == b[i]
+    i = i + 1
+  end
+  true
+end
+
+puts "== Section 1: HTTP/3 Constants and Types"
+raise "control stream type" unless H3StreamType::CONTROL == 0x00_u64
+raise "push stream type" unless H3StreamType::PUSH == 0x01_u64
+raise "qpack encoder stream type" unless H3StreamType::QPACK_ENCODER == 0x02_u64
+raise "qpack decoder stream type" unless H3StreamType::QPACK_DECODER == 0x03_u64
+raise "webtransport bidi type" unless H3StreamType::WEBTRANSPORT_BIDI == 0x41_u64
+raise "webtransport uni type" unless H3StreamType::WEBTRANSPORT_UNI == 0x54_u64
+
+raise "frame data type" unless H3FrameType::DATA == 0x00_u64
+raise "frame headers type" unless H3FrameType::HEADERS == 0x01_u64
+raise "frame settings type" unless H3FrameType::SETTINGS == 0x04_u64
+raise "frame goaway type" unless H3FrameType::GOAWAY == 0x07_u64
+puts "  constants: stream types, frame types, and error codes verified"
+
+puts "== Section 2: Settings Dictionary Encoding and Decoding"
+settings = SettingsDictionary.new
+settings.set(H3Setting::QPACK_MAX_TABLE_CAPACITY, 4096_u64)
+settings.set(H3Setting::QPACK_BLOCKED_STREAMS, 100_u64)
+settings.set(H3Setting::MAX_FIELD_SECTION_SIZE, 65536_u64)
+settings.set(H3Setting::ENABLE_CONNECT_PROTOCOL, 1_u64)
+settings.set(H3Setting::H3_DATAGRAM, 1_u64)
+settings.set(H3Setting::WEBTRANSPORT_MAX_SESSIONS, 16_u64)
+
+encoded_settings = settings.encode
+raise "encoded settings empty" if encoded_settings.empty?
+
+decoded_settings = SettingsDictionary.decode(encoded_settings)
+raise "settings table cap" unless decoded_settings.get(H3Setting::QPACK_MAX_TABLE_CAPACITY) == 4096_u64
+raise "settings blocked streams" unless decoded_settings.get(H3Setting::QPACK_BLOCKED_STREAMS) == 100_u64
+raise "settings max field size" unless decoded_settings.get(H3Setting::MAX_FIELD_SECTION_SIZE) == 65536_u64
+raise "settings enable connect" unless decoded_settings.get(H3Setting::ENABLE_CONNECT_PROTOCOL) == 1_u64
+raise "settings h3 datagram" unless decoded_settings.get(H3Setting::H3_DATAGRAM) == 1_u64
+raise "settings webtransport" unless decoded_settings.get(H3Setting::WEBTRANSPORT_MAX_SESSIONS) == 16_u64
+puts "  settings: serialization and round-trip decoding verified"
+
+puts "== Section 3: HTTP/3 Frame Codecs"
+# DATA Frame
+data_payload = Bytes.new(5)
+data_payload[0] = 'H'.ord.to_u8; data_payload[1] = 'e'.ord.to_u8; data_payload[2] = 'l'.ord.to_u8
+data_payload[3] = 'l'.ord.to_u8; data_payload[4] = 'o'.ord.to_u8
+data_frame = H3FrameCodec.encode_data(data_payload)
+f_type, f_payload, f_consumed = H3FrameCodec.decode_frame(data_frame)
+raise "data frame type" unless f_type == H3FrameType::DATA
+raise "data frame payload" unless bytes_equal(f_payload, data_payload)
+raise "data frame consumed" unless f_consumed == data_frame.size
+
+# HEADERS Frame
+hdr_payload = Bytes.new(4, 0xaa_u8)
+hdr_frame = H3FrameCodec.encode_headers(hdr_payload)
+f_type, f_payload, f_consumed = H3FrameCodec.decode_frame(hdr_frame)
+raise "headers frame type" unless f_type == H3FrameType::HEADERS
+raise "headers frame payload" unless bytes_equal(f_payload, hdr_payload)
+
+# GOAWAY Frame
+goaway_frame = H3FrameCodec.encode_goaway(4_u64)
+f_type, f_payload, _ = H3FrameCodec.decode_frame(goaway_frame)
+raise "goaway frame type" unless f_type == H3FrameType::GOAWAY
+sid, _ = VarInt.decode(f_payload, 0)
+raise "goaway stream id" unless sid == 4_u64
+
+# CANCEL_PUSH Frame
+cpush_frame = H3FrameCodec.encode_cancel_push(2_u64)
+f_type, f_payload, _ = H3FrameCodec.decode_frame(cpush_frame)
+raise "cancel push frame type" unless f_type == H3FrameType::CANCEL_PUSH
+pid, _ = VarInt.decode(f_payload, 0)
+raise "cancel push id" unless pid == 2_u64
+
+# MAX_PUSH_ID Frame
+mpush_frame = H3FrameCodec.encode_max_push_id(8_u64)
+f_type, f_payload, _ = H3FrameCodec.decode_frame(mpush_frame)
+raise "max push id frame type" unless f_type == H3FrameType::MAX_PUSH_ID
+mpid, _ = VarInt.decode(f_payload, 0)
+raise "max push id" unless mpid == 8_u64
+puts "  frames: DATA, HEADERS, SETTINGS, GOAWAY, CANCEL_PUSH, MAX_PUSH_ID verified"
+
+puts "== Section 4: Unidirectional Control Stream Handshake"
+client_session = H3Session.new(ConnectionRole::CLIENT)
+server_session = H3Session.new(ConnectionRole::SERVER)
+
+# Client sends control stream with SETTINGS
+client_ctrl_bytes = client_session.open_control_stream
+raise "control stream empty" if client_ctrl_bytes.empty?
+
+# Server processes client control stream
+err_ctrl = server_session.receive_control_stream(client_ctrl_bytes)
+raise "control stream processing error" unless err_ctrl == H3Error::NO_ERROR
+raise "server remote settings enable connect" unless server_session.remote_settings.get(H3Setting::ENABLE_CONNECT_PROTOCOL) == 1_u64
+raise "server remote settings datagram" unless server_session.remote_settings.get(H3Setting::H3_DATAGRAM) == 1_u64
+
+# Server sends control stream with SETTINGS
+server_ctrl_bytes = server_session.open_control_stream
+err_ctrl_s = client_session.receive_control_stream(server_ctrl_bytes)
+raise "client control stream processing error" unless err_ctrl_s == H3Error::NO_ERROR
+raise "client remote settings webtransport" unless client_session.remote_settings.get(H3Setting::WEBTRANSPORT_MAX_SESSIONS) == 16_u64
+puts "  control-stream: bidirectional SETTINGS handshake verified"
+
+puts "== Section 5: QPACK Header Compression & Request/Response Round-Trip"
+req_headers = [
+  FieldLine.new("user-agent", "iyi-http3/1.0"),
+  FieldLine.new("accept", "text/html,application/xhtml+xml"),
+]
+req_body = Bytes.new(4)
+req_body[0] = 'P'.ord.to_u8; req_body[1] = 'I'.ord.to_u8; req_body[2] = 'N'.ord.to_u8; req_body[3] = 'G'.ord.to_u8
+
+request = H3Request.build("POST", "/api/v1/resource", "api.iyi.org", req_headers, req_body)
+raise "request method" unless request.method == "POST"
+raise "request path" unless request.path == "/api/v1/resource"
+raise "request authority" unless request.authority == "api.iyi.org"
+
+# Frame request into wire stream bytes
+stream_0_bytes = client_session.frame_request(0_u64, request)
+raise "framed request empty" if stream_0_bytes.empty?
+
+# Server receives and parses stream 0
+parsed_fields, parsed_body, p_err = server_session.parse_stream(0_u64, stream_0_bytes)
+raise "request parse error" unless p_err == H3Error::NO_ERROR
+raise "parsed body mismatch" unless bytes_equal(parsed_body, req_body)
+
+# Check pseudo-headers decoded
+parsed_method = ""
+parsed_path = ""
+i = 0
+while i < parsed_fields.size
+  parsed_method = parsed_fields[i].value if parsed_fields[i].name == ":method"
+  parsed_path = parsed_fields[i].value if parsed_fields[i].name == ":path"
+  i = i + 1
+end
+raise "method decoded" unless parsed_method == "POST"
+raise "path decoded" unless parsed_path == "/api/v1/resource"
+
+# Server responds with 200 OK
+res_headers = [FieldLine.new("content-type", "text/plain")]
+res_body = Bytes.new(4)
+res_body[0] = 'P'.ord.to_u8; res_body[1] = 'O'.ord.to_u8; res_body[2] = 'N'.ord.to_u8; res_body[3] = 'G'.ord.to_u8
+response = H3Response.build(200, res_headers, res_body)
+
+stream_0_res_bytes = server_session.frame_response(0_u64, response)
+rx_res_fields, rx_res_body, res_err = client_session.parse_stream(0_u64, stream_0_res_bytes)
+raise "response parse error" unless res_err == H3Error::NO_ERROR
+raise "response body mismatch" unless bytes_equal(rx_res_body, res_body)
+
+rx_status = 0
+i = 0
+while i < rx_res_fields.size
+  rx_status = rx_res_fields[i].value.to_i if rx_res_fields[i].name == ":status"
+  i = i + 1
+end
+raise "response status 200" unless rx_status == 200
+puts "  request-response: QPACK field compression and stream framing round-trip verified"
+
+puts "== Section 6: Extended CONNECT & WebTransport Session Contract"
+connect_req = H3Request.build_extended_connect("webtransport", "chat.iyi.org", "/wt-channel")
+raise "must be extended connect" unless connect_req.extended_connect?
+raise "extended connect method" unless connect_req.method == "CONNECT"
+raise "extended connect protocol" unless connect_req.protocol == "webtransport"
+raise "extended connect authority" unless connect_req.authority == "chat.iyi.org"
+
+# Register WebTransport session (Finding 19)
+wt_session = server_session.create_webtransport_session(4_u64)
+raise "wt session nil" if wt_session.nil?
+raise "wt session id mismatch" unless wt_session.session_id == 4_u64
+puts "  extended-connect: RFC 8441 / RFC 9220 Extended CONNECT request verified"
+
+puts "== Section 7: HTTP Datagrams (RFC 9297) & Quarter Stream ID Mapping"
+# Stream ID 8 -> Quarter Stream ID 2
+dgram_payload = Bytes.new(8, 0x42_u8)
+encoded_dgram = client_session.encode_datagram(8_u64, dgram_payload)
+rx_sid, rx_dgram_payload = server_session.decode_datagram(encoded_dgram)
+raise "stream id mapping" unless rx_sid == 8_u64
+raise "datagram payload" unless bytes_equal(rx_dgram_payload, dgram_payload)
+
+# Stream ID 0 -> Quarter Stream ID 0
+encoded_dgram_0 = client_session.encode_datagram(0_u64, dgram_payload)
+rx_sid_0, rx_dgram_payload_0 = server_session.decode_datagram(encoded_dgram_0)
+raise "stream id 0 mapping" unless rx_sid_0 == 0_u64
+raise "datagram payload 0" unless bytes_equal(rx_dgram_payload_0, dgram_payload)
+puts "  datagrams: Quarter Stream ID mapping and RFC 9297 datagram framing verified"
+
+puts "== Section 8: Finding 15 Duplicate SETTINGS Rejection on Control Stream"
+# Synthesize control stream with two consecutive SETTINGS frames
+settings_frame_raw = H3FrameCodec.encode_settings(settings)
+ctrl_hdr = VarInt.encode(H3StreamType::CONTROL)
+dup_stream = Bytes.new(ctrl_hdr.size + settings_frame_raw.size * 2)
+off = 0
+i = 0; while i < ctrl_hdr.size
+  dup_stream[off + i] = ctrl_hdr[i]; i = i + 1
+end
+off = off + ctrl_hdr.size
+i = 0; while i < settings_frame_raw.size
+  dup_stream[off + i] = settings_frame_raw[i]; i = i + 1
+end
+off = off + settings_frame_raw.size
+i = 0; while i < settings_frame_raw.size
+  dup_stream[off + i] = settings_frame_raw[i]; i = i + 1
+end
+
+dup_test_session = H3Session.new(ConnectionRole::SERVER)
+dup_err = dup_test_session.receive_control_stream(dup_stream)
+raise "duplicate SETTINGS not rejected" unless dup_err == H3Error::FRAME_UNEXPECTED
+puts "  control-stream-audit: duplicate SETTINGS correctly rejected with H3_FRAME_UNEXPECTED"
+
+puts "== Section 9: Finding 16 Forbidden HTTP/2 Frame Rejection on Request Stream"
+# Frame type 0x06 (HTTP/2 PING) is strictly forbidden on HTTP/3 request streams
+forbidden_frame = H3FrameCodec.encode_frame(0x06_u64, Bytes.new(8, 0_u8))
+_, _, forbid_err = server_session.parse_stream(0_u64, forbidden_frame)
+raise "forbidden frame not rejected" unless forbid_err == H3Error::FRAME_UNEXPECTED
+
+# SETTINGS frame (0x04) is forbidden on request streams
+forbid_settings = H3FrameCodec.encode_frame(H3FrameType::SETTINGS, settings_frame_raw)
+_, _, forbid_set_err = server_session.parse_stream(0_u64, forbid_settings)
+raise "forbidden settings on request stream not rejected" unless forbid_set_err == H3Error::FRAME_UNEXPECTED
+puts "  forbidden-frames: HTTP/2 frames and SETTINGS on request stream rejected with H3_FRAME_UNEXPECTED"
+
+puts "== Section 10: Finding 17 Reserved HTTP/2 Settings and Duplicate Settings Rejection"
+# Reserved HTTP/2 setting: 0x02 (ENABLE_PUSH)
+bad_settings_payload = Bytes.new(4)
+bad_settings_payload[0] = 0x02_u8 # Setting ID 2
+bad_settings_payload[1] = 0x01_u8 # Value 1
+bad_settings_payload[2] = 0x01_u8 # Setting ID 1
+bad_settings_payload[3] = 0x20_u8 # Value 32
+
+res_dict, res_code = SettingsDictionary.decode?(bad_settings_payload)
+raise "reserved H2 setting not rejected" unless res_dict.nil? && res_code == H3Error::SETTINGS_ERROR
+
+# Duplicate setting ID: 0x06 present twice
+dup_setting_payload = Bytes.new(4)
+dup_setting_payload[0] = 0x06_u8; dup_setting_payload[1] = 0x10_u8
+dup_setting_payload[2] = 0x06_u8; dup_setting_payload[3] = 0x20_u8
+
+dup_dict, dup_code = SettingsDictionary.decode?(dup_setting_payload)
+raise "duplicate setting ID not rejected" unless dup_dict.nil? && dup_code == H3Error::SETTINGS_ERROR
+puts "  settings-audit: reserved HTTP/2 settings and duplicate IDs rejected with H3_SETTINGS_ERROR"
+
+puts
+puts "all std/http3 checks passed"

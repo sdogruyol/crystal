@@ -2112,7 +2112,8 @@ module Iyi
       parser.parse
     rescue ex : InvalidByteSequenceError
       stderr.print colorize("Error: ").red.bold
-      stderr.print colorize("file '#{Iyi.relative_filename(source.filename)}' is not a valid Crystal source file: ").bold
+      language = source.filename.ends_with?(".iyi") ? "iyi" : "Crystal"
+      stderr.print colorize("file '#{Iyi.relative_filename(source.filename)}' is not a valid #{language} source file: ").bold
       stderr.puts ex.message
       exit 1
     end

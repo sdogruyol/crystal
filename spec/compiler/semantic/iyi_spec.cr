@@ -2914,7 +2914,7 @@ describe "Semantic: iyi" do
       # `def` inside a `pub trait` belongs to the trait — `Enumerable#to_a`
       # writes no `pub` and has to stay callable on every implementer.
       semantic(<<-CODE)
-        module std/enumerable
+        module std/enumerated
 
         pub trait Container
           type Elem

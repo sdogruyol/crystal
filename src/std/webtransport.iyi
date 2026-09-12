@@ -1,0 +1,693 @@
+# WebTransport over HTTP/3 — draft-ietf-webtrans-http3, RFC 9297, RFC 8441, RFC 9220.
+#
+# Answers the WebTransport session architecture requirements:
+#
+# 1. Session Establishment Handshake:
+#    Negotiated over HTTP/3 using Extended CONNECT (RFC 8441 / RFC 9220):
+#      :method    = CONNECT
+#      :protocol  = webtransport
+#      :scheme    = https
+#      :authority = <host>:<port>
+#      :path      = <path>
+#    Enabled by the HTTP/3 setting SETTINGS_ENABLE_CONNECT_PROTOCOL (0x08 = 1).
+#    The stream ID of the Extended CONNECT request stream is the Session ID.
+#    All subsequent streams and datagrams are associated with this Session ID.
+#
+# 2. The Three Data Paths:
+#    a. Bidirectional Streams:
+#       Dedicated QUIC bidirectional streams initiated with the stream header:
+#         Stream Type (i) = 0x41 (WEBTRANSPORT_BIDI_STREAM_TYPE)
+#         Session ID (i)
+#       Followed by application data.
+#    b. Unidirectional Streams:
+#       Dedicated QUIC unidirectional streams initiated with the stream header:
+#         Stream Type (i) = 0x54 (WEBTRANSPORT_UNI_STREAM_TYPE)
+#         Session ID (i)
+#       Followed by application data.
+#    c. Unreliable Datagrams:
+#       Carried within QUIC DATAGRAM frames using the HTTP Datagram format (RFC 9297):
+#         Quarter Stream ID (i) = Session ID // 4
+#         Datagram Payload (..)
+#       Provides the unreliable, out-of-order capability that HTTP/1.1 and HTTP/2 lack.
+#
+# 3. Session Termination and Capsules:
+#    Controlled via the Capsule Protocol on the Extended CONNECT stream:
+#    - CLOSE_WEBTRANSPORT_SESSION (0x2843):
+#        Application Error Code (32-bit unsigned int, 4 bytes big endian)
+#        Error Message (UTF-8 string)
+#    - DRAIN_WEBTRANSPORT_SESSION (0x78ae):
+#        Empty payload signaling graceful shutdown.
+#
+# 4. State Machine:
+#    Tracks session lifecycle: Connecting -> Open -> Draining -> Closed / Failed.
+#    Drives establishment, stream framing, datagram encoding, capsule processing,
+#    and graceful or abrupt termination against synthesized bytes.
+#
+# 5. Transport Interface:
+#    Defines the contract wave two's HTTP/3 agent must satisfy to host WebTransport.
+
+module std/webtransport
+
+import std/slice
+import std/capsule
+using std/slice::{Slice, Bytes}
+using std/capsule::{VarInt, HttpDatagram, Capsule, CapsuleType, CapsuleReader, ExtendedConnect, CapsuleProtocol}
+
+# =============================================================================
+# Constants for WebTransport over HTTP/3
+# =============================================================================
+
+pub struct WebTransportConstants
+  # Extended CONNECT settings
+  pub SETTINGS_ENABLE_CONNECT_PROTOCOL   =   0x08_u64
+  pub SETTINGS_H3_DATAGRAM               =   0x33_u64
+  pub SETTINGS_WEBTRANSPORT_MAX_SESSIONS = 0x2b60_u64
+
+  # Stream Type prefixes (encoded as QUIC variable-length integers)
+  pub STREAM_TYPE_BIDI = 0x41_u64 # 65 in decimal
+  pub STREAM_TYPE_UNI  = 0x54_u64 # 84 in decimal
+
+  # Capsule Types
+  pub CAPSULE_CLOSE_SESSION = 0x2843_u64 # 10307 in decimal
+  pub CAPSULE_DRAIN_SESSION = 0x78ae_u64 # 30894 in decimal
+
+  pub PROTOCOL_NAME = "webtransport"
+end
+
+# =============================================================================
+# Close WebTransport Session Capsule (draft-ietf-webtrans-http3 Section 5)
+# =============================================================================
+
+pub struct CloseSessionCapsule
+  @error_code : UInt64
+  @reason : String
+
+  def initialize(@error_code : UInt64, @reason : String)
+  end
+
+  # 32-bit application error code (0 to 4294967295)
+  getter error_code : UInt64
+  getter reason : String
+
+  # Encodes capsule value:
+  #   Application Error Code (32 bits = 4 bytes big-endian)
+  #   Error Message (UTF-8 string)
+  def encode_value : Bytes
+    reason_bytesize = @reason.bytesize
+    total_size = 4 + reason_bytesize
+    buf = Bytes.new(total_size)
+
+    # 32-bit error code big-endian
+    buf[0] = (@error_code.unsafe_shr(24_u64) & 0xff_u64).to_u8
+    buf[1] = (@error_code.unsafe_shr(16_u64) & 0xff_u64).to_u8
+    buf[2] = (@error_code.unsafe_shr(8_u64) & 0xff_u64).to_u8
+    buf[3] = (@error_code & 0xff_u64).to_u8
+
+    # UTF-8 reason string bytes
+    i = 0
+    while i < reason_bytesize
+      buf[4 + i] = @reason.to_unsafe[i]
+      i = i + 1
+    end
+
+    buf
+  end
+
+  # Wraps the close payload in a standard Capsule.
+  def to_capsule : Capsule
+    Capsule.new(WebTransportConstants::CAPSULE_CLOSE_SESSION, encode_value)
+  end
+
+  # Decodes CloseSessionCapsule from raw capsule value bytes, returning nil if truncated.
+  def self.decode_value?(bytes : Bytes, offset : Int32 = 0) : CloseSessionCapsule?
+    remaining = bytes.size - offset
+    return nil if remaining < 4
+
+    b0 = bytes[offset].to_u64
+    b1 = bytes[offset + 1].to_u64
+    b2 = bytes[offset + 2].to_u64
+    b3 = bytes[offset + 3].to_u64
+
+    code = b0.unsafe_shl(24_u64) | b1.unsafe_shl(16_u64) | b2.unsafe_shl(8_u64) | b3
+    reason_len = remaining - 4
+
+    reason_str = String.new(reason_len) do |buffer|
+      i = 0
+      while i < reason_len
+        buffer[i] = bytes[offset + 4 + i]
+        i = i + 1
+      end
+    end
+
+    new(code, reason_str)
+  end
+
+  # Decodes CloseSessionCapsule from raw capsule value bytes, raising on truncation.
+  def self.decode_value(bytes : Bytes, offset : Int32 = 0) : CloseSessionCapsule
+    res = decode_value?(bytes, offset)
+    if res.nil?
+      raise "close session capsule truncated: expected at least 4 bytes error code"
+    end
+    res
+  end
+
+  def self.decode(bytes : Bytes, offset : Int32 = 0) : CloseSessionCapsule
+    decode_value(bytes, offset)
+  end
+
+  # Decodes CloseSessionCapsule directly from a Capsule object.
+  def self.from_capsule(capsule : Capsule) : CloseSessionCapsule
+    if capsule.capsule_type != WebTransportConstants::CAPSULE_CLOSE_SESSION
+      raise "expected CLOSE_WEBTRANSPORT_SESSION capsule (0x2843), got 0x#{capsule.capsule_type}"
+    end
+    decode_value(capsule.value)
+  end
+end
+
+# =============================================================================
+# Drain WebTransport Session Capsule (draft-ietf-webtrans-http3 Section 5)
+# =============================================================================
+
+pub struct DrainSessionCapsule
+  def self.to_capsule : Capsule
+    Capsule.new(WebTransportConstants::CAPSULE_DRAIN_SESSION, Bytes.new(0))
+  end
+end
+
+# =============================================================================
+# Stream Framing (Bidirectional & Unidirectional)
+# =============================================================================
+
+# Header for WebTransport Bidirectional Streams (Stream Type 0x41)
+pub struct BidiStreamHeader
+  @session_id : UInt64
+
+  def initialize(@session_id : UInt64)
+  end
+
+  getter session_id : UInt64
+
+  def encode : Bytes
+    type_bytes = VarInt.encode(WebTransportConstants::STREAM_TYPE_BIDI)
+    session_bytes = VarInt.encode(@session_id)
+    total_size = type_bytes.size + session_bytes.size
+    buf = Bytes.new(total_size)
+
+    i = 0
+    while i < type_bytes.size
+      buf[i] = type_bytes[i]
+      i = i + 1
+    end
+
+    j = 0
+    while j < session_bytes.size
+      buf[type_bytes.size + j] = session_bytes[j]
+      j = j + 1
+    end
+
+    buf
+  end
+
+  def self.decode?(bytes : Bytes, offset : Int32 = 0, strict : Bool = false) : {BidiStreamHeader, Int32}?
+    return nil if offset < 0 || offset >= bytes.size
+
+    t_res = VarInt.decode?(bytes, offset, strict: strict)
+    return nil if t_res.nil?
+    stype, type_len = t_res
+    return nil if stype != WebTransportConstants::STREAM_TYPE_BIDI
+
+    s_res = VarInt.decode?(bytes, offset + type_len, strict: strict)
+    return nil if s_res.nil?
+    session_id, sess_len = s_res
+    {new(session_id), type_len + sess_len}
+  end
+
+  def self.decode(bytes : Bytes, offset : Int32 = 0, strict : Bool = false) : {BidiStreamHeader, Int32}
+    res = decode?(bytes, offset, strict: strict)
+    if res.nil?
+      if offset < 0 || offset >= bytes.size
+        raise "bidi stream header truncated: buffer empty or offset beyond end"
+      end
+      stype, _ = VarInt.decode(bytes, offset, strict: strict)
+      if stype != WebTransportConstants::STREAM_TYPE_BIDI
+        raise "invalid webtransport bidi stream type: expected 0x41, got 0x#{stype}"
+      end
+      raise "bidi stream header truncated: buffer ends before session id"
+    end
+    res
+  end
+end
+
+# Header for WebTransport Unidirectional Streams (Stream Type 0x54)
+pub struct UniStreamHeader
+  @session_id : UInt64
+
+  def initialize(@session_id : UInt64)
+  end
+
+  getter session_id : UInt64
+
+  def encode : Bytes
+    type_bytes = VarInt.encode(WebTransportConstants::STREAM_TYPE_UNI)
+    session_bytes = VarInt.encode(@session_id)
+    total_size = type_bytes.size + session_bytes.size
+    buf = Bytes.new(total_size)
+
+    i = 0
+    while i < type_bytes.size
+      buf[i] = type_bytes[i]
+      i = i + 1
+    end
+
+    j = 0
+    while j < session_bytes.size
+      buf[type_bytes.size + j] = session_bytes[j]
+      j = j + 1
+    end
+
+    buf
+  end
+
+  def self.decode?(bytes : Bytes, offset : Int32 = 0, strict : Bool = false) : {UniStreamHeader, Int32}?
+    return nil if offset < 0 || offset >= bytes.size
+
+    t_res = VarInt.decode?(bytes, offset, strict: strict)
+    return nil if t_res.nil?
+    stype, type_len = t_res
+    return nil if stype != WebTransportConstants::STREAM_TYPE_UNI
+
+    s_res = VarInt.decode?(bytes, offset + type_len, strict: strict)
+    return nil if s_res.nil?
+    session_id, sess_len = s_res
+    {new(session_id), type_len + sess_len}
+  end
+
+  def self.decode(bytes : Bytes, offset : Int32 = 0, strict : Bool = false) : {UniStreamHeader, Int32}
+    res = decode?(bytes, offset, strict: strict)
+    if res.nil?
+      if offset < 0 || offset >= bytes.size
+        raise "uni stream header truncated: buffer empty or offset beyond end"
+      end
+      stype, _ = VarInt.decode(bytes, offset, strict: strict)
+      if stype != WebTransportConstants::STREAM_TYPE_UNI
+        raise "invalid webtransport uni stream type: expected 0x54, got 0x#{stype}"
+      end
+      raise "uni stream header truncated: buffer ends before session id"
+    end
+    res
+  end
+end
+
+# =============================================================================
+# WebTransport Datagram Framing (draft-ietf-webtrans-http3 Section 4.4 & RFC 9297)
+# =============================================================================
+
+pub struct WebTransportDatagram
+  @session_id : UInt64
+  @payload : Bytes
+
+  def initialize(@session_id : UInt64, @payload : Bytes)
+  end
+
+  getter session_id : UInt64
+  getter payload : Bytes
+
+  # Quarter Stream ID associated with the WebTransport Session ID:
+  # quarter_stream_id = session_id // 4
+  def quarter_stream_id : UInt64
+    @session_id // 4_u64
+  end
+
+  # Encodes this WebTransport datagram into HTTP Datagram wire format:
+  #   Quarter Stream ID (i)
+  #   Datagram Payload (..)
+  def encode : Bytes
+    qid_bytes = VarInt.encode(quarter_stream_id)
+    total_size = qid_bytes.size + @payload.size
+    buf = Bytes.new(total_size)
+
+    i = 0
+    while i < qid_bytes.size
+      buf[i] = qid_bytes[i]
+      i = i + 1
+    end
+
+    j = 0
+    while j < @payload.size
+      buf[qid_bytes.size + j] = @payload[j]
+      j = j + 1
+    end
+
+    buf
+  end
+
+  # Decodes a WebTransport datagram from HTTP Datagram wire bytes.
+  def self.decode?(bytes : Bytes, offset : Int32 = 0, strict : Bool = false) : {WebTransportDatagram, Int32}?
+    return nil if offset < 0 || offset >= bytes.size
+
+    q_res = VarInt.decode?(bytes, offset, strict: strict)
+    return nil if q_res.nil?
+    qid, qid_len = q_res
+    sess_id = qid * 4_u64
+
+    payload_offset = offset + qid_len
+    payload_size = bytes.size - payload_offset
+    return nil if payload_size < 0
+
+    payload = Bytes.new(payload_size)
+    k = 0
+    while k < payload_size
+      payload[k] = bytes[payload_offset + k]
+      k = k + 1
+    end
+
+    {new(sess_id, payload), bytes.size - offset}
+  end
+
+  def self.decode(bytes : Bytes, offset : Int32 = 0, strict : Bool = false) : {WebTransportDatagram, Int32}
+    res = decode?(bytes, offset, strict: strict)
+    if res.nil?
+      raise "webtransport datagram truncated: buffer empty or offset beyond end"
+    end
+    res
+  end
+end
+
+# =============================================================================
+# WebTransport Session State Machine
+# =============================================================================
+
+# Represents the discrete lifecycle state of a WebTransport session.
+pub struct SessionStatus
+  pub CONNECTING = 0
+  pub OPEN       = 1
+  pub DRAINING   = 2
+  pub CLOSED     = 3
+  pub FAILED     = 4
+
+  def self.name(status : Int32) : String
+    case status
+    when CONNECTING then "connecting"
+    when OPEN       then "open"
+    when DRAINING   then "draining"
+    when CLOSED     then "closed"
+    when FAILED     then "failed"
+    else                 "unknown"
+    end
+  end
+end
+
+pub class WebTransportSession
+  @status : Int32
+  @session_id : UInt64
+  @close_code : UInt64
+  @close_reason : String
+  @is_client : Bool
+
+  def initialize(@session_id : UInt64, @is_client : Bool = true)
+    @status = SessionStatus::CONNECTING
+    @close_code = 0_u64
+    @close_reason = ""
+  end
+
+  getter status : Int32
+  getter session_id : UInt64
+  getter close_code : UInt64
+  getter close_reason : String
+  getter is_client : Bool
+
+  def status_name : String
+    SessionStatus.name(@status)
+  end
+
+  def connecting? : Bool
+    @status == SessionStatus::CONNECTING
+  end
+
+  def open? : Bool
+    @status == SessionStatus::OPEN
+  end
+
+  def draining? : Bool
+    @status == SessionStatus::DRAINING
+  end
+
+  def closed? : Bool
+    @status == SessionStatus::CLOSED
+  end
+
+  def failed? : Bool
+    @status == SessionStatus::FAILED
+  end
+
+  # Processes an Extended CONNECT response status code.
+  # A 2xx status code transitions the session to Open.
+  # Any other status transitions to Failed.
+  def on_connect_response(status_code : Int32) : Int32
+    unless connecting?
+      raise "cannot process connect response in #{status_name} state"
+    end
+
+    if ExtendedConnect.valid_response?(status_code)
+      @status = SessionStatus::OPEN
+    else
+      @status = SessionStatus::FAILED
+      @close_reason = "CONNECT rejected with status #{status_code}"
+    end
+    @status
+  end
+
+  def create_bidi_stream : Bytes
+    BidiStreamHeader.new(@session_id).encode
+  end
+
+  def create_uni_stream : Bytes
+    UniStreamHeader.new(@session_id).encode
+  end
+
+  # Frames a bidirectional stream payload for transmission.
+  # Prepends the 0x41 Stream Type and Session ID header.
+  def send_bidi_stream(payload : Bytes) : Bytes
+    unless open?
+      raise "cannot send bidi stream in #{status_name} state"
+    end
+
+    hdr = BidiStreamHeader.new(@session_id).encode
+    total_size = hdr.size + payload.size
+    buf = Bytes.new(total_size)
+
+    i = 0
+    while i < hdr.size
+      buf[i] = hdr[i]
+      i = i + 1
+    end
+
+    j = 0
+    while j < payload.size
+      buf[hdr.size + j] = payload[j]
+      j = j + 1
+    end
+
+    buf
+  end
+
+  # Parses an incoming bidirectional stream payload and validates the session ID.
+  def receive_bidi_stream(bytes : Bytes) : Bytes
+    unless open? || draining?
+      raise "cannot receive bidi stream in #{status_name} state"
+    end
+
+    hdr, consumed = BidiStreamHeader.decode(bytes)
+    if hdr.session_id != @session_id
+      raise "session id mismatch: expected #{@session_id}, got #{hdr.session_id}"
+    end
+
+    payload_size = bytes.size - consumed
+    payload = Bytes.new(payload_size)
+    k = 0
+    while k < payload_size
+      payload[k] = bytes[consumed + k]
+      k = k + 1
+    end
+    payload
+  end
+
+  # Frames a unidirectional stream payload for transmission.
+  # Prepends the 0x54 Stream Type and Session ID header.
+  def send_uni_stream(payload : Bytes) : Bytes
+    unless open?
+      raise "cannot send uni stream in #{status_name} state"
+    end
+
+    hdr = UniStreamHeader.new(@session_id).encode
+    total_size = hdr.size + payload.size
+    buf = Bytes.new(total_size)
+
+    i = 0
+    while i < hdr.size
+      buf[i] = hdr[i]
+      i = i + 1
+    end
+
+    j = 0
+    while j < payload.size
+      buf[hdr.size + j] = payload[j]
+      j = j + 1
+    end
+
+    buf
+  end
+
+  # Parses an incoming unidirectional stream payload and validates the session ID.
+  def receive_uni_stream(bytes : Bytes) : Bytes
+    unless open? || draining?
+      raise "cannot receive uni stream in #{status_name} state"
+    end
+
+    hdr, consumed = UniStreamHeader.decode(bytes)
+    if hdr.session_id != @session_id
+      raise "session id mismatch: expected #{@session_id}, got #{hdr.session_id}"
+    end
+
+    payload_size = bytes.size - consumed
+    payload = Bytes.new(payload_size)
+    k = 0
+    while k < payload_size
+      payload[k] = bytes[consumed + k]
+      k = k + 1
+    end
+    payload
+  end
+
+  # Frames an unreliable datagram for transmission.
+  def send_datagram(payload : Bytes) : Bytes
+    unless open?
+      raise "cannot send datagram in #{status_name} state"
+    end
+
+    WebTransportDatagram.new(@session_id, payload).encode
+  end
+
+  # Parses an incoming unreliable datagram and validates the session ID.
+  def receive_datagram(bytes : Bytes) : Bytes
+    unless open? || draining?
+      raise "cannot receive datagram in #{status_name} state"
+    end
+
+    dgram, consumed = WebTransportDatagram.decode(bytes)
+    if dgram.session_id != @session_id
+      raise "datagram session id mismatch: expected #{@session_id}, got #{dgram.session_id}"
+    end
+    dgram.payload
+  end
+
+  # Initiates graceful session shutdown (draining).
+  # Returns the DRAIN_WEBTRANSPORT_SESSION capsule.
+  def drain : Capsule
+    if closed? || failed?
+      raise "cannot drain session in #{status_name} state"
+    end
+    @status = SessionStatus::DRAINING
+    DrainSessionCapsule.to_capsule
+  end
+
+  # Terminates the session with an application error code and reason.
+  # Returns the CLOSE_WEBTRANSPORT_SESSION capsule.
+  def close(code : UInt64, reason : String) : Capsule
+    if closed? || failed?
+      raise "cannot close session already in #{status_name} state"
+    end
+    @status = SessionStatus::CLOSED
+    @close_code = code
+    @close_reason = reason
+    CloseSessionCapsule.new(code, reason).to_capsule
+  end
+
+  # Ingests an incoming capsule from the CONNECT stream.
+  # If the capsule is CLOSE_WEBTRANSPORT_SESSION, transitions to Closed.
+  # If DRAIN_WEBTRANSPORT_SESSION, transitions to Draining.
+  # Unknown capsule types are ignored according to the extensibility rule.
+  def receive_capsule(capsule : Capsule) : Int32
+    if capsule.close_webtransport_session?
+      close_cap = CloseSessionCapsule.from_capsule(capsule)
+      @status = SessionStatus::CLOSED
+      @close_code = close_cap.error_code
+      @close_reason = close_cap.reason
+    elsif capsule.drain_webtransport_session?
+      if @status == SessionStatus::OPEN
+        @status = SessionStatus::DRAINING
+      end
+    end
+    # Unknown capsule types are skipped per RFC 9297 Section 3.2 extensibility rule.
+    @status
+  end
+
+  def process_capsule(capsule : Capsule) : Int32
+    receive_capsule(capsule)
+  end
+end
+
+# =============================================================================
+# Wave Two Transport Interface Definition
+# =============================================================================
+#
+# The HTTP/3 and QUIC implementation in wave two must satisfy the following contract
+# to host WebTransport sessions:
+#
+# 1. Connection-Level Primitives:
+#    - Settings exchange:
+#        Must support SETTINGS_ENABLE_CONNECT_PROTOCOL (0x08 = 1).
+#        Must support SETTINGS_H3_DATAGRAM (0x33 = 1) for unreliable datagrams.
+#        May support SETTINGS_WEBTRANSPORT_MAX_SESSIONS (0x2b60).
+#    - Extended CONNECT dispatch:
+#        Must accept HTTP/3 request streams with :method = CONNECT and
+#        :protocol = webtransport, assigning the request Stream ID as the Session ID.
+#
+# 2. Stream Multiplexing:
+#    - Bidirectional Stream Dispatch:
+#        Incoming bidi streams starting with varint 0x41 must be demultiplexed
+#        by Session ID to the matching WebTransportSession.
+#    - Unidirectional Stream Dispatch:
+#        Incoming uni streams starting with varint 0x54 must be demultiplexed
+#        by Session ID to the matching WebTransportSession.
+#
+# 3. Datagram Transport:
+#    - Unreliable Datagram Dispatch:
+#        Incoming QUIC DATAGRAM frames must be parsed as HTTP Datagrams (RFC 9297).
+#        The Quarter Stream ID (session_id // 4) maps the datagram to its session.
+#    - Outbound Datagram Transport:
+#        When QUIC DATAGRAM frames are available, the encoded HTTP Datagram is sent
+#        as a QUIC DATAGRAM. If unavailable, it falls back to a DATAGRAM capsule (0x00)
+#        on the CONNECT stream.
+#
+# 4. Capsule Exchange:
+#    - Capsule Delivery:
+#        The Extended CONNECT stream must be read as a sequence of Capsule frames.
+#        Close and drain capsules trigger session termination and graceful shutdown.
+#        Unknown capsule types must be skipped without error.
+#
+pub struct WaveTwoTransportContract
+  # Summary of requirements exported for documentation and verification.
+  pub def self.required_settings : Array(UInt64)
+    [
+      WebTransportConstants::SETTINGS_ENABLE_CONNECT_PROTOCOL,
+      WebTransportConstants::SETTINGS_H3_DATAGRAM,
+      WebTransportConstants::SETTINGS_WEBTRANSPORT_MAX_SESSIONS,
+    ]
+  end
+
+  pub def self.stream_types : Array(UInt64)
+    [
+      WebTransportConstants::STREAM_TYPE_BIDI,
+      WebTransportConstants::STREAM_TYPE_UNI,
+    ]
+  end
+
+  pub def self.capsule_types : Array(UInt64)
+    [
+      CapsuleType::DATAGRAM,
+      WebTransportConstants::CAPSULE_CLOSE_SESSION,
+      WebTransportConstants::CAPSULE_DRAIN_SESSION,
+    ]
+  end
+end

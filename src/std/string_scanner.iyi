@@ -1,0 +1,344 @@
+# Lexical string scanner for iyi.
+#
+# Provides scanning and pattern matching over a string with position tracking.
+
+module std/string_scanner
+
+import std/text
+import std/regex
+
+class ::StringScanner
+  getter string : String
+  getter byte_offset : Int32
+  @last_regex_match : Std::Regex::MatchData?
+  @last_string_match : String?
+
+  def initialize(@string : String)
+    @byte_offset = 0
+    @last_regex_match = nil
+    @last_string_match = nil
+  end
+
+  def eos? : Bool
+    @byte_offset >= @string.bytesize
+  end
+
+  def offset : Int32
+    return @byte_offset if @string.single_byte_optimizable?
+    @string.byte_index_to_char_index(@byte_offset) || 0
+  end
+
+  def offset=(position : Int32) : Nil
+    raise "Index out of range: #{position}" if position < 0
+    if @string.single_byte_optimizable?
+      @byte_offset = position > @string.bytesize ? @string.bytesize : position
+    else
+      @byte_offset = @string.char_index_to_byte_index(position) || @string.bytesize
+    end
+  end
+
+  def byte_offset=(position : Int32) : Nil
+    raise "Index out of range: #{position}" if position < 0
+    @byte_offset = position > @string.bytesize ? @string.bytesize : position
+  end
+
+  def reset : Nil
+    @byte_offset = 0
+    @last_regex_match = nil
+    @last_string_match = nil
+  end
+
+  def terminate : Nil
+    @byte_offset = @string.bytesize
+    @last_regex_match = nil
+    @last_string_match = nil
+  end
+
+  def rewind(len : Int32 = 1) : Nil
+    raise "Cannot rewind negative length #{len}" if len < 0
+    if @string.single_byte_optimizable?
+      raise "Index out of range" if len > @byte_offset
+      @byte_offset -= len
+    else
+      cur_char_idx = offset
+      raise "Index out of range" if len > cur_char_idx
+      self.offset = cur_char_idx - len
+    end
+  end
+
+  def rest : String
+    @string.byte_slice(@byte_offset, @string.bytesize - @byte_offset)
+  end
+
+  def peek(len : Int32) : String
+    return "" if len <= 0 || eos?
+    if @string.single_byte_optimizable?
+      available = @string.bytesize - @byte_offset
+      count = len < available ? len : available
+      @string.byte_slice(@byte_offset, count)
+    else
+      rem = rest
+      ch = rem.chars
+      count = len < ch.size ? len : ch.size
+      result = ""
+      i = 0
+      while i < count
+        result = result + ch[i].to_s
+        i += 1
+      end
+      result
+    end
+  end
+
+  def peek_behind(len : Int32) : String
+    return "" if len <= 0 || @byte_offset <= 0
+    if @string.single_byte_optimizable?
+      count = len < @byte_offset ? len : @byte_offset
+      @string.byte_slice(@byte_offset - count, count)
+    else
+      prefix = @string.byte_slice(0, @byte_offset)
+      ch = prefix.chars
+      start_char = ch.size - len
+      start_char = 0 if start_char < 0
+      result = ""
+      i = start_char
+      while i < ch.size
+        result = result + ch[i].to_s
+        i += 1
+      end
+      result
+    end
+  end
+
+  def current_char? : Char?
+    return nil if eos?
+    rest_str = rest
+    ch = rest_str.chars
+    ch.empty? ? nil : ch.first
+  end
+
+  def current_char : Char
+    current_char? || raise "End of string reached"
+  end
+
+  def previous_char? : Char?
+    return nil if @byte_offset <= 0
+    prefix = @string.byte_slice(0, @byte_offset)
+    ch = prefix.chars
+    ch.empty? ? nil : ch.last
+  end
+
+  def previous_char : Char
+    previous_char? || raise "Beginning of string reached"
+  end
+
+  def current_byte? : UInt8?
+    return nil if eos?
+    @string.to_unsafe[@byte_offset]
+  end
+
+  def current_byte : UInt8
+    current_byte? || raise "End of string reached"
+  end
+
+  def previous_byte? : UInt8?
+    return nil if @byte_offset <= 0
+    @string.to_unsafe[@byte_offset - 1]
+  end
+
+  def previous_byte : UInt8
+    previous_byte? || raise "Beginning of string reached"
+  end
+
+  def scan(pattern : String) : String?
+    match_string(pattern, advance: true, anchored: true)
+  end
+
+  def scan(pattern : Char) : String?
+    match_string(pattern.to_s, advance: true, anchored: true)
+  end
+
+  def scan(pattern : Std::Regex::Regex) : String?
+    match_regex(pattern, advance: true, anchored: true)
+  end
+
+  def scan(len : Int32) : String?
+    return "" if len == 0
+    return nil if len < 0 || eos?
+    if @string.single_byte_optimizable?
+      return nil if @byte_offset + len > @string.bytesize
+      res = @string.byte_slice(@byte_offset, len)
+      @byte_offset += len
+      @last_string_match = res
+      @last_regex_match = nil
+      res
+    else
+      rem = rest
+      ch = rem.chars
+      return nil if ch.size < len
+      res = ""
+      i = 0
+      while i < len
+        res = res + ch[i].to_s
+        i += 1
+      end
+      @byte_offset += res.bytesize
+      @last_string_match = res
+      @last_regex_match = nil
+      res
+    end
+  end
+
+  def scan_until(pattern : String) : String?
+    match_string(pattern, advance: true, anchored: false)
+  end
+
+  def scan_until(pattern : Char) : String?
+    match_string(pattern.to_s, advance: true, anchored: false)
+  end
+
+  def scan_until(pattern : Std::Regex::Regex) : String?
+    match_regex(pattern, advance: true, anchored: false)
+  end
+
+  def skip(pattern : String) : Int32?
+    m = scan(pattern)
+    m ? m.size : nil
+  end
+
+  def skip(pattern : Char) : Int32?
+    m = scan(pattern)
+    m ? m.size : nil
+  end
+
+  def skip(pattern : Std::Regex::Regex) : Int32?
+    m = scan(pattern)
+    m ? m.size : nil
+  end
+
+  def skip(len : Int32) : Int32?
+    m = scan(len)
+    m ? m.size : nil
+  end
+
+  def skip_until(pattern : String) : Int32?
+    m = scan_until(pattern)
+    m ? m.size : nil
+  end
+
+  def skip_until(pattern : Char) : Int32?
+    m = scan_until(pattern)
+    m ? m.size : nil
+  end
+
+  def skip_until(pattern : Std::Regex::Regex) : Int32?
+    m = scan_until(pattern)
+    m ? m.size : nil
+  end
+
+  def check(pattern : String) : String?
+    match_string(pattern, advance: false, anchored: true)
+  end
+
+  def check(pattern : Char) : String?
+    match_string(pattern.to_s, advance: false, anchored: true)
+  end
+
+  def check(pattern : Std::Regex::Regex) : String?
+    match_regex(pattern, advance: false, anchored: true)
+  end
+
+  def check(len : Int32) : String?
+    peek(len)
+  end
+
+  def check_until(pattern : String) : String?
+    match_string(pattern, advance: false, anchored: false)
+  end
+
+  def check_until(pattern : Char) : String?
+    match_string(pattern.to_s, advance: false, anchored: false)
+  end
+
+  def check_until(pattern : Std::Regex::Regex) : String?
+    match_regex(pattern, advance: false, anchored: false)
+  end
+
+  def matched? : Bool
+    !@last_regex_match.nil? || !@last_string_match.nil?
+  end
+
+  def [](group : Int32) : String
+    self[group]? || raise "Group #{group} did not match"
+  end
+
+  def []?(group : Int32) : String?
+    if m = @last_regex_match
+      m[group]
+    elsif s = @last_string_match
+      group == 0 ? s : nil
+    else
+      nil
+    end
+  end
+
+  def inspect : String
+    limit = @string.bytesize - @byte_offset
+    limit = 10 if limit > 10
+    preview = @string.byte_slice(@byte_offset, limit)
+    "#<StringScanner #{@byte_offset}/#{@string.bytesize} #{eos? ? "fin" : preview.inspect}>"
+  end
+
+  private def match_string(pattern : String, advance : Bool, anchored : Bool) : String?
+    p_len = pattern.bytesize
+    return nil if p_len > @string.bytesize - @byte_offset
+
+    if anchored
+      s_ptr = @string.to_unsafe + @byte_offset
+      p_ptr = pattern.to_unsafe
+      i = 0
+      while i < p_len
+        return nil if s_ptr[i] != p_ptr[i]
+        i += 1
+      end
+      @byte_offset += p_len if advance
+      @last_string_match = pattern
+      @last_regex_match = nil
+      pattern
+    else
+      idx = @string.index(pattern, @byte_offset)
+      return nil unless idx
+      finish = idx + p_len
+      result = @string.byte_slice(@byte_offset, finish - @byte_offset)
+      @byte_offset = finish if advance
+      @last_string_match = result
+      @last_regex_match = nil
+      result
+    end
+  end
+
+  private def match_regex(pattern : Std::Regex::Regex, advance : Bool, anchored : Bool) : String?
+    return nil if eos?
+    match = pattern.match(@string, @byte_offset)
+    return nil unless match
+
+    b0 = match.begin(0)
+    e0 = match.end(0)
+    return nil unless b0 && e0
+
+    if anchored
+      return nil unless b0 == @byte_offset
+      result = @string.byte_slice(@byte_offset, e0 - @byte_offset)
+      @byte_offset = e0 if advance
+      @last_regex_match = match
+      @last_string_match = nil
+      result
+    else
+      result = @string.byte_slice(@byte_offset, e0 - @byte_offset)
+      @byte_offset = e0 if advance
+      @last_regex_match = match
+      @last_string_match = nil
+      result
+    end
+  end
+end

@@ -54,6 +54,11 @@
 
 module std/text
 
+import std/slice
+using std/slice::{Slice, Bytes}
+pub alias Bytes = Std::Slice::Bytes
+alias ::Bytes = Std::Slice::Bytes
+
 struct ::Char
   def ascii_letter? : Bool
     (self >= 'a' && self <= 'z') || (self >= 'A' && self <= 'Z')
@@ -1084,10 +1089,596 @@ class ::String
     result
   end
 
-  private def byte_slice(start : Int32, count : Int32) : String
-    String.new(count) do |buffer|
-      buffer.copy_from(to_unsafe + start, count)
+  def byte_slice(start : Int32, count : Int32) : String
+    byte_slice?(start, count) || raise "start #{start}, count #{count} out of bounds for bytesize #{bytesize}"
+  end
+
+  def byte_slice?(start : Int32, count : Int32) : String?
+    return nil if count < 0
+    start = bytesize + start if start < 0
+    return nil if start < 0 || start > bytesize
+    available = bytesize - start
+    taken = count < available ? count : available
+    String.new(taken) do |buffer|
+      buffer.copy_from(to_unsafe + start, taken)
     end
+  end
+
+  def byte_slice(range : Range(Int32, Int32)) : String
+    byte_slice?(range) || raise "Range #{range.begin}..#{range.end} out of bounds for bytesize #{bytesize}"
+  end
+
+  def byte_slice?(range : Range(Int32, Int32)) : String?
+    b = range.begin
+    e = range.end
+    b = bytesize + b if b < 0
+    e = bytesize + e if e < 0
+    return nil if b < 0 || b > bytesize
+    e = bytesize if e > bytesize
+    count = range.exclusive? ? e - b : e - b + 1
+    count = 0 if count < 0
+    byte_slice?(b, count)
+  end
+
+  def [](range : Range(Int32, Int32)) : String
+    self[range]? || raise "Range #{range.begin}..#{range.end} out of bounds for size #{size}"
+  end
+
+  def []?(range : Range(Int32, Int32)) : String?
+    b = range.begin
+    e = range.end
+    b = size + b if b < 0
+    e = size + e if e < 0
+    return nil if b < 0 || b > size
+    e = size if e > size
+    count = range.exclusive? ? e - b : e - b + 1
+    count = 0 if count < 0
+    if single_byte_optimizable?
+      byte_slice?(b, count)
+    else
+      ch = chars
+      return nil if b > ch.size
+      count = ch.size - b if b + count > ch.size
+      res = ""
+      i = 0
+      while i < count
+        res = res + ch[b + i].to_s
+        i += 1
+      end
+      res
+    end
+  end
+
+  def single_byte_optimizable? : Bool
+    bytesize == size
+  end
+
+  def ascii_only? : Bool
+    bytesize == size
+  end
+
+  def present? : Bool
+    !blank?
+  end
+
+  def same?(other : String) : Bool
+    to_unsafe.address == other.to_unsafe.address
+  end
+
+  def <=>(other : String) : Int32
+    return 0 if same?(other)
+    min_len = bytesize < other.bytesize ? bytesize : other.bytesize
+    p1 = to_unsafe
+    p2 = other.to_unsafe
+    i = 0
+    while i < min_len
+      b1 = p1[i]
+      b2 = p2[i]
+      if b1 != b2
+        return b1 < b2 ? -1 : 1
+      end
+      i += 1
+    end
+    bytesize < other.bytesize ? -1 : (bytesize > other.bytesize ? 1 : 0)
+  end
+
+  def compare(other : String, case_insensitive : Bool = false) : Int32
+    unless case_insensitive
+      return self <=> other
+    end
+    s1 = downcase
+    s2 = other.downcase
+    s1 <=> s2
+  end
+
+  def to_slice : Bytes
+    Bytes.new(to_unsafe, bytesize)
+  end
+
+  def char_at(index : Int32) : Char
+    char_at?(index) || raise "Index #{index} out of range for string of size #{size}"
+  end
+
+  def char_at?(index : Int32) : Char?
+    index = size + index if index < 0
+    return nil if index < 0 || index >= size
+    if single_byte_optimizable?
+      return to_unsafe[index].unsafe_chr
+    end
+    ch = chars
+    index < ch.size ? ch[index] : nil
+  end
+
+  def byte_at(index : Int32) : UInt8
+    byte_at?(index) || raise "Index #{index} out of range for string of bytesize #{bytesize}"
+  end
+
+  def byte_at?(index : Int32) : UInt8?
+    index = bytesize + index if index < 0
+    return nil if index < 0 || index >= bytesize
+    to_unsafe[index]
+  end
+
+  def codepoint_at(index : Int32) : Int32
+    char_at(index).ord
+  end
+
+  def char_index_to_byte_index(index : Int32) : Int32?
+    return nil if index < 0
+    return index if single_byte_optimizable? && index <= bytesize
+    if index == 0
+      return 0
+    end
+    byte_idx = 0
+    char_idx = 0
+    ptr = to_unsafe
+    b_size = bytesize
+    while byte_idx < b_size
+      if char_idx == index
+        return byte_idx
+      end
+      b = ptr[byte_idx].to_i
+      if (b & 0x80) == 0
+        byte_idx += 1
+      elsif (b & 0xE0) == 0xC0
+        byte_idx += 2
+      elsif (b & 0xF0) == 0xE0
+        byte_idx += 3
+      elsif (b & 0xF8) == 0xF0
+        byte_idx += 4
+      else
+        byte_idx += 1
+      end
+      char_idx += 1
+    end
+    char_idx == index ? byte_idx : nil
+  end
+
+  def byte_index_to_char_index(index : Int32) : Int32?
+    return nil if index < 0 || index > bytesize
+    return index if single_byte_optimizable?
+    if index == 0
+      return 0
+    end
+    byte_idx = 0
+    char_idx = 0
+    ptr = to_unsafe
+    while byte_idx < index
+      b = ptr[byte_idx].to_i
+      if (b & 0x80) == 0
+        byte_idx += 1
+      elsif (b & 0xE0) == 0xC0
+        byte_idx += 2
+      elsif (b & 0xF0) == 0xE0
+        byte_idx += 3
+      elsif (b & 0xF8) == 0xF0
+        byte_idx += 4
+      else
+        byte_idx += 1
+      end
+      char_idx += 1
+    end
+    byte_idx == index ? char_idx : nil
+  end
+
+  def delete_at(index : Int32) : String
+    delete_at(index, 1)
+  end
+
+  def delete_at(start : Int32, count : Int32) : String
+    raise "negative count: #{count}" if count < 0
+    start = size + start if start < 0
+    raise "start #{start} out of bounds for size #{size}" if start < 0 || start > size
+    if single_byte_optimizable?
+      b_start = start
+      b_count = count < (bytesize - b_start) ? count : (bytesize - b_start)
+      byte_slice(0, b_start) + byte_slice(b_start + b_count, bytesize - b_start - b_count)
+    else
+      ch = chars
+      res = ""
+      i = 0
+      while i < ch.size
+        res = res + ch[i].to_s unless i >= start && i < start + count
+        i += 1
+      end
+      res
+    end
+  end
+
+  def delete_at(range : Range(Int32, Int32)) : String
+    b = range.begin
+    e = range.end
+    b = size + b if b < 0
+    e = size + e if e < 0
+    count = range.exclusive? ? e - b : e - b + 1
+    count = 0 if count < 0
+    delete_at(b, count)
+  end
+
+  def insert(index : Int32, other : String) : String
+    index = size + 1 + index if index < 0
+    raise "index #{index} out of bounds for size #{size}" if index < 0 || index > size
+    if single_byte_optimizable?
+      byte_slice(0, index) + other + byte_slice(index, bytesize - index)
+    else
+      ch = chars
+      res = ""
+      i = 0
+      while i <= ch.size
+        if i == index
+          res = res + other
+        end
+        if i < ch.size
+          res = res + ch[i].to_s
+        end
+        i += 1
+      end
+      res
+    end
+  end
+
+  def insert(index : Int32, other : Char) : String
+    insert(index, other.to_s)
+  end
+
+  def lchop : String
+    return "" if empty?
+    if single_byte_optimizable?
+      byte_slice(1, bytesize - 1)
+    else
+      ch = chars
+      res = ""
+      i = 1
+      while i < ch.size
+        res = res + ch[i].to_s
+        i += 1
+      end
+      res
+    end
+  end
+
+  def lchop(prefix : String) : String
+    return self unless starts_with?(prefix)
+    byte_slice(prefix.bytesize, bytesize - prefix.bytesize)
+  end
+
+  def rchop : String
+    return "" if empty?
+    if single_byte_optimizable?
+      byte_slice(0, bytesize - 1)
+    else
+      ch = chars
+      res = ""
+      i = 0
+      while i < ch.size - 1
+        res = res + ch[i].to_s
+        i += 1
+      end
+      res
+    end
+  end
+
+  def rchop(suffix : String) : String
+    return self unless ends_with?(suffix)
+    byte_slice(0, bytesize - suffix.bytesize)
+  end
+
+  def rchop(suffix : Char) : String
+    rchop(suffix.to_s)
+  end
+
+  def hexbytes? : Bytes?
+    return nil unless bytesize.even?
+    b_len = bytesize // 2
+    slice = Bytes.new(b_len)
+    i = 0
+    while i < b_len
+      c1 = to_unsafe[i * 2]
+      c2 = to_unsafe[i * 2 + 1]
+      h1 = hex_val(c1)
+      h2 = hex_val(c2)
+      return nil if h1 < 0 || h2 < 0
+      slice[i] = ((h1 << 4) | h2).to_u8
+      i += 1
+    end
+    slice
+  end
+
+  def hexbytes : Bytes
+    hexbytes? || raise "Invalid hex string: #{inspect}"
+  end
+
+  private def hex_val(b : UInt8) : Int32
+    if b >= 48_u8 && b <= 57_u8
+      (b - 48_u8).to_i
+    elsif b >= 97_u8 && b <= 102_u8
+      (b - 97_u8).to_i + 10
+    elsif b >= 65_u8 && b <= 70_u8
+      (b - 65_u8).to_i + 10
+    else
+      -1
+    end
+  end
+
+  def to_hex : String
+    String.new(bytesize * 2) do |buf|
+      digits = "0123456789abcdef".to_unsafe
+      i = 0
+      while i < bytesize
+        b = to_unsafe[i].to_i
+        buf[i * 2] = digits[(b >> 4) & 0xF]
+        buf[i * 2 + 1] = digits[b & 0xF]
+        i += 1
+      end
+    end
+  end
+
+  def count(&block : Char -> Bool) : Int32
+    c = 0
+    each_char do |ch|
+      c += 1 if yield ch
+    end
+    c
+  end
+
+  def delete(&block : Char -> Bool) : String
+    res = ""
+    each_char do |ch|
+      res = res + ch.to_s unless yield ch
+    end
+    res
+  end
+
+  def squeeze(&block : Char -> Bool) : String
+    return self if empty?
+    res = ""
+    has_prev = false
+    prev = ' '
+    each_char do |ch|
+      if has_prev && prev == ch && (yield ch)
+        # skip duplicate
+      else
+        res = res + ch.to_s
+        prev = ch
+        has_prev = true
+      end
+    end
+    res
+  end
+
+  def underscore : String
+    return "" if empty?
+    res = ""
+    last_is_separator = true
+    each_char_with_index do |c, i|
+      if c >= 'A' && c <= 'Z'
+        if i > 0 && !last_is_separator
+          res = res + "_"
+        end
+        res = res + (c.ord + 32).unsafe_chr.to_s
+        last_is_separator = false
+      elsif c == '-' || c == ' ' || c == '_'
+        unless last_is_separator
+          res = res + "_"
+        end
+        last_is_separator = true
+      else
+        res = res + c.to_s
+        last_is_separator = false
+      end
+    end
+    res
+  end
+
+  def camelcase(lower : Bool = false) : String
+    return "" if empty?
+    res = ""
+    next_upper = !lower
+    each_char do |c|
+      if c == '_' || c == '-' || c == ' '
+        next_upper = true
+      elsif next_upper
+        res = res + ((c >= 'a' && c <= 'z') ? (c.ord - 32).unsafe_chr.to_s : c.to_s)
+        next_upper = false
+      else
+        res = res + c.to_s
+      end
+    end
+    res
+  end
+
+  def titleize : String
+    return "" if empty?
+    res = ""
+    next_upper = true
+    each_char do |c|
+      if c == '_' || c == '-' || c == ' '
+        res = res + " "
+        next_upper = true
+      elsif next_upper
+        res = res + ((c >= 'a' && c <= 'z') ? (c.ord - 32).unsafe_chr.to_s : c.to_s)
+        next_upper = false
+      else
+        res = res + ((c >= 'A' && c <= 'Z') ? (c.ord + 32).unsafe_chr.to_s : c.to_s)
+      end
+    end
+    res
+  end
+
+  def each_char_with_index(&block : Char, Int32 -> Nil) : Nil
+    i = 0
+    each_char do |c|
+      yield c, i
+      i += 1
+    end
+  end
+
+  def each_codepoint(&block : Int32 -> Nil) : Nil
+    each_char do |c|
+      yield c.ord
+    end
+  end
+
+  def self.build(capacity : Int32 = 64, &block : String::Builder -> Nil) : String
+    String::Builder.build(capacity, &block)
+  end
+end
+
+class ::String::Builder
+  getter bytesize : Int32
+  getter capacity : Int32
+  @buffer : Pointer(UInt8)
+  @finished : Bool
+
+  def initialize(initial_capacity : Int32 = 64)
+    initial_capacity = 16 if initial_capacity < 16
+    @capacity = initial_capacity
+    @buffer = Pointer(UInt8).malloc(@capacity.to_u64 + 1)
+    @bytesize = 0
+    @finished = false
+  end
+
+  def self.build(capacity : Int32 = 64, &block : Builder -> Nil) : String
+    builder = new(capacity)
+    yield builder
+    builder.to_s
+  end
+
+  def self.new(string : String) : Builder
+    b = new(string.bytesize)
+    b << string
+    b
+  end
+
+  def <<(str : String) : self
+    write_string(str.to_unsafe, str.bytesize)
+    self
+  end
+
+  def <<(char : Char) : self
+    cp = char.ord
+    if cp < 0x80
+      write_byte(cp.to_u8)
+    elsif cp < 0x800
+      write_byte((0xC0 | (cp >> 6)).to_u8)
+      write_byte((0x80 | (cp & 0x3F)).to_u8)
+    elsif cp < 0x10000
+      write_byte((0xE0 | (cp >> 12)).to_u8)
+      write_byte((0x80 | ((cp >> 6) & 0x3F)).to_u8)
+      write_byte((0x80 | (cp & 0x3F)).to_u8)
+    elsif cp <= 0x10FFFF
+      write_byte((0xF0 | (cp >> 18)).to_u8)
+      write_byte((0x80 | ((cp >> 12) & 0x3F)).to_u8)
+      write_byte((0x80 | ((cp >> 6) & 0x3F)).to_u8)
+      write_byte((0x80 | (cp & 0x3F)).to_u8)
+    else
+      write_byte('?'.ord.to_u8)
+    end
+    self
+  end
+
+  def <<(obj) : self
+    self << obj.to_s
+    self
+  end
+
+  def print(obj) : Nil
+    self << obj
+  end
+
+  def puts(obj) : Nil
+    self << obj
+    self << '\n'
+  end
+
+  def puts : Nil
+    self << '\n'
+  end
+
+  def write(slice : Bytes) : Nil
+    write_string(slice.to_unsafe, slice.size)
+  end
+
+  def write_byte(byte : UInt8) : Nil
+    ensure_capacity(@bytesize + 1)
+    @buffer[@bytesize] = byte
+    @bytesize += 1
+  end
+
+  def buffer : Pointer(UInt8)
+    @buffer
+  end
+
+  def empty? : Bool
+    @bytesize == 0
+  end
+
+  def chomp(byte : UInt8) : self
+    if @bytesize > 0 && @buffer[@bytesize - 1] == byte
+      @bytesize -= 1
+      if byte == 10_u8 && @bytesize > 0 && @buffer[@bytesize - 1] == 13_u8
+        @bytesize -= 1
+      end
+    end
+    self
+  end
+
+  def back(amount : Int32) : Int32
+    raise "Invalid back amount #{amount}" if amount < 0 || amount > @bytesize
+    @bytesize -= amount
+    amount
+  end
+
+  def to_s : String
+    raise "String::Builder already finished" if @finished
+    @finished = true
+    String.new(@bytesize) do |buf|
+      buf.copy_from(@buffer, @bytesize)
+    end
+  end
+
+  private def write_string(ptr : Pointer(UInt8), len : Int32) : Nil
+    return if len <= 0
+    ensure_capacity(@bytesize + len)
+    (@buffer + @bytesize).copy_from(ptr, len)
+    @bytesize += len
+  end
+
+  private def ensure_capacity(needed : Int32) : Nil
+    return if needed <= @capacity
+    new_cap = @capacity * 2
+    new_cap = needed if new_cap < needed
+    new_buf = Pointer(UInt8).malloc(new_cap.to_u64 + 1)
+    new_buf.copy_from(@buffer, @bytesize)
+    @buffer = new_buf
+    @capacity = new_cap
+  end
+end
+
+class ::IyiIO
+  def <<(obj) : self
+    print(obj.to_s)
+    self
   end
 end
 

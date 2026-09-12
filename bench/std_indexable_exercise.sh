@@ -123,6 +123,14 @@ prove_fails() {
   local label="$1" dir="$2" expected_phrase="$3" sed_script="$4"
   mkdir -p "$WORK/$dir/std"
   sed "$sed_script" "$REPO/src/std/indexable.iyi" > "$WORK/$dir/std/indexable.iyi"
+  # A patch that matches nothing leaves the library intact, and an intact
+  # library passes, which reads as "this check cannot fail" when the truth is
+  # that nothing was broken to test it. Line-anchored patches drift.
+  if cmp -s "$REPO/src/std/indexable.iyi" "$WORK/$dir/std/indexable.iyi"; then
+    echo "  $label: the patch changed nothing, so this proves nothing"
+    status=1
+    return
+  fi
 
   if ! IYI_PATH="$WORK/$dir:$REPO/src:$REPO/samples/iyi" "$IYI" run \
        "$REPO/bench/std_indexable_exercise.iyi" >"$WORK/$dir.out" 2>&1; then
@@ -151,7 +159,7 @@ prove_fails "fetch default fallback" broken_fetch "assertion failed: fetch out o
 
 # 3. Break bsearch binary search: return nil unconditionally
 prove_fails "bsearch binary search" broken_bsearch "assertion failed: bsearch found" \
-  's/idx ? unsafe_fetch(idx) : nil/nil/'
+  's/idx [?] unsafe_fetch(idx) : nil/nil/'
 
 # 4. Break values_at: skip last element
 prove_fails "values_at lookup" broken_values "expected .10,50,30., got" \

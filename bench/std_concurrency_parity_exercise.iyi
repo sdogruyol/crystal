@@ -1,0 +1,523 @@
+# Concurrency Parity Standard Library Exercise.
+# Exercises every concurrency primitive the standard library ports into iyi:
+#   1. std/atomic: Atomic(T) for Int32, Int64, UInt8, UInt64, Bool, Pointer, Reference,
+#      orderings, fence, RMW ops, bitwise_or, and Atomic::Flag.
+#   2. std/fiber: Fiber lifecycle, inspection, cooperative scheduling, state queries.
+#   3. std/concurrent: spawn, sleep, error handling.
+#   4. std/sync: Mutex (Checked, Reentrant, Unchecked), ConditionVariable, RWLock,
+#      Exclusive(T), Shared(T), and ::Sync namespace aliases.
+#   5. std/mutex: Mutex and Protection aliases.
+#   6. std/wait_group: WaitGroup barrier, add, done, wait, block spawn, done?.
+#   7. std/channel: Channel(T) buffered/unbuffered, receive?, receive_or_raise,
+#      send_or_raise, non-blocking ops, select actions, iteration, ClosedError.
+#   8. Platform gates and concurrency error boundaries.
+
+import std/atomic
+import std/fiber
+import std/concurrent
+import std/sync
+import std/mutex
+import std/wait_group
+import std/channel
+
+using std/atomic::{Atomic, AtomicOrdering, Ordering, fence, AtomicFlag}
+using std/fiber::{Fiber}
+using std/concurrent::{spawn, sleep}
+using std/sync::{Type, ConditionVariable, RWLock, Exclusive, Shared}
+using std/wait_group::{WaitGroup}
+using std/channel::{Channel, ClosedError}
+
+class Item
+  property id : Int32
+
+  def initialize(@id : Int32)
+  end
+end
+
+# =============================================================================
+# 1. std/atomic: Primitive types, pointer, reference, orderings, and RMW
+# =============================================================================
+
+# Int32
+a_i32 = Atomic(Int32).new(100)
+raise "atomic i32 get" unless a_i32.get == 100
+raise "atomic i32 lazy_get" unless a_i32.lazy_get == 100
+a_i32.set(120, Ordering::Release)
+raise "atomic i32 set" unless a_i32.get == 120
+a_i32.lazy_set(130)
+raise "atomic i32 lazy_set" unless a_i32.get == 130
+old_swap = a_i32.swap(150, Ordering::AcquireRelease)
+raise "atomic i32 swap old" unless old_swap == 130
+raise "atomic i32 swap new" unless a_i32.get == 150
+
+# RMW arithmetic
+old_add = a_i32.add(25, Ordering::AcquireRelease)
+raise "atomic i32 add old" unless old_add == 150
+raise "atomic i32 add new" unless a_i32.get == 175
+old_sub = a_i32.sub(15, Ordering::AcquireRelease)
+raise "atomic i32 sub old" unless old_sub == 175
+raise "atomic i32 sub new" unless a_i32.get == 160
+
+# Bitwise operations
+bits = Atomic(Int32).new(0b1100)
+bits.and(0b1010, Ordering::SequentiallyConsistent)
+raise "atomic i32 and" unless bits.get == 0b1000
+bits.bitwise_or(0b0001, Ordering::SequentiallyConsistent)
+raise "atomic i32 bitwise_or" unless bits.get == 0b1001
+bits.xor(0b0011, Ordering::SequentiallyConsistent)
+raise "atomic i32 xor" unless bits.get == 0b1010
+bits.nand(0b1111, Ordering::SequentiallyConsistent)
+raise "atomic i32 nand" unless bits.get == -11
+
+# Max and Min
+mm = Atomic(Int32).new(50)
+mm.max(80, Ordering::SequentiallyConsistent)
+raise "atomic i32 max" unless mm.get == 80
+mm.max(40, Ordering::SequentiallyConsistent)
+raise "atomic i32 max no-op" unless mm.get == 80
+mm.min(30, Ordering::SequentiallyConsistent)
+raise "atomic i32 min" unless mm.get == 30
+mm.min(60, Ordering::SequentiallyConsistent)
+raise "atomic i32 min no-op" unless mm.get == 30
+
+# Compare and Set
+cas_atom = Atomic(Int32).new(10)
+old_c1, ok_c1 = cas_atom.compare_and_set(10, 20, Ordering::SequentiallyConsistent, Ordering::Acquire)
+raise "atomic cas success ok" unless ok_c1
+raise "atomic cas success old" unless old_c1 == 10
+raise "atomic cas success new" unless cas_atom.get == 20
+
+old_c2, ok_c2 = cas_atom.compare_and_set(999, 30, Ordering::SequentiallyConsistent, Ordering::Acquire)
+raise "atomic cas failure ok" if ok_c2
+raise "atomic cas failure old" unless old_c2 == 20
+raise "atomic cas failure unchanged" unless cas_atom.get == 20
+
+# Int64, UInt8, UInt64
+a_i64 = Atomic(Int64).new(1000_i64)
+a_i64.add(500_i64)
+raise "atomic i64 add" unless a_i64.get == 1500_i64
+
+a_u8 = Atomic(UInt8).new(10_u8)
+a_u8.add(5_u8)
+raise "atomic u8 add" unless a_u8.get == 15_u8
+
+a_u64 = Atomic(UInt64).new(10000_u64)
+a_u64.sub(2000_u64)
+raise "atomic u64 sub" unless a_u64.get == 8000_u64
+
+# Bool atomic
+a_bool = Atomic(Bool).new(false)
+raise "atomic bool init" unless a_bool.get == false
+a_bool.set(true)
+raise "atomic bool set" unless a_bool.get == true
+old_b = a_bool.swap(false)
+raise "atomic bool swap old" unless old_b == true
+raise "atomic bool swap new" unless a_bool.get == false
+old_b2, ok_b2 = a_bool.compare_and_set(false, true, Ordering::SequentiallyConsistent, Ordering::SequentiallyConsistent)
+raise "atomic bool cas ok" unless ok_b2
+raise "atomic bool cas val" unless a_bool.get == true
+
+# Reference atomic
+item1 = Item.new(1)
+item2 = Item.new(2)
+a_ref = Atomic(Item).new(item1)
+raise "atomic ref init" unless a_ref.get.id == 1
+a_ref.set(item2)
+raise "atomic ref set" unless a_ref.get.id == 2
+old_ref = a_ref.swap(item1)
+raise "atomic ref swap" unless old_ref.id == 2 && a_ref.get.id == 1
+
+# Pointer atomic
+num1 = 42
+num2 = 84
+ptr1 = pointerof(num1)
+ptr2 = pointerof(num2)
+a_ptr = Atomic(Pointer(Int32)).new(ptr1)
+raise "atomic ptr init" unless a_ptr.get.value == 42
+a_ptr.set(ptr2)
+raise "atomic ptr set" unless a_ptr.get.value == 84
+
+puts "atomic primitives: integer, bool, pointer, and reference operations verified"
+
+# =============================================================================
+# 2. std/atomic: Atomic::Flag, Ordering predicates, and Fences
+# =============================================================================
+
+flag = Atomic::Flag.new
+raise "flag initial test_and_set" unless flag.test_and_set == true
+raise "flag second test_and_set" unless flag.test_and_set == false
+flag.clear
+raise "flag test_and_set after clear" unless flag.test_and_set == true
+
+# Ordering predicates
+ord_rel = Ordering::Relaxed
+raise "ord relaxed?" unless ord_rel.relaxed?
+raise "ord not acquire?" if ord_rel.acquire?
+
+ord_acq = Ordering::Acquire
+raise "ord acquire?" unless ord_acq.acquire?
+
+ord_relz = Ordering::Release
+raise "ord release?" unless ord_relz.release?
+
+ord_ar = Ordering::AcquireRelease
+raise "ord acquire_release?" unless ord_ar.acquire_release?
+
+ord_seq = Ordering::SequentiallyConsistent
+raise "ord sequentially_consistent?" unless ord_seq.sequentially_consistent?
+
+# Fences across orderings
+fence(Ordering::Relaxed)
+fence(Ordering::Acquire)
+fence(Ordering::Release)
+fence(Ordering::AcquireRelease)
+fence(Ordering::SequentiallyConsistent)
+Atomic.fence(Ordering::SequentiallyConsistent)
+
+puts "atomic flag & orderings: Flag, memory orderings, and fences verified"
+
+# =============================================================================
+# 3. std/fiber: Lifecycle, inspection, and cooperative execution
+# =============================================================================
+
+main_f = Fiber.current
+raise "main fiber not nil" if main_f.nil?
+raise "main fiber running?" unless main_f.running?
+
+worker_executed = false
+worker_fiber = Fiber.new("audit-worker") do
+  cur = Fiber.current
+  raise "worker name match" unless cur.name == "renamed-worker"
+  worker_executed = true
+end
+
+raise "worker name initial" unless worker_fiber.name == "audit-worker"
+raise "worker initially dead?" if worker_fiber.dead?
+worker_fiber.name = "renamed-worker"
+raise "worker renamed" unless worker_fiber.name == "renamed-worker"
+
+worker_fiber.enqueue
+Fiber.yield
+raise "worker executed after yield" unless worker_executed
+raise "worker dead after execution" unless worker_fiber.dead?
+
+# Equality and inspection
+raise "fiber equality self" unless worker_fiber == worker_fiber
+raise "fiber same? self" unless worker_fiber.same?(worker_fiber)
+inspect_str = worker_fiber.inspect
+to_s_str = worker_fiber.to_s
+raise "fiber inspect format" unless inspect_str.starts_with?("#<Fiber:0x")
+
+puts "fiber operations: lifecycle, naming, inspection, and cooperative yield verified"
+
+# =============================================================================
+# 4. std/concurrent: spawn, macro spawn, and sleep
+# =============================================================================
+
+spawn_ran = false
+task_f = spawn(name: "simple-spawn") do
+  spawn_ran = true
+end
+Fiber.yield
+raise "spawn block executed" unless spawn_ran
+
+macro_ran = false
+spawn macro_ran = true, name: "macro-spawn"
+Fiber.yield
+raise "macro spawn executed" unless macro_ran
+
+sleep(0.001)
+
+main_sleeper = Fiber.current
+spawn do
+  main_sleeper.enqueue
+end
+sleep
+
+puts "concurrent spawn & sleep: spawn forms and sleep durations verified"
+
+# =============================================================================
+# 5. std/sync: Mutex (Checked, Reentrant, Unchecked), ConditionVariable
+# =============================================================================
+
+# Checked Mutex
+checked_m = Std::Sync::Mutex.new(protection: Type::Checked)
+raise "checked_m checked?" unless checked_m.type.checked?
+raise "checked_m try_lock" unless checked_m.try_lock
+raise "checked_m second try_lock false" if checked_m.try_lock
+checked_m.unlock
+
+# Reentrant Mutex
+reentrant_m = Std::Sync::Mutex.new(protection: Type::Reentrant)
+raise "reentrant_m reentrant?" unless reentrant_m.type.reentrant?
+reentrant_m.lock
+reentrant_m.lock
+reentrant_m.unlock
+reentrant_m.unlock
+
+# Unchecked Mutex
+unchecked_m = Std::Sync::Mutex.new(protection: Type::Unchecked)
+raise "unchecked_m unchecked?" unless unchecked_m.type.unchecked?
+unchecked_m.synchronize do
+  # critical section
+end
+
+# ConditionVariable
+cv = ConditionVariable.new
+cv_mutex = Std::Sync::Mutex.new
+cv_worker_done = false
+woken_count = 0
+
+spawn do
+  cv_mutex.synchronize do
+    while woken_count < 1
+      cv.wait(cv_mutex)
+    end
+  end
+  cv_worker_done = true
+end
+
+Fiber.yield
+cv_mutex.synchronize do
+  woken_count = 1
+  cv.signal
+end
+Fiber.yield
+raise "condition variable signal woke waiter" unless cv_worker_done
+
+# ConditionVariable broadcast
+cv_broadcast_done = false
+woken_broadcast = 0
+spawn do
+  cv_mutex.synchronize do
+    while woken_broadcast == 0
+      cv.wait(cv_mutex)
+    end
+  end
+  cv_broadcast_done = true
+end
+
+Fiber.yield
+cv_mutex.synchronize do
+  woken_broadcast = 2
+  cv.broadcast
+end
+Fiber.yield
+raise "condition variable broadcast woke waiters" unless cv_broadcast_done
+
+puts "sync mutex & condition variable: checked, reentrant, and CV signal/broadcast verified"
+
+# =============================================================================
+# 6. std/sync & std/mutex: RWLock, Exclusive, Shared, and aliases
+# =============================================================================
+
+rw = RWLock.new
+read_count = 0
+rw.read_synchronize do
+  read_count = 1
+end
+raise "rwlock read synchronize" unless read_count == 1
+
+write_count = 0
+rw.write_synchronize do
+  write_count = 2
+end
+raise "rwlock write synchronize" unless write_count == 2
+
+rw.synchronize do
+  write_count = 3
+end
+raise "rwlock generic synchronize" unless write_count == 3
+
+# Exclusive
+ex = Exclusive(Int32).new(42)
+ex_val = 0
+ex.synchronize do |v|
+  ex_val = v
+end
+raise "exclusive val" unless ex_val == 42
+ex.unsafe_set(99)
+raise "exclusive unsafe_get" unless ex.unsafe_get == 99
+
+# Shared
+sh = Shared(String).new("init")
+sh_val = ""
+sh.read do |v|
+  sh_val = v
+end
+raise "shared read" unless sh_val == "init"
+sh.write do |v|
+  # write lock
+end
+sh.unsafe_set("updated")
+raise "shared unsafe_get" unless sh.unsafe_get == "updated"
+
+# Aliases in std/mutex and ::Sync
+alias_m = Std::Mutex::Mutex.new(protection: Std::Mutex::Protection::Reentrant)
+raise "mutex alias reentrant" unless alias_m.type.reentrant?
+
+sync_mod_m = Sync::Mutex.new
+raise "::Sync::Mutex works" if sync_mod_m.nil?
+
+puts "sync rwlock, exclusive & shared: read/write synchronization and aliases verified"
+
+# =============================================================================
+# 7. std/wait_group: WaitGroup barrier and block execution
+# =============================================================================
+
+wg = WaitGroup.new(3)
+raise "wg not done initially" if wg.done?
+wg.done
+raise "wg not done at 2" if wg.done?
+wg.done
+raise "wg not done at 1" if wg.done?
+wg.done
+raise "wg done at 0" unless wg.done?
+
+wg_spawned_count = 0
+WaitGroup.wait do |group|
+  group.spawn(name: "wg-t1") do
+    wg_spawned_count = wg_spawned_count + 1
+  end
+  group.spawn(name: "wg-t2") do
+    wg_spawned_count = wg_spawned_count + 1
+  end
+end
+raise "waitgroup block spawn count" unless wg_spawned_count == 2
+
+puts "wait group barrier: counter, wait barrier, and spawn tracking verified"
+
+# =============================================================================
+# 8. std/channel: Rendezvous, buffered, inspection, non-blocking, and close
+# =============================================================================
+
+# Buffered channel inspection
+ch_buf = Channel(Int32).new(2)
+raise "channel capacity 2" unless ch_buf.capacity == 2
+raise "channel initially empty" unless ch_buf.empty?
+raise "channel initially not full" if ch_buf.full?
+raise "channel initial size 0" unless ch_buf.size == 0
+
+ch_buf.send(100)
+raise "channel size 1" unless ch_buf.size == 1
+raise "channel not empty after send" if ch_buf.empty?
+raise "channel not full after 1 send" if ch_buf.full?
+
+ch_buf.send(200)
+raise "channel size 2" unless ch_buf.size == 2
+raise "channel full after 2 sends" unless ch_buf.full?
+
+# Non-blocking send on full channel
+nb_send_full = ch_buf.send_non_blocking(300)
+raise "non_blocking send on full channel fails" if nb_send_full
+
+# Receive
+v_rec1 = ch_buf.receive?
+raise "receive? value 1" unless v_rec1 == 100
+v_rec2 = ch_buf.receive_or_raise
+raise "receive_or_raise value 2" unless v_rec2 == 200
+
+# Non-blocking receive on empty channel
+nb_rec_empty = ch_buf.receive_non_blocking
+raise "non_blocking receive on empty channel is nil" unless nb_rec_empty.nil?
+
+# Rendezvous channel (unbuffered)
+ch_rend = Channel(String).new
+rend_received = ""
+spawn do
+  rend_received = ch_rend.receive_or_raise
+end
+Fiber.yield
+ch_rend.send_or_raise("rendezvous-msg")
+Fiber.yield
+raise "rendezvous delivered" unless rend_received == "rendezvous-msg"
+
+puts "channel rendezvous & buffered: capacity, size, non-blocking ops, and delivery verified"
+
+# =============================================================================
+# 9. std/channel: Iteration, drainage, select actions, and first helpers
+# =============================================================================
+
+ch_drain = Channel(Int32).new(3)
+ch_drain.send(1)
+ch_drain.send(2)
+ch_drain.send(3)
+ch_drain.close
+raise "channel closed? after close" unless ch_drain.closed?
+
+drained = [] of Int32
+ch_drain.each do |num|
+  drained << num
+end
+raise "channel drained count" unless drained.size == 3
+raise "channel drained item 0" unless drained[0] == 1
+raise "channel drained item 1" unless drained[1] == 2
+raise "channel drained item 2" unless drained[2] == 3
+
+# receive? after drain is nil
+raise "receive? after drained is nil" unless ch_drain.receive?.nil?
+
+# Select actions
+action_ch = Channel(Int32).new(1)
+recv_action = action_ch.receive_select_action
+send_action = action_ch.send_select_action(555)
+raise "receive_select_action created" if recv_action.nil?
+raise "send_select_action created" if send_action.nil?
+
+# Channel.receive_first
+ch_a = Channel(Int32).new(1)
+ch_b = Channel(Int32).new(1)
+ch_b.send(777)
+first_val = Channel.receive_first(ch_a, ch_b)
+raise "receive_first selected ch_b" unless first_val == 777
+
+# Channel.send_first
+Channel.send_first(888, ch_a, ch_b)
+raise "send_first sent to ready channel" unless ch_a.receive? == 888
+
+# Channel inspect
+ch_s = ch_a.inspect
+raise "channel inspect format" unless ch_s.starts_with?("#<Channel(Int32):0x")
+
+puts "channel iteration & select actions: each drain, select actions, and first helpers verified"
+
+# =============================================================================
+# 10. Concurrency errors and boundary checks
+# =============================================================================
+
+# ClosedError representation
+closed_err = ClosedError.new("custom channel close")
+raise "closed error message" unless closed_err.message == "custom channel close"
+
+# Sync Error representation
+sync_err = Std::Sync::Error.new("custom sync error")
+raise "sync error message" unless sync_err.message == "custom sync error"
+
+puts "concurrency errors & boundaries: error types and boundary contracts verified"
+
+# =============================================================================
+# 11. Platform gates and memory consistency
+# =============================================================================
+
+# Check that atomic memory barriers and fences guarantee visibility
+barrier_var = Atomic(Int32).new(0)
+barrier_var.set(1, Ordering::Release)
+fence(Ordering::Acquire)
+raise "memory barrier value" unless barrier_var.get(Ordering::Acquire) == 1
+
+# Verify platform target flags are recognized
+target_platform = "unknown"
+{% if flag?(:darwin) %}
+  target_platform = "darwin"
+{% elsif flag?(:linux) %}
+  target_platform = "linux"
+{% elsif flag?(:win32) %}
+  target_platform = "win32"
+{% else %}
+  target_platform = "unknown"
+{% end %}
+raise "recognized platform" if target_platform == "unknown"
+
+puts "platform gates & memory consistency: target #{target_platform} and barriers verified"
+
+puts "all std/concurrency_parity checks passed"

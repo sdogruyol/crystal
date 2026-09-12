@@ -25,7 +25,8 @@ still compiles `.cr` files, and it is what the specs and the bench below use.
 One workflow, `.github/workflows/iyi.yml`, and it is the whole of CI:
 
 ```console
-$ ./bin/crystal tool format --check src spec
+$ git ls-files -z '*.iyi' | xargs -0 ./bin/iyi tool format --check
+$ git ls-files -z '*.cr' | xargs -0 ./bin/crystal tool format --check
 $ ./bin/crystal spec spec/compiler/iyimod_spec.cr spec/compiler/iyi_import_spec.cr \
     spec/compiler/semantic/iyi_spec.cr spec/compiler/compiler_spec.cr
 $ make compiler_spec primitives_spec std_spec

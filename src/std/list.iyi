@@ -63,6 +63,40 @@ pub struct List(T)
     other.each { |x| copy << x }
     List(T).new(copy)
   end
+
+  def first : T
+    raise "first of an empty list" if empty?
+    @items[0]
+  end
+
+  def first? : T?
+    empty? ? nil : @items[0]
+  end
+
+  def last : T
+    raise "last of an empty list" if empty?
+    @items[@items.size - 1]
+  end
+
+  def last? : T?
+    empty? ? nil : @items[@items.size - 1]
+  end
+
+  def to_a : Array(T)
+    @items.dup
+  end
+
+  def to_s : String
+    "List{" + @items.join(", ") + "}"
+  end
+
+  def inspect : String
+    to_s
+  end
+
+  def ==(other : List(T)) : Bool
+    @items == other.to_a
+  end
 end
 
 # The whole surface below `each` comes from the trait. `Elem` is bound to the

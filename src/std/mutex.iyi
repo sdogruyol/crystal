@@ -1,0 +1,8 @@
+# Crystal-compatible Mutex API — alias to Sync::Mutex and Sync::Type.
+
+module std/mutex
+
+pub import std/sync
+
+pub alias Mutex = Std::Sync::Mutex
+pub alias Protection = Std::Sync::Type

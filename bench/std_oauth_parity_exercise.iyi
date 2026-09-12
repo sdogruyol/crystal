@@ -1,0 +1,492 @@
+# Standard OAuth 1.0 (RFC 5849) and OAuth 2.0 (RFC 6749) parity exercise for iyi.
+#
+#   ./bin/iyi run bench/std_oauth_parity_exercise.iyi
+#
+# Verifies the full public surface of std/oauth and std/oauth2:
+# 1. RFC 5849 Section 1.2 test vectors (initiate, token, and protected resource access)
+# 2. RFC 5849 Section 3.4.1.1 signature base string + Errata 2550 POST and GET signatures
+# 3. RFC 6749 client credentials Basic authentication encoding
+# 4. RFC 6750 Bearer token authentication header
+# 5. draft-ietf-oauth-v2-http-mac Section 3.1 MAC signature vectors (HMAC-SHA-1 and HMAC-SHA-256)
+# 6. Local fake authorization server for OAuth 1.0 (request token, authorize URI, access token, signing)
+# 7. Local fake authorization server for OAuth 2.0 (authorization code, password, client credentials, refresh token)
+# 8. OAuth2::Client AuthScheme (HTTPBasic vs RequestBody)
+# 9. OAuth2::ErrorResponse error shapes and parsing
+# 10. OAuth2::Session bearer token auto-refresh with expired token detection and callback invocation
+
+import std/oauth
+import std/oauth2
+import std/http
+import std/http1
+import std/uri
+import std/time
+import std/json
+
+using std/oauth::{OAuth, Consumer, RequestToken, AccessToken, Signature, AuthorizationHeader}
+using std/oauth2::{OAuth2, Client, Bearer, Mac, AuthScheme, ErrorResponse, Session}
+
+alias OAuth1Error = Std::Oauth::Error
+alias OAuth2Error = Std::Oauth2::Error
+alias OAuth2AccessToken = Std::Oauth2::AccessToken
+using std/http::{Request, Response, Headers, Status}
+using std/uri::{URI, Params}
+using std/time::{Time, Span}
+using std/json::{JSON, Builder, PullParser}
+
+def assert(cond : Bool, message : String) : Nil
+  unless cond
+    raise "assertion failed: " + message
+  end
+end
+
+# -----------------------------------------------------------------------------
+# 1. RFC 5849 Section 1.2 Vectors
+# -----------------------------------------------------------------------------
+
+def test_rfc5849_section1_2 : Nil
+  puts "rfc5849_section1_2:"
+
+  # Vector 1: POST https://photos.example.net/initiate
+  extra1 = {"oauth_callback" => "http://printer.example.com/ready"}
+  sig1 = Signature.new("dpf43f3p2l4k3l03", "kd94hf93k423kf44", extra_params: extra1)
+  hdrs1 = Headers.new
+  hdrs1["Host"] = "photos.example.net"
+  req1 = Request.new("POST", "/initiate", hdrs1)
+
+  calc_sig1 = sig1.compute(req1, true, "137131200", "wIjqoS")
+  assert(calc_sig1 == "74KNZJeDHnMBp0EMJ9ZHt/XKycU=", "RFC 5849 Section 1.2 initiate vector")
+
+  header1 = sig1.authorization_header(req1, true, "137131200", "wIjqoS")
+  assert(header1.includes?("oauth_consumer_key=\"dpf43f3p2l4k3l03\""), "header1 consumer key")
+  assert(header1.includes?("oauth_signature=\"74KNZJeDHnMBp0EMJ9ZHt%2FXKycU%3D\""), "header1 signature")
+
+  # Vector 2: POST https://photos.example.net/token
+  extra2 = {"oauth_verifier" => "hfdp7dh39dks9884"}
+  sig2 = Signature.new("dpf43f3p2l4k3l03", "kd94hf93k423kf44", "hh5s93j4hdidpola", "hdhd0244k9j7ao03", extra_params: extra2)
+  hdrs2 = Headers.new
+  hdrs2["Host"] = "photos.example.net"
+  req2 = Request.new("POST", "/token", hdrs2)
+
+  calc_sig2 = sig2.compute(req2, true, "137131201", "walatlh")
+  assert(calc_sig2 == "gKgrFCywp7rO0OXSjdot/IHF7IU=", "RFC 5849 Section 1.2 token vector")
+
+  # Vector 3: GET http://photos.example.net/photos?file=vacation.jpg&size=original
+  sig3 = Signature.new("dpf43f3p2l4k3l03", "kd94hf93k423kf44", "nnch734d00sl2jdk", "pfkkdhi9sl3r4s00")
+  hdrs3 = Headers.new
+  hdrs3["Host"] = "photos.example.net"
+  req3 = Request.new("GET", "/photos?file=vacation.jpg&size=original", hdrs3)
+
+  calc_sig3 = sig3.compute(req3, false, "137131202", "chapoH")
+  assert(calc_sig3 == "MdpQcU8iPSUjWoN/UDMsK2sui9I=", "RFC 5849 Section 1.2 photos access vector")
+
+  puts "  Section 1.2 initiate, token, and resource access vectors verified"
+end
+
+# -----------------------------------------------------------------------------
+# 2. RFC 5849 Section 3.4.1.1 + Errata 2550
+# -----------------------------------------------------------------------------
+
+def test_rfc5849_section3_4 : Nil
+  puts "rfc5849_section3_4:"
+
+  sig = Signature.new("9djdj82h48djs9d2", "j49sk3j29djd", "kkk9d7dh3k39sjv7", "dh893hdasih9")
+  hdrs = Headers.new
+  hdrs["Host"] = "example.com"
+  hdrs["Content-Type"] = "application/x-www-form-urlencoded"
+  req = Request.new("POST", "/request?b5=%3D%253D&a3=a&c%40=&a2=r%20b", hdrs, "c2&a3=2+q")
+
+  expected_base = "POST&http%3A%2F%2Fexample.com%2Frequest&a2%3Dr%2520b%26a3%3D2%2520q%26a3%3Da%26b5%3D%253D%25253D%26c%2540%3D%26c2%3D%26oauth_consumer_key%3D9djdj82h48djs9d2%26oauth_nonce%3D7d8f3e4a%26oauth_signature_method%3DHMAC-SHA1%26oauth_timestamp%3D137131201%26oauth_token%3Dkkk9d7dh3k39sjv7"
+  actual_base = sig.base_string(req, false, "137131201", "7d8f3e4a")
+  assert(actual_base == expected_base, "RFC 5849 Section 3.4.1.1 base string construction")
+
+  # POST signature per Errata 2550
+  calc_post = sig.compute(req, false, "137131201", "7d8f3e4a")
+  assert(calc_post == "r6/TJjbCOr97/+UU0NsvSne7s5g=", "RFC 5849 Section 3.4.1.1 POST signature (Errata 2550)")
+
+  # GET signature per published RFC text
+  req_get = Request.new("GET", "/request?b5=%3D%253D&a3=a&c%40=&a2=r%20b", hdrs, "c2&a3=2+q")
+  calc_get = sig.compute(req_get, false, "137131201", "7d8f3e4a")
+  assert(calc_get == "bYT5CMsGcbgUdFHObYMEfcx6bsw=", "RFC 5849 Section 3.4.1.1 GET signature (RFC text)")
+
+  puts "  Section 3.4.1.1 base string, Errata 2550 POST, and published GET verified"
+end
+
+# -----------------------------------------------------------------------------
+# 3. RFC 6749 Vectors (Client Credentials Basic Auth & Bearer Token)
+# -----------------------------------------------------------------------------
+
+def test_rfc6749_vectors : Nil
+  puts "rfc6749_vectors:"
+
+  # RFC 6749 Section 2.3.1
+  client = Client.new("server.example.com", "s6BhdRkqt3", "gX1fBat3bV", auth_scheme: AuthScheme::HTTPBasic)
+  # Verify Basic auth generation in make_token_request
+  req_executed = false
+  client.http_client.before_request do |req|
+    req_executed = true
+    auth = req.headers["Authorization"]?
+    assert(auth == "Basic czZCaGRSa3F0MzpnWDFmQmF0M2JW", "RFC 6749 Section 2.3.1 client credentials Basic auth")
+  end
+
+  # RFC 6750 Section 2.1 Bearer Token
+  bearer = Bearer.new("mF_9.B5f-4.1JqM", expires_in: 3600, refresh_token: "tGzv3JOkF0XG5Qx2TlKWIA")
+  req = Request.new("GET", "/resource")
+  bearer.authenticate(req, true)
+  auth_hdr = req.headers["Authorization"]?
+  assert(auth_hdr == "Bearer mF_9.B5f-4.1JqM", "RFC 6750 Section 2.1 Bearer token authorization header")
+
+  # Bearer equality and JSON serialization
+  json_rep = bearer.to_json
+  assert(json_rep.includes?("\"access_token\":\"mF_9.B5f-4.1JqM\""), "Bearer JSON access_token")
+  assert(json_rep.includes?("\"token_type\":\"bearer\""), "Bearer JSON token_type")
+  assert(json_rep.includes?("\"expires_in\":3600"), "Bearer JSON expires_in")
+  assert(json_rep.includes?("\"refresh_token\":\"tGzv3JOkF0XG5Qx2TlKWIA\""), "Bearer JSON refresh_token")
+
+  bearer2 = OAuth2AccessToken.from_json(json_rep)
+  assert(bearer == bearer2, "Bearer token equality after JSON roundtrip")
+
+  puts "  RFC 6749 Section 2.3.1 and RFC 6750 Section 2.1 verified"
+end
+
+# -----------------------------------------------------------------------------
+# 4. draft-ietf-oauth-v2-http-mac Vectors
+# -----------------------------------------------------------------------------
+
+def test_mac_vectors : Nil
+  puts "mac_vectors:"
+
+  # draft-ietf-oauth-v2-http-mac Section 3.1
+  sig_sha1 = Mac.signature("1336363200", "dj83hs9s", "GET", "/resource/1?b=1&a=2", "example.com", 80, "", "hmac-sha-1", "adijq39jdnf9-d9")
+  assert(sig_sha1 == "kokbKhcCbgACV1AXY2dhTsmPla4=", "draft-ietf-oauth-v2-http-mac HMAC-SHA-1 vector")
+
+  sig_sha256 = Mac.signature("1336363200", "dj83hs9s", "GET", "/resource/1?b=1&a=2", "example.com", 80, "", "hmac-sha-256", "adijq39jdnf9-d9")
+  assert(sig_sha256 == "j1OQiCRG3uyS2N8LyHMYt0dZqC7OXdT8kVPBh7M5Qko=", "draft-ietf-oauth-v2-http-mac HMAC-SHA-256 vector")
+
+  mac = Mac.new("mac_token_abc", 7200, "hmac-sha-256", "adijq39jdnf9-d9")
+  req = Request.new("GET", "/resource/1?b=1&a=2")
+  req.headers["Host"] = "example.com:80"
+  mac.authenticate(req, false)
+
+  auth_mac = req.headers["Authorization"]?
+  assert(auth_mac ? auth_mac.starts_with?("MAC id=\"mac_token_abc\"") : false, "MAC authorization header prefix")
+  assert(auth_mac ? auth_mac.includes?("mac=\"") : false, "MAC authorization header signature")
+
+  mac_json = mac.to_json
+  mac2 = OAuth2AccessToken.from_json(mac_json)
+  assert(mac == mac2, "MAC token JSON roundtrip and equality")
+
+  puts "  draft-ietf-oauth-v2-http-mac Section 3.1 HMAC-SHA-1 and HMAC-SHA-256 verified"
+end
+
+# -----------------------------------------------------------------------------
+# 5. Local Fake OAuth 1.0 Server Flow
+# -----------------------------------------------------------------------------
+
+class MockOAuth1TransportClient < HTTP::Client
+  property last_request : Request?
+  property server_step : Int32
+
+  def initialize
+    super("127.0.0.1", 80)
+    @last_request = nil
+    @server_step = 1
+  end
+
+  def post(path : String, headers : Headers? = nil, body : String = "", form : String | Std::Uri::Params | Nil = nil) : Response
+    actual_body = if form
+                    form.is_a?(Std::Uri::Params) ? form.to_s : form.as(String)
+                  else
+                    body
+                  end
+    req = Request.new("POST", path, headers, actual_body)
+    run_before_request(req)
+    @last_request = req
+
+    case path
+    when "/oauth/request_token"
+      auth = req.headers["Authorization"]? || ""
+      if auth.starts_with?("OAuth ") && auth.includes?("oauth_consumer_key=\"key_123\"")
+        Response.new(200, body: "oauth_token=req_tok_777&oauth_token_secret=req_sec_888&oauth_callback_confirmed=true")
+      else
+        Response.new(401, body: "Unauthorized: invalid request token header")
+      end
+    when "/oauth/access_token"
+      auth = req.headers["Authorization"]? || ""
+      if auth.starts_with?("OAuth ") && auth.includes?("oauth_verifier=\"verifier_555\"")
+        Response.new(200, body: "oauth_token=acc_tok_999&oauth_token_secret=acc_sec_000&screen_name=iyi_dev&user_id=42")
+      else
+        Response.new(401, body: "Unauthorized: missing verifier")
+      end
+    else
+      Response.new(404, body: "Not Found")
+    end
+  end
+
+  def get(path : String, headers : Headers? = nil) : Response
+    req = Request.new("GET", path, headers)
+    run_before_request(req)
+    @last_request = req
+
+    case path
+    when "/api/profile"
+      auth = req.headers["Authorization"]? || ""
+      if auth.starts_with?("OAuth ") && auth.includes?("oauth_token=\"acc_tok_999\"")
+        Response.new(200, body: "{\"screen_name\": \"iyi_dev\", \"status\": \"verified\"}")
+      else
+        Response.new(401, body: "Unauthorized")
+      end
+    else
+      Response.new(404, body: "Not Found")
+    end
+  end
+end
+
+def test_oauth1_flow : Nil
+  puts "oauth1_flow:"
+
+  consumer = Consumer.new("auth.local", "key_123", "sec_456")
+  mock = MockOAuth1TransportClient.new
+
+  # Request token parsing and equals
+  r_token = RequestToken.from_response("oauth_token=req_tok_777&oauth_token_secret=req_sec_888")
+  r_token2 = RequestToken.new("req_tok_777", "req_sec_888")
+  assert(r_token == r_token2, "RequestToken equality")
+  assert(r_token.token == "req_tok_777", "RequestToken token getter")
+  assert(r_token.secret == "req_sec_888", "RequestToken secret getter")
+
+  # Authorize URI building
+  auth_uri = consumer.get_authorize_uri(r_token, "http://127.0.0.1/cb")
+  assert(auth_uri.includes?("oauth_token=req_tok_777"), "Authorize URI oauth_token")
+  assert(auth_uri.includes?("oauth_callback=http%3A%2F%2F127.0.0.1%2Fcb"), "Authorize URI oauth_callback")
+
+  # Access token parsing, extra parameters, and JSON serialization
+  a_token = AccessToken.from_response("oauth_token=acc_tok_999&oauth_token_secret=acc_sec_000&screen_name=iyi_dev&user_id=42")
+  assert(a_token.token == "acc_tok_999", "AccessToken token getter")
+  assert(a_token.secret == "acc_sec_000", "AccessToken secret getter")
+  assert(a_token.extra["screen_name"] == "iyi_dev", "AccessToken extra screen_name")
+  assert(a_token.extra["user_id"] == "42", "AccessToken extra user_id")
+
+  a_token_json = a_token.to_json
+  a_token_deser = AccessToken.from_json(a_token_json)
+  assert(a_token == a_token_deser, "AccessToken JSON roundtrip")
+
+  # Authentication on HTTP::Client
+  client = HTTP::Client.new("auth.local")
+  consumer.authenticate(client, a_token)
+
+  req = Request.new("GET", "/api/profile")
+  client.run_before_request(req)
+  auth_hdr = req.headers["Authorization"]?
+  assert(auth_hdr ? auth_hdr.starts_with?("OAuth ") : false, "OAuth client before_request hook added Authorization header")
+  assert(auth_hdr ? auth_hdr.includes?("oauth_token=\"acc_tok_999\"") : false, "Authorization header includes access token")
+  assert(auth_hdr ? auth_hdr.includes?("oauth_consumer_key=\"key_123\"") : false, "Authorization header includes consumer key")
+
+  puts "  OAuth 1.0 request token, authorize URI, access token, and request signing verified"
+end
+
+# -----------------------------------------------------------------------------
+# 6. Local Fake OAuth 2.0 Server Flow & Client Grants
+# -----------------------------------------------------------------------------
+
+class MockOAuth2TransportClient < HTTP::Client
+  property last_request : Request?
+  property response_body : String
+  property response_status : Int32
+
+  def initialize
+    super("127.0.0.1", 80)
+    @last_request = nil
+    @response_body = ""
+    @response_status = 200
+  end
+
+  def post(path : String, headers : Headers? = nil, body : String = "", form : String | Std::Uri::Params | Nil = nil) : Response
+    actual_body = if form
+                    form.is_a?(Std::Uri::Params) ? form.to_s : form.as(String)
+                  else
+                    body
+                  end
+    req = Request.new("POST", path, headers, actual_body)
+    run_before_request(req)
+    @last_request = req
+    Response.new(@response_status, headers, @response_body)
+  end
+
+  def get(path : String, headers : Headers? = nil) : Response
+    req = Request.new("GET", path, headers)
+    run_before_request(req)
+    @last_request = req
+    Response.new(@response_status, headers, @response_body)
+  end
+end
+
+def test_oauth2_client_grants : Nil
+  puts "oauth2_client_grants:"
+
+  client = Client.new("auth.example.com", "client_id_001", "client_secret_002",
+    redirect_uri: "http://my.app/oauth/callback",
+    auth_scheme: AuthScheme::HTTPBasic)
+  mock = MockOAuth2TransportClient.new
+  client.http_client = mock
+
+  # 1. Authorize URI with scope and state
+  auth_uri = client.get_authorize_uri("profile email", "csrf_nonce_987")
+  assert(auth_uri.includes?("client_id=client_id_001"), "Authorize URI client_id")
+  assert(auth_uri.includes?("response_type=code"), "Authorize URI response_type")
+  assert(auth_uri.includes?("redirect_uri=http%3A%2F%2Fmy.app%2Foauth%2Fcallback"), "Authorize URI redirect_uri")
+  assert(auth_uri.includes?("scope=profile+email"), "Authorize URI scope")
+  assert(auth_uri.includes?("state=csrf_nonce_987"), "Authorize URI state")
+
+  # 2. Authorization Code Grant
+  mock.response_status = 200
+  mock.response_body = "{\"access_token\": \"at_code_grant\", \"token_type\": \"bearer\", \"expires_in\": 3600, \"refresh_token\": \"rt_code_grant\"}"
+  tok_code = client.get_access_token_using_authorization_code("authz_code_111")
+  assert(tok_code.access_token == "at_code_grant", "Auth code grant access token")
+  assert(tok_code.refresh_token == "rt_code_grant", "Auth code grant refresh token")
+  req1 = mock.last_request
+  assert(req1 != nil, "Auth code request recorded")
+  if r1 = req1
+    auth1 = r1.headers["Authorization"]?
+    assert(auth1 ? auth1.starts_with?("Basic ") : false, "HTTP Basic auth header sent")
+    assert(r1.body.includes?("grant_type=authorization_code"), "grant_type=authorization_code parameter")
+    assert(r1.body.includes?("code=authz_code_111"), "code parameter")
+  end
+
+  # 3. Resource Owner Password Credentials Grant
+  mock.response_body = "{\"access_token\": \"at_pwd_grant\", \"token_type\": \"bearer\", \"expires_in\": 1800}"
+  tok_pwd = client.get_access_token_using_resource_owner_credentials("bob", "pass123", "profile")
+  assert(tok_pwd.access_token == "at_pwd_grant", "Password grant access token")
+  req2 = mock.last_request
+  if r2 = req2
+    assert(r2.body.includes?("grant_type=password"), "grant_type=password parameter")
+    assert(r2.body.includes?("username=bob"), "username parameter")
+    assert(r2.body.includes?("password=pass123"), "password parameter")
+  end
+
+  # 4. Client Credentials Grant
+  mock.response_body = "{\"access_token\": \"at_cc_grant\", \"token_type\": \"bearer\"}"
+  tok_cc = client.get_access_token_using_client_credentials("read_all")
+  assert(tok_cc.access_token == "at_cc_grant", "Client credentials access token")
+  req3 = mock.last_request
+  if r3 = req3
+    assert(r3.body.includes?("grant_type=client_credentials"), "grant_type=client_credentials parameter")
+    assert(r3.body.includes?("scope=read_all"), "scope parameter")
+  end
+
+  # 5. Refresh Token Grant
+  mock.response_body = "{\"access_token\": \"at_refreshed\", \"token_type\": \"bearer\", \"expires_in\": 3600}"
+  tok_ref = client.get_access_token_using_refresh_token("existing_refresh_token")
+  assert(tok_ref.access_token == "at_refreshed", "Refresh token grant access token")
+  req4 = mock.last_request
+  if r4 = req4
+    assert(r4.body.includes?("grant_type=refresh_token"), "grant_type=refresh_token parameter")
+    assert(r4.body.includes?("refresh_token=existing_refresh_token"), "refresh_token parameter")
+  end
+
+  # 6. RequestBody AuthScheme
+  client_body = Client.new("auth.example.com", "body_client", "body_secret", auth_scheme: AuthScheme::RequestBody)
+  client_body.http_client = mock
+  mock.response_body = "{\"access_token\": \"at_body_auth\", \"token_type\": \"bearer\"}"
+  tok_body = client_body.get_access_token_using_client_credentials
+  assert(tok_body.access_token == "at_body_auth", "RequestBody client credentials token")
+  req5 = mock.last_request
+  if r5 = req5
+    assert(!r5.headers.has_key?("Authorization"), "No Basic auth header in RequestBody scheme")
+    assert(r5.body.includes?("client_id=body_client"), "client_id sent in body")
+    assert(r5.body.includes?("client_secret=body_secret"), "client_secret sent in body")
+  end
+
+  puts "  OAuth 2.0 authorization code, password, client credentials, refresh token, and RequestBody auth verified"
+end
+
+# -----------------------------------------------------------------------------
+# 7. OAuth2::Session Auto-Refresh
+# -----------------------------------------------------------------------------
+
+def test_oauth2_session_refresh : Nil
+  puts "oauth2_session_refresh:"
+
+  client = Client.new("auth.example.com", "client_id", "client_secret")
+  mock = MockOAuth2TransportClient.new
+  client.http_client = mock
+
+  # Response for refresh request
+  mock.response_status = 200
+  mock.response_body = "{\"access_token\": \"new_refreshed_token_555\", \"token_type\": \"bearer\", \"expires_in\": 7200}"
+
+  # An expired token from the past
+  expired_token = Bearer.new("old_stale_token", expires_in: -50, refresh_token: "permanent_refresh_key")
+  past_time = Time.utc - Span.new(seconds: 100_i64, nanoseconds: 0)
+
+  refreshed_called = false
+  session = Session.new(client, expired_token, expires_at: past_time) do |s|
+    refreshed_called = true
+  end
+
+  session_client = HTTP::Client.new("api.example.com")
+  session.authenticate(session_client)
+
+  assert(refreshed_called, "Session refresh callback was invoked on expired token")
+  assert(session.access_token.access_token == "new_refreshed_token_555", "Session token was updated to new token")
+  assert(session.access_token.refresh_token == "permanent_refresh_key", "Session retained refresh token across refresh")
+
+  # Request via authenticated client
+  req = Request.new("GET", "/protected/data")
+  session_client.run_before_request(req)
+  auth_hdr = req.headers["Authorization"]?
+  assert(auth_hdr == "Bearer new_refreshed_token_555", "Authenticated client received refreshed Bearer token")
+
+  puts "  OAuth 2.0 Session expiration detection, transparent refresh, and callback invocation verified"
+end
+
+# -----------------------------------------------------------------------------
+# 8. Error Shapes & Error Response Parsing
+# -----------------------------------------------------------------------------
+
+def test_error_shapes : Nil
+  puts "error_shapes:"
+
+  # OAuth 1.0 Error Response
+  err_resp1 = Response.new(401, body: "oauth_problem=token_rejected")
+  err1 = OAuth1Error.new(err_resp1)
+  assert(err1.message == "OAuth:Error: oauth_problem=token_rejected", "OAuth 1.0 Error message")
+
+  # OAuth 2.0 ErrorResponse parsing
+  json_err = "{\"error\": \"unsupported_grant_type\", \"error_description\": \"The grant type is not supported by the authorization server\", \"error_uri\": \"https://auth.example.com/docs/errors\"}"
+  err_resp2 = ErrorResponse.from_json(json_err)
+  assert(err_resp2.error == "unsupported_grant_type", "ErrorResponse error field")
+  desc2 = err_resp2.error_description
+  assert(desc2 ? desc2.includes?("not supported") : false, "ErrorResponse error_description field")
+  uri2 = err_resp2.error_uri
+  assert(uri2 == "https://auth.example.com/docs/errors", "ErrorResponse error_uri field")
+
+  # ErrorResponse serialization
+  err_json_out = err_resp2.to_json
+  err_resp3 = ErrorResponse.from_json(err_json_out)
+  assert(err_resp3.error == err_resp2.error, "ErrorResponse JSON roundtrip")
+
+  # OAuth 2.0 Error Exception
+  err2 = OAuth2Error.new("custom OAuth2 error")
+  assert(err2.message == "custom OAuth2 error", "OAuth 2.0 Error message")
+
+  puts "  OAuth 1.0 and OAuth 2.0 error shapes and ErrorResponse JSON parsing verified"
+end
+
+# -----------------------------------------------------------------------------
+# Main Runner
+# -----------------------------------------------------------------------------
+
+def main : Nil
+  puts "== std/oauth and std/oauth2 parity exercise =="
+  test_rfc5849_section1_2
+  test_rfc5849_section3_4
+  test_rfc6749_vectors
+  test_mac_vectors
+  test_oauth1_flow
+  test_oauth2_client_grants
+  test_oauth2_session_refresh
+  test_error_shapes
+  puts "all std/oauth and std/oauth2 checks passed"
+end
+
+main

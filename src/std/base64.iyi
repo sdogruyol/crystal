@@ -1,0 +1,377 @@
+# Base64 encoding and decoding according to RFC 2045 and RFC 4648.
+#
+# Pure iyi implementation with zero external C library dependencies.
+
+module std/base64
+
+import std/static_array
+import std/slice
+using std/slice::{Slice, Bytes}
+pub alias Bytes = Std::Slice::Bytes
+
+class ::String
+  def to_slice : Std::Slice::Bytes
+    Std::Slice::Bytes.new(to_unsafe, bytesize, read_only: true)
+  end
+end
+
+module ::Base64
+  class Error < Exception
+    getter message : String
+
+    def initialize(@message : String = "")
+    end
+  end
+
+  private CHARS_STD  = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+  private CHARS_SAFE = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+  private LINE_SIZE  =    60
+  private PAD        = 61_u8 # '='
+  private NL         = 10_u8 # '\n'
+  private NR         = 13_u8 # '\r'
+
+  # Returns the base64-encoded version of *data*.
+  # Complies with RFC 2045 with newlines every 60 characters.
+  private def self.to_slice(data : Std::Slice::Bytes) : Std::Slice::Bytes
+    data
+  end
+
+  private def self.to_slice(data) : Std::Slice::Bytes
+    data.to_slice
+  end
+
+  def self.encode(data) : String
+    slice = to_slice(data)
+    return "" if slice.empty?
+
+    raw_chars = ((slice.size + 2) // 3) * 4
+    newlines = (raw_chars // LINE_SIZE) + ((raw_chars % LINE_SIZE > 0) ? 1 : 0)
+    total_len = raw_chars + newlines
+
+    String.new(total_len) do |buf|
+      chars_bytes = CHARS_STD.to_unsafe
+      src = slice.to_unsafe
+      size = slice.size
+      dst_idx = 0
+      col = 0
+      src_idx = 0
+
+      while src_idx + 3 <= size
+        b0 = src[src_idx].to_i32
+        b1 = src[src_idx + 1].to_i32
+        b2 = src[src_idx + 2].to_i32
+        triple = (b0 << 16) | (b1 << 8) | b2
+
+        c0 = chars_bytes[(triple >> 18) & 0x3f]
+        c1 = chars_bytes[(triple >> 12) & 0x3f]
+        c2 = chars_bytes[(triple >> 6) & 0x3f]
+        c3 = chars_bytes[triple & 0x3f]
+
+        buf[dst_idx] = c0; dst_idx += 1; col += 1
+        if col >= LINE_SIZE
+          buf[dst_idx] = NL; dst_idx += 1; col = 0
+        end
+
+        buf[dst_idx] = c1; dst_idx += 1; col += 1
+        if col >= LINE_SIZE
+          buf[dst_idx] = NL; dst_idx += 1; col = 0
+        end
+
+        buf[dst_idx] = c2; dst_idx += 1; col += 1
+        if col >= LINE_SIZE
+          buf[dst_idx] = NL; dst_idx += 1; col = 0
+        end
+
+        buf[dst_idx] = c3; dst_idx += 1; col += 1
+        if col >= LINE_SIZE
+          buf[dst_idx] = NL; dst_idx += 1; col = 0
+        end
+
+        src_idx += 3
+      end
+
+      rem = size - src_idx
+      if rem == 1
+        b0 = src[src_idx].to_i32
+        triple = b0 << 16
+        c0 = chars_bytes[(triple >> 18) & 0x3f]
+        c1 = chars_bytes[(triple >> 12) & 0x3f]
+
+        buf[dst_idx] = c0; dst_idx += 1; col += 1
+        if col >= LINE_SIZE
+          buf[dst_idx] = NL; dst_idx += 1; col = 0
+        end
+
+        buf[dst_idx] = c1; dst_idx += 1; col += 1
+        if col >= LINE_SIZE
+          buf[dst_idx] = NL; dst_idx += 1; col = 0
+        end
+
+        buf[dst_idx] = PAD; dst_idx += 1; col += 1
+        if col >= LINE_SIZE
+          buf[dst_idx] = NL; dst_idx += 1; col = 0
+        end
+
+        buf[dst_idx] = PAD; dst_idx += 1; col += 1
+        if col >= LINE_SIZE
+          buf[dst_idx] = NL; dst_idx += 1; col = 0
+        end
+      elsif rem == 2
+        b0 = src[src_idx].to_i32
+        b1 = src[src_idx + 1].to_i32
+        triple = (b0 << 16) | (b1 << 8)
+        c0 = chars_bytes[(triple >> 18) & 0x3f]
+        c1 = chars_bytes[(triple >> 12) & 0x3f]
+        c2 = chars_bytes[(triple >> 6) & 0x3f]
+
+        buf[dst_idx] = c0; dst_idx += 1; col += 1
+        if col >= LINE_SIZE
+          buf[dst_idx] = NL; dst_idx += 1; col = 0
+        end
+
+        buf[dst_idx] = c1; dst_idx += 1; col += 1
+        if col >= LINE_SIZE
+          buf[dst_idx] = NL; dst_idx += 1; col = 0
+        end
+
+        buf[dst_idx] = c2; dst_idx += 1; col += 1
+        if col >= LINE_SIZE
+          buf[dst_idx] = NL; dst_idx += 1; col = 0
+        end
+
+        buf[dst_idx] = PAD; dst_idx += 1; col += 1
+        if col >= LINE_SIZE
+          buf[dst_idx] = NL; dst_idx += 1; col = 0
+        end
+      end
+
+      if col > 0
+        buf[dst_idx] = NL
+        dst_idx += 1
+      end
+    end
+  end
+
+  # Writes the base64-encoded version of *data* to *io*.
+  def self.encode(data, io) : Int32
+    str = encode(data)
+    io << str
+    io.flush
+    str.bytesize
+  end
+
+  # Returns the base64-encoded version of *data* with no newlines.
+  # Complies with RFC 4648.
+  def self.strict_encode(data) : String
+    encode_internal(to_slice(data), CHARS_STD, pad: true)
+  end
+
+  # Writes the base64-encoded version of *data* with no newlines to *io*.
+  def self.strict_encode(data, io) : Int32
+    str = strict_encode(data)
+    io << str
+    io.flush
+    str.bytesize
+  end
+
+  # Returns the base64-encoded version of *data* using URL-safe alphabet.
+  def self.urlsafe_encode(data, padding : Bool = true) : String
+    encode_internal(to_slice(data), CHARS_SAFE, pad: padding)
+  end
+
+  # Writes the base64-encoded version of *data* using URL-safe alphabet to *io*.
+  def self.urlsafe_encode(data, io) : Int32
+    str = urlsafe_encode(data, padding: true)
+    io << str
+    io.flush
+    str.bytesize
+  end
+
+  private def self.encode_internal(slice : Std::Slice::Bytes, alphabet : String, pad : Bool) : String
+    size = slice.size
+    return "" if size == 0
+
+    out_len = ((size + 2) // 3) * 4
+    rem = size % 3
+    if !pad
+      if rem == 1
+        out_len -= 2
+      elsif rem == 2
+        out_len -= 1
+      end
+    end
+
+    String.new(out_len) do |buf|
+      chars_bytes = alphabet.to_unsafe
+      src = slice.to_unsafe
+      dst_idx = 0
+      src_idx = 0
+
+      while src_idx + 3 <= size
+        b0 = src[src_idx].to_i32
+        b1 = src[src_idx + 1].to_i32
+        b2 = src[src_idx + 2].to_i32
+        triple = (b0 << 16) | (b1 << 8) | b2
+
+        buf[dst_idx] = chars_bytes[(triple >> 18) & 0x3f]
+        buf[dst_idx + 1] = chars_bytes[(triple >> 12) & 0x3f]
+        buf[dst_idx + 2] = chars_bytes[(triple >> 6) & 0x3f]
+        buf[dst_idx + 3] = chars_bytes[triple & 0x3f]
+        dst_idx += 4
+        src_idx += 3
+      end
+
+      if rem == 1
+        b0 = src[src_idx].to_i32
+        triple = b0 << 16
+        buf[dst_idx] = chars_bytes[(triple >> 18) & 0x3f]
+        buf[dst_idx + 1] = chars_bytes[(triple >> 12) & 0x3f]
+        dst_idx += 2
+        if pad
+          buf[dst_idx] = PAD
+          buf[dst_idx + 1] = PAD
+          dst_idx += 2
+        end
+      elsif rem == 2
+        b0 = src[src_idx].to_i32
+        b1 = src[src_idx + 1].to_i32
+        triple = (b0 << 16) | (b1 << 8)
+        buf[dst_idx] = chars_bytes[(triple >> 18) & 0x3f]
+        buf[dst_idx + 1] = chars_bytes[(triple >> 12) & 0x3f]
+        buf[dst_idx + 2] = chars_bytes[(triple >> 6) & 0x3f]
+        dst_idx += 3
+        if pad
+          buf[dst_idx] = PAD
+          dst_idx += 1
+        end
+      end
+    end
+  end
+
+  private def self.decode_char(byte : UInt8) : UInt8
+    if byte >= 65_u8 && byte <= 90_u8
+      byte - 65_u8
+    elsif byte >= 97_u8 && byte <= 122_u8
+      byte - 97_u8 + 26_u8
+    elsif byte >= 48_u8 && byte <= 57_u8
+      byte - 48_u8 + 52_u8
+    elsif byte == 43_u8 || byte == 45_u8
+      62_u8
+    elsif byte == 47_u8 || byte == 95_u8
+      63_u8
+    else
+      255_u8
+    end
+  end
+
+  # Returns the base64-decoded version of *data* as a `Bytes`.
+  # Decodes either standard or urlsafe alphabets.
+  def self.decode(data) : Std::Slice::Bytes
+    slice = to_slice(data)
+    size = slice.size
+    return Std::Slice::Bytes.new(0) if size == 0
+
+    # Upper bound on output bytes: (size * 3) // 4 + 4
+    max_out = (size * 3 // 4) + 4
+    out_buf = Pointer(UInt8).malloc(max_out.to_u64)
+    out_idx = 0
+
+    src = slice.to_unsafe
+    i = 0
+    chunk = uninitialized UInt8[4]
+    chunk_len = 0
+
+    while i < size
+      b = src[i]
+      i += 1
+      # Skip whitespace
+      next if b == NL || b == NR || b == 32_u8 || b == 9_u8
+      if b == PAD
+        # Padding character
+        chunk[chunk_len] = 64_u8
+        chunk_len += 1
+      else
+        val = decode_char(b)
+        raise "Invalid base64 character: #{b.to_i}" if val == 255_u8
+        chunk[chunk_len] = val
+        chunk_len += 1
+      end
+
+      if chunk_len == 4
+        c0 = chunk[0]
+        c1 = chunk[1]
+        c2 = chunk[2]
+        c3 = chunk[3]
+
+        if c0 == 64_u8 || c1 == 64_u8
+          raise "Invalid padding in base64"
+        end
+
+        v0 = c0.to_i32
+        v1 = c1.to_i32
+        v2 = c2.to_i32
+        v3 = c3.to_i32
+
+        out_buf[out_idx] = ((v0 << 2) | (v1 >> 4)).to_u8
+        out_idx += 1
+
+        if c2 != 64_u8
+          out_buf[out_idx] = (((v1 & 0x0f) << 4) | (v2 >> 2)).to_u8
+          out_idx += 1
+          if c3 != 64_u8
+            out_buf[out_idx] = (((v2 & 0x03) << 6) | v3).to_u8
+            out_idx += 1
+          end
+        end
+        chunk_len = 0
+      end
+    end
+
+    if chunk_len == 1
+      raise "Wrong base64 input size"
+    elsif chunk_len == 2
+      c0 = chunk[0]
+      c1 = chunk[1]
+      raise "Invalid base64 padding" if c0 == 64_u8 || c1 == 64_u8
+      v0 = c0.to_i32
+      v1 = c1.to_i32
+      out_buf[out_idx] = ((v0 << 2) | (v1 >> 4)).to_u8
+      out_idx += 1
+    elsif chunk_len == 3
+      c0 = chunk[0]
+      c1 = chunk[1]
+      c2 = chunk[2]
+      raise "Invalid base64 padding" if c0 == 64_u8 || c1 == 64_u8
+      v0 = c0.to_i32
+      v1 = c1.to_i32
+      v2 = c2.to_i32
+      out_buf[out_idx] = ((v0 << 2) | (v1 >> 4)).to_u8
+      out_idx += 1
+      if c2 != 64_u8
+        out_buf[out_idx] = (((v1 & 0x0f) << 4) | (v2 >> 2)).to_u8
+        out_idx += 1
+      end
+    end
+
+    # Return trimmed Bytes slice
+    Std::Slice::Bytes.new(out_buf, out_idx)
+  end
+
+  # Writes the base64-decoded version of *data* to *io*.
+  def self.decode(data, io) : Int32
+    decoded = decode(data)
+    io.write(decoded)
+    io.flush
+    decoded.size
+  end
+
+  # Returns the base64-decoded version of *data* as a `String`.
+  def self.decode_string(data) : String
+    decoded = decode(data)
+    String.new(decoded.size) do |buf|
+      buf.copy_from(decoded.to_unsafe, decoded.size)
+    end
+  end
+end
+
+pub alias Base64 = ::Base64

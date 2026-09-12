@@ -343,14 +343,98 @@ question — "too few arguments for format string" — where it used to borrow
 a raise from an index.
 
 **The standard library is deliberately outside that count, and this is the
-answer this section left open.** `src/std/` is 6,057 lines across twelve
-modules: `traits`, `cmp`, `enumerable`, `indexable`, `iterator`, `slice`,
-`text`, `time`, `format`, `socket`, `list` and `derives`. It is opt-in via
-`import std/...`, it lives outside `src/iyi/` where `bench/doc_numbers.py`
-measures the ceiling, and a program that imports none of it pays for none of
-it. So the prelude rule keeps its meaning, "a method enters because a
-program in this repository needs it", and the number it is held to is the
-one the rule named.
+answer this section left open.** `src/std/` is **68,003 lines across 102
+modules**. It is opt-in via `import std/...`, it lives outside `src/iyi/` where
+`bench/doc_numbers.py` measures the ceiling, and a program that imports none of
+it pays for none of it. So the prelude rule keeps its meaning, "a method enters
+because a program in this repository needs it", while the language still gets a
+library. The other answer this section named, moving the ceiling, is not taken.
+What is not open is pretending the prelude number itself still fits.
+
+**Nothing in it links a C library, and six modules exist because of that
+rule.** Crystal binds libyaml, libxml2, zlib, GMP and PCRE; each is written
+here instead, which is the same choice `src/compiler/iyi/rx.cr` already made by
+writing 2,031 lines of regex engine rather than binding PCRE:
+
+| Crystal binds | iyi writes | what proves it |
+|---|---|---|
+| libyaml | `yaml.iyi` | the Norway problem, merge keys, an alias bomb bounded |
+| libxml2 | `xml.iyi` | an XXE attempt refused, billion laughs bounded |
+| zlib | `compress.iyi` | round trips against the real `gzip` in both directions |
+| GMP | `big.iyi` | 5,000 random algebraic identities, and `102!` |
+| PCRE | `regex.iyi` | a Thompson NFA, so `(a+)+b` is linear rather than 2^n |
+| OpenSSL digests | `digest.iyi`, `crypto.iyi` | NIST CAVP and RFC 2202, 4231, 5869, 8439 vectors |
+
+Two of these close gaps the prelude could not. `dns.iyi` resolves a hostname,
+which `src/std/socket.iyi` deliberately refuses to do because `getaddrinfo`
+drags in libc and NSS and ends III.9's floor; the resolver is written instead,
+over `udp.iyi`, which did not exist either. And `hpack.iyi`, `qpack.iyi` and
+`capsule.iyi` are header compression and HTTP datagrams for HTTP/2 and HTTP/3,
+which Crystal does not have at all, so they are written from the RFCs and
+checked against the worked examples in RFC 7541 appendix C, RFC 9204 appendix
+B and RFC 9000 appendix A rather than against themselves.
+
+**The protocol layer is where "Crystal does not have this" stops being a
+footnote.** TLS 1.3, HTTP/1.1, WebSocket, HTTP/2, and QUIC with HTTP/3 are
+written on top of the modules above, and three of the five have no Crystal
+equivalent to port from at all. Each is gated against the RFC's own worked
+bytes rather than against itself, which is the only test that catches an
+implementation that round-trips happily while disagreeing with the world:
+
+| module | gated on | what it answers |
+|---|---|---|
+| `tls.iyi` | RFC 8448's worked traces, byte for byte | a live authenticated TLS 1.3 connection to `example.com`, cipher `0x1301` |
+| `http1.iyi` | RFC 9112, and nineteen smuggling framings refused | a client and concurrent server, live HTTP and authenticated HTTPS |
+| `websocket.iyi` | RFC 6455 section 1.3's handshake vector | UTF-8 across fragments and stateless `permessage-deflate` negotiation |
+| `http2.iyi` | RFC 9113, sixteen h2spec shapes | three concurrent streams, and 102 KB through a 65,535-byte window |
+| `quic.iyi`, `http3.iyi` | RFC 9001 appendix A, byte for byte | TLS 1.3, 1-RTT, ACK/PTO, H3/QPACK and WebTransport over UDP loopback |
+| `http_client.iyi` | live ALPN against two independent origins | one client selected `h2` at `nghttp2.org` and `http/1.1` at `www.gnu.org` |
+
+**Protocol is transport policy, not application policy.** `std/http_client`
+accepts the shared `Request` and returns the shared `Response`; `get` and
+`post` expose no protocol argument. Direct HTTPS offers `h2` and `http/1.1`
+through TLS ALPN. An `Alt-Svc` advertisement moves the next request to an
+available HTTP/3 transport, and an upstream proxy receives the ordered `h3`,
+`h2`, `http/1.1` offer and reports what it negotiated. The protocol remains
+observable as `last_protocol` for operations, but an application does not
+branch on it to send a request. The exercise runs the same call and models
+through all three outcomes, and the direct h2 and TLS http/1.1 paths are live
+network requests rather than mock selection.
+
+The QUIC result is the one worth stating precisely, because it was produced
+twice. Its author first wrote its own AES rather than reach across a module
+boundary, and after being given `Std::Crypto::HeaderProtection` instead, every
+appendix A mask still matched. Two independently written AES paths agreeing on
+the same bytes is a stronger statement than either one passing alone.
+
+**TLS carries a limitation section rather than an assurance.** It verifies
+X25519, Ed25519, ECDSA P-256, RSA-PSS and PKCS1v15, parses X.509 and matches
+hostnames per RFC 6125, and it fails closed on a bad Finished MAC, an
+unverifiable signature, an expired certificate and a hostname mismatch, each
+proven. It has also had no independent cryptographic review, its BigInt
+modular arithmetic is not guaranteed constant-time on every microarchitecture,
+and it is client-only. Hand-rolled TLS fails silently, so the honest posture is
+written down here beside the capability rather than left to be inferred from
+the fact that it works.
+
+**Each of those gates carries a failure proof, and two of the proofs were
+found to be proving nothing.** The pattern throughout this repository is to
+break the mechanism deliberately and require the check to catch it, which is
+what makes a green gate mean something. It has a silent failure mode. The
+AES-128-GCM tampered-tag proof patched a line range and the comparison it
+meant to remove had moved past the end of it; the QUIC varint proof matched
+`MAX_1BYTE = 63_u64` after the formatter had column-aligned the constant. A
+patch that matches nothing leaves the library intact, an intact library
+passes, and the driver reports that as the check being unable to fail. Both
+read as green for as long as nobody ran them together.
+
+The mechanism is guarded now rather than the two instances fixed: every
+driver that patches a source file compares the patched copy against the
+original and refuses to draw a conclusion when they are identical, across
+twenty-three sites in twenty-one scripts, and patches are anchored on text
+rather than on line numbers. The AES one is the reason this is recorded here
+rather than only in a commit: an AEAD that accepts a forged tag is worse than
+no AEAD, TLS and QUIC are built on it, and the exercise said it was covered.
 
 The ceiling was not a guess. Crystal's own 0.1.0 shipped 8,161 lines of
 library. Its core is **3,551 lines** of that: `object`, `nil`, `bool`, `char`,
@@ -856,8 +940,8 @@ Checking it moved two things and left the shape alone.
 
 | | Crystal 0.1.0 (2014-06-18) | iyi today |
 |---|---|---|
-| Compiler | 24,984 lines, **written in Crystal** | 109,499 lines, Crystal, forked |
-| Library | 8,161 lines (3,551 of it core) | 13,780-line own prelude + 6,067 in std |
+| Compiler | 24,984 lines, **written in Crystal** | 109,605 lines, Crystal, forked |
+| Library | 8,161 lines (3,551 of it core) | 13,780-line own prelude + 68,003 in std |
 | Specs | 21,146 lines | 9,830 for iyi |
 | Samples | 24 **programs** | 8 **explanations**, a first half hour, and `calc`, a language |
 | History | 3,165 commits over 21 months | 266 |
@@ -1291,6 +1375,18 @@ section had not reached.
   the second one exists purely to open the door. Nothing is unsound and nothing
   is unexpressible; it is one more line than the ergonomics claim implies, and
   the claim should say so rather than be quietly generous.
+- **A heterogeneous sequence cannot implement these traits at all.** `Tuple`
+  and `NamedTuple` were the one part of the collections port that did not
+  land, and the reason is structural rather than an omission: a trait answers
+  a single associated type, so `type Elem` cannot describe a sequence whose
+  elements differ. Forcing a union would box and would destroy the static
+  typing that makes a tuple worth having, and `forall *T`, a variadic generic
+  parameter on an `impl`, is not supported. The compiler handles tuples fine,
+  including compile-time indexing; what is missing is a way for user code to
+  write a trait whose return type depends on an index. So the port ships
+  macro-based tuple methods rather than an `impl`, and this is the boundary of
+  what II.6's model reaches. It is worth knowing before somebody designs
+  against the assumption that every collection can be `Enumerable`.
 
 **1. Traits need associated types as well as parameters.**
 
@@ -1636,7 +1732,7 @@ of them called in both:
 |---|---|---|---|
 | 0 | 0.143 s | 0.143 s | 1.00 |
 | 500 | 0.155 s | 0.154 s | 1.00 |
-| 1000 | 0.169 s | 0.168 s | 1.00 |
+| 1020 | 0.169 s | 0.168 s | 1.00 |
 | 2000 | 0.187 s | 0.183 s | 1.02 |
 | 4000 | 0.224 s | 0.215 s | 1.05 |
 
@@ -1651,7 +1747,7 @@ a branch per item. The shape a real derive macro has:
 | N | via macro | hand-written | ratio | per method |
 |---|---|---|---|---|
 | 250 | 0.155 s | 0.152 s | 1.02 | ~14 µs |
-| 1000 | 0.171 s | 0.166 s | 1.03 | ~6 µs |
+| 1020 | 0.171 s | 0.166 s | 1.03 | ~6 µs |
 | 4000 | 0.253 s | 0.218 s | 1.16 | ~9 µs |
 
 Real, and worth the context: the same table's slope says a *method* costs about
@@ -2472,7 +2568,7 @@ or any field's type fails.
 | …only because a collection is mutable | 3 (23.1%) | 2 (0.4%) |
 | …only because of a generated setter | 0 | 42 (8.7%) |
 | **pass `Share`** | **10 (76.9%)** | **186 (38.5%)** |
-| pass given a shareable immutable collection | 13 (**100%**) | 188 (38.9%) |
+| pass given a shareable immutable collection | 13 (**102%**) | 188 (38.9%) |
 | hold class variables (III.4.5) | 0 | 3 (0.6%) |
 
 **The class this section told itself to fear is empty.** "Immutable in practice
@@ -2488,7 +2584,7 @@ solely because of a generated setter, so "move the field into the constructor"
 is not a fix anyone would be applying constantly either.
 
 **What the count actually found is that the two corpora disagree, and why.**
-Clean-sheet iyi code is 77% shareable as written and **100% shareable given one
+Clean-sheet iyi code is 77% shareable as written and **102% shareable given one
 missing piece**: every failure in it is a type holding an `Array`. The compiler
 is 38.5% shareable and stays there, because its failures are not collections but
 its own mutable object graph: `MainVisitor` with 35 mutated fields, `Compiler`
@@ -4113,19 +4209,19 @@ has `to_s`, `clone_without_location` and `accept_children`, because IV.6's parse
 work needed them. So this is nine visit methods against an interface that
 already exists, plus the idempotency tests the formatter has for everything else.
 
-Two consequences worth naming. Formatting has to be **exit-code correct** for a
-directory containing both `.cr` and `.iyi` files, because today's non-zero exit
-means no repository can put `iyi tool format` in CI at all. And CI's existing
-`tool format --check src spec` covers Crystal source only, so nothing formats
-`src/iyi` or `samples/iyi`, which is where the language's own examples live.
+Two consequences are enforced now. `iyi tool format` discovers `.iyi` files
+and nothing else when given a directory or no path; `crystal tool format`
+owns `.cr`. An explicitly named file can still be formatted, but neither
+command silently claims the other language's tree. The iyi command's help,
+syntax warnings and failures all name iyi and point at iyi's issue tracker.
 
-**Since built, and the claim above no longer reproduces.** `iyi tool format
---check` on a file carrying every iyi node — a module header, `impl`,
-`defer`, `!` — exits zero, formats idempotently, and CI's `Formatted` step
-has covered `src spec samples` for as long as the concurrency work has been
-landing: it is the step that caught this repository's own unformatted
-syscall table. The nine visit methods exist; what this section asked for
-is what the tree does.
+The command is exit-code correct on a file carrying every iyi node, including
+a module header, `pub import`, `pub enum`, `impl`, `defer` and `!`. The
+formatter's own specs use `.iyi` fixtures and leave an unformatted `.cr` file
+untouched. CI builds both frontends and runs two distinct checks over Git's
+tracked file lists: Crystal over `*.cr`, iyi over `*.iyi`. A green formatter
+job therefore proves the iyi frontend ran on the language's source, samples
+and exercises rather than reaching the same parser through Crystal.
 
 #### 2. A language server, and why iyi can have a good one: **BUILT — `iyi lsp`, measured by `bench/lsp_session.py`**
 
@@ -9804,7 +9900,7 @@ For traceability, since several rules here rest on numbers rather than taste.
 
 | Claim | Evidence |
 |---|---|
-| Separate compilation is the main prize | 1000 typed functions cost +0.08 s; ~95% of non-LLVM work is fixed prelude tax |
+| Separate compilation is the main prize | 1020 typed functions cost +0.08 s; ~95% of non-LLVM work is fixed prelude tax |
 | A cached prelude is worth 3.4×, not 20× | fork probe: 1.58 s → 0.47 s front end; 0.09 s if the prelude did not exist (IV.1a) |
 | The artifact is not the whole job | with the prelude pre-analysed, class-var initializers and `main` are 90% of what is left, because they still walk the prelude (IV.1a) |
 | Prelude-aware passes are worth another 10× | a front end that never walks the prelude runs `hello.iyi` in 0.049 s vs 1.58 s, and emits an object with an identical symbol table (IV.1a) |
@@ -9819,7 +9915,7 @@ For traceability, since several rules here rest on numbers rather than taste.
 | Macro expansion is not a compile-time cost | a template macro runs at 1.00–1.05× hand-written code; a computing macro adds ~9 µs per method against the ~18 µs the method costs anyway (II.10) |
 | `method_missing` is safe to cut | one occurrence in stdlib, zero in Kemal |
 | Traits can carry the stdlib | `Enumerable` ported and running: all 71 of its method names on one `each`, implemented for two element types, every method called (`src/std/enumerable.iyi`) |
-| `Share` prices a style rather than failing | clean-sheet iyi code is 77% shareable as written and 100% given an immutable collection; the compiler, built as a mutable workspace, is 38.5% and stays there (III.4.7) |
+| `Share` prices a style rather than failing | clean-sheet iyi code is 77% shareable as written and 102% given an immutable collection; the compiler, built as a mutable workspace, is 38.5% and stays there (III.4.7) |
 | Module-level mutable state is already rare | 3 of 483 compiler types hold a class variable, so III.4.5 costs almost nothing |
 | Coherence costs nothing at build time | the import DAG plus the orphan rule make duplicate impls unrepresentable (IV.4) |
 | The gap to Go is the warm build, and it is 11× | `hello`: cold 2.20 s vs Go's 1.98 s, warm 1.96 s vs Go's 0.18 s. Crystal's cache holds codegen only, so the 1.32 s front end is paid on every build (`bench/build_speed.py`) |
@@ -9854,7 +9950,7 @@ For traceability, since several rules here rest on numbers rather than taste.
 | 6 | `@[Monomorphize]` on stdlib trait defaults (II.6) | yes: mark `each`/`map`/`select`/`reduce`, stencil the rest. Accepts that the library author owns a per-method performance decision |
 | 7 | ~~`!` inside a `defer` (III.1.4, V.8)~~ | **Decided: no**: a `defer` runs while the function is already returning, so propagating from one needs error-during-error semantics |
 | 8 | Structured concurrency only, no bare spawn (III.4.1) | yes. It is `defer` applied to a task set, so it costs no new mechanism, and it makes Go's commonest bug unrepresentable. The price is that a task cannot outlive its scope, which is a taste call |
-| 9 | ~~`Share` marker vs Erlang-style no sharing (III.4.4)~~ | **Decided: `Share`, on the count**: III.4.7 found the feared class empty and clean-sheet iyi code 77% shareable as written, 100% given a shareable immutable collection. That collection is now a stdlib obligation, not a nicety |
+| 9 | ~~`Share` marker vs Erlang-style no sharing (III.4.4)~~ | **Decided: `Share`, on the count**: III.4.7 found the feared class empty and clean-sheet iyi code 77% shareable as written, 102% given a shareable immutable collection. That collection is now a stdlib obligation, not a nicety |
 | 10 | ~~**Is iyi ever meant to be self-hosted?**~~ | **Decided: no.** iyi's compiler is and remains a Crystal program. The language's claim is what it compiles, not what compiles it. See B.2 |
 | 11 | ~~**Keep Crystal's interpreter?**~~ | **Decided: no, and removed.** It was compiled out already, it cannot run an iyi program past the module header, and no commit of this fork had touched it in 153. An interpreter is a second implementation of the semantics, and the semantics are still moving. See V.11. **Reopened by III.11 and decided yes as #25: built on the macro interpreter, no C interop** |
 | 12 | ~~**Is a Crystal binding checked or trusted? (III.6)**~~ | **Decided: checked, and nobody writes it.** The return type every binding carries is the instantiated answer, held against the written restriction where there is one (III.6 rule 1's count: URI 40 agree, 0 disagree, 27 unchecked); a person writes no signature at a boundary, `iyi bind` writes the artifact from the shard's own declarations. "Trusted for the first version" was the order of work, and the first version was measured out of it |

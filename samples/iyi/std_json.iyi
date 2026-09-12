@@ -1,0 +1,105 @@
+# Sample: Real-world usage of native JSON standard library (std/json).
+# Demonstrates:
+#   1. Parsing complex documents with JSON.parse and traversing via JSON::Any
+#   2. Type accessors and safe navigation (as_s, as_i, as_f, as_bool, dig, []?)
+#   3. Generating compact and pretty JSON with JSON.build
+#   4. Streaming parsing of documents with JSON::PullParser
+#   5. Handling Unicode and surrogate pair emojis seamlessly
+
+import std/json
+
+puts "=== 1. Parsing and Traversing with JSON.parse ==="
+
+payload = "{\"project\": \"iyi\", \"version\": 1, \"released\": true, \"metrics\": {\"speedup\": 4.25, \"stars\": 1200}, \"tags\": [\"systems\", \"fast\", \"native\"], \"author\": {\"name\": \"Jason\", \"handle\": \"jwaldrip\"}, \"emoji\": \"\\ud83d\\ude80\"}"
+
+doc = JSON.parse(payload)
+
+puts "Project: #{doc["project"].as_s}"
+puts "Version: #{doc["version"].as_i}"
+puts "Released: #{doc["released"].as_bool}"
+puts "Speedup: #{doc["metrics"]["speedup"].as_f}x"
+puts "Emoji: #{doc["emoji"].as_s}"
+
+# Array traversal
+puts "Tags count: #{doc["tags"].size}"
+puts "First tag: #{doc["tags"][0].as_s}"
+
+# Safe navigation and dig
+puts "Handle (via dig): #{doc.dig("author", "handle").as_s}"
+missing = doc["author"]["website"]?
+puts "Website present: #{!missing.nil?}"
+
+puts ""
+puts "=== 2. Generating JSON with JSON.build ==="
+
+# Compact JSON generation
+compact_json = JSON.build do |json|
+  json.object do
+    json.field("service", "telemetry")
+    json.field("status", "healthy")
+    json.field("uptime_sec", 86400)
+    json.field("active", true)
+    json.field("endpoints") do
+      json.array do
+        json.string("https://api.iyi.org/v1")
+        json.string("https://backup.iyi.org/v1")
+      end
+    end
+  end
+end
+
+puts "Compact output:"
+puts compact_json
+
+puts ""
+# Pretty-printed JSON generation
+pretty_json = JSON.build(2) do |json|
+  json.object do
+    json.field("app", "core")
+    json.field("workers", 4)
+    json.field("ports") do
+      json.array do
+        json.number(8080)
+        json.number(8443)
+      end
+    end
+  end
+end
+
+puts "Pretty output:"
+puts pretty_json
+
+puts ""
+puts "=== 3. Streaming with JSON::PullParser ==="
+
+stream_doc = "{\"events\": [{\"id\": 101, \"action\": \"login\"}, {\"id\": 102, \"action\": \"sync\"}], \"count\": 2}"
+
+pull = JSON::PullParser.new(stream_doc)
+pull.read_object do |key|
+  if key == "events"
+    puts "Streaming events:"
+    pull.read_array do
+      pull.read_object do |event_key|
+        if event_key == "id"
+          id = pull.read_int
+          print "  event id=#{id} "
+        elsif event_key == "action"
+          action = pull.read_string
+          puts "action=#{action}"
+        else
+          pull.skip
+        end
+      end
+    end
+  elsif key == "count"
+    total = pull.read_int
+    puts "Total event count: #{total}"
+  else
+    pull.skip
+  end
+end
+
+puts ""
+puts "=== 4. Round-Trip Serialization ==="
+parsed_again = JSON.parse(doc.to_json)
+puts "Round-trip matches original: #{parsed_again["project"].as_s == doc["project"].as_s}"

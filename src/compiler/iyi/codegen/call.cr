@@ -128,6 +128,12 @@ class Iyi::CodeGenVisitor
         call_arg =
           if arg.type != def_arg.type && !arg.type.no_return? &&
              arg.type.implements?(def_arg.type)
+            # A bound method keeps its written parameter rather than being
+            # specialised per caller. Widening a value into a mixed union
+            # yields the address of the union slot, while the method's LLVM
+            # signature takes that union by value. Record the declaration's
+            # type so the shared ABI load below reads the union slot; virtual
+            # and reference parameters remain pointers as before.
             passed_type = def_arg.type
             upcast(call_arg, def_arg.type, arg.type)
           else

@@ -1,0 +1,338 @@
+# Synchronization primitives: Mutex, RWLock, ConditionVariable, Exclusive, Shared.
+#
+# Provides Crystal-compatible concurrent and parallel synchronization primitives
+# built on iyi's native fiber runtime.
+
+module std/sync
+
+import std/fiber
+using std/fiber::{Fiber}
+
+pub enum Type
+  Unchecked = 0
+  Checked   = 1
+  Reentrant = 2
+
+  def unchecked? : Bool
+    value == 0
+  end
+
+  def checked? : Bool
+    value == 1
+  end
+
+  def reentrant? : Bool
+    value == 2
+  end
+
+  def ==(other : Type) : Bool
+    value == other.value
+  end
+end
+
+pub class Error < Exception
+  getter message : String
+
+  def initialize(@message : String = "")
+  end
+end
+
+def raise(error : Error) : NoReturn
+  ::raise(error.message)
+end
+
+module Lockable
+  abstract def lock : Nil
+  abstract def unlock : Nil
+
+  def synchronize(&)
+    lock
+    begin
+      yield
+    ensure
+      unlock
+    end
+  end
+end
+
+pub class ConditionVariable
+  @waiters : Array(Fiber)
+
+  def initialize
+    @waiters = [] of Fiber
+  end
+
+  def wait(mutex : Lockable) : Nil
+    current = Fiber.current
+    @waiters << current
+    mutex.unlock
+    begin
+      Fiber.suspend
+    ensure
+      mutex.lock
+    end
+  end
+
+  def signal : Nil
+    if waiter = @waiters.shift?
+      waiter.enqueue
+    end
+    nil
+  end
+
+  def broadcast : Nil
+    while waiter = @waiters.shift?
+      waiter.enqueue
+    end
+    nil
+  end
+end
+
+pub class Mutex
+  include Lockable
+
+  property type : Type
+
+  def self.new(*, protection : Type)
+    new(type: protection)
+  end
+
+  def initialize(@type : Type = Type::Checked)
+    @owner = nil.as(Fiber?)
+    @count = 0
+    @waiters = [] of Fiber
+  end
+
+  def lock : Nil
+    current = Fiber.current
+    if @type.reentrant?
+      if @owner == current
+        @count += 1
+        return nil
+      end
+    elsif @type.checked?
+      if @owner == current
+        raise Error.new("Mutex already locked by current fiber")
+      end
+    end
+
+    while @owner
+      @waiters << current
+      Fiber.suspend
+    end
+
+    @owner = current
+    @count = 1
+    nil
+  end
+
+  def try_lock : Bool
+    current = Fiber.current
+    if @type.reentrant?
+      if @owner == current
+        @count += 1
+        return true
+      end
+    end
+
+    if @owner.nil?
+      @owner = current
+      @count = 1
+      true
+    else
+      false
+    end
+  end
+
+  def unlock : Nil
+    current = Fiber.current
+    if @owner != current
+      if @type.checked? || @type.reentrant?
+        raise Error.new("Mutex not owned by current fiber")
+      end
+    end
+
+    if @type.reentrant?
+      @count -= 1
+      if @count > 0
+        return nil
+      end
+    end
+
+    @owner = nil
+    @count = 0
+    if waiter = @waiters.shift?
+      waiter.enqueue
+    end
+    nil
+  end
+end
+
+pub class RWLock
+  def initialize
+    @readers = 0
+    @writer = nil.as(Fiber?)
+    @read_waiters = [] of Fiber
+    @write_waiters = [] of Fiber
+  end
+
+  def read_lock : Nil
+    current = Fiber.current
+    while @writer || !@write_waiters.empty?
+      @read_waiters << current
+      Fiber.suspend
+    end
+    @readers += 1
+    nil
+  end
+
+  def read_unlock : Nil
+    if @readers <= 0
+      raise Error.new("RWLock has no active readers to unlock")
+    end
+    @readers -= 1
+    if @readers == 0 && (writer = @write_waiters.shift?)
+      writer.enqueue
+    end
+    nil
+  end
+
+  def write_lock : Nil
+    current = Fiber.current
+    while @writer || @readers > 0
+      @write_waiters << current
+      Fiber.suspend
+    end
+    @writer = current
+    nil
+  end
+
+  def write_unlock : Nil
+    current = Fiber.current
+    if @writer != current
+      raise Error.new("RWLock write lock not owned by current fiber")
+    end
+    @writer = nil
+    if writer = @write_waiters.shift?
+      writer.enqueue
+    else
+      while reader = @read_waiters.shift?
+        reader.enqueue
+      end
+    end
+    nil
+  end
+
+  def read_synchronize(&)
+    read_lock
+    begin
+      yield
+    ensure
+      read_unlock
+    end
+  end
+
+  def write_synchronize(&)
+    write_lock
+    begin
+      yield
+    ensure
+      write_unlock
+    end
+  end
+
+  def synchronize(&)
+    write_synchronize do
+      yield
+    end
+  end
+end
+
+pub class Exclusive(T)
+  include Lockable
+
+  def initialize(@value : T)
+    @lock = Mutex.new
+  end
+
+  def lock : Nil
+    @lock.lock
+  end
+
+  def unlock : Nil
+    @lock.unlock
+  end
+
+  def synchronize(&)
+    @lock.synchronize do
+      yield @value
+    end
+  end
+
+  def unsafe_get : T
+    @value
+  end
+
+  def unsafe_set(@value : T) : T
+    @value
+  end
+
+  def wait(cv : ConditionVariable) : Nil
+    @lock.wait(cv)
+  end
+end
+
+pub class Shared(T)
+  def initialize(@value : T)
+    @lock = RWLock.new
+  end
+
+  def read(&)
+    @lock.read_synchronize do
+      yield @value
+    end
+  end
+
+  def write(&)
+    @lock.write_synchronize do
+      yield @value
+    end
+  end
+
+  def synchronize(&)
+    write do |v|
+      yield v
+    end
+  end
+
+  def unsafe_get : T
+    @value
+  end
+
+  def unsafe_set(@value : T) : T
+    @value
+  end
+
+  def lock : Nil
+    @lock.lock
+  end
+
+  def unlock : Nil
+    @lock.unlock
+  end
+
+  def wait(cv : ConditionVariable) : Nil
+    @lock.wait(cv)
+  end
+end
+
+module ::Sync
+  alias Type = Std::Sync::Type
+  alias Mutex = Std::Sync::Mutex
+  alias ConditionVariable = Std::Sync::ConditionVariable
+  alias RWLock = Std::Sync::RWLock
+  alias Exclusive = Std::Sync::Exclusive
+  alias Shared = Std::Sync::Shared
+  alias Error = Std::Sync::Error
+  alias Lockable = Std::Sync::Lockable
+end

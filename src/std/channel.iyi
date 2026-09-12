@@ -1,0 +1,183 @@
+# Crystal-compatible Channel API — buffered/unbuffered channels,
+# inspection, non-blocking send/receive, and iteration.
+#
+# Complements iyi's core primitive Channel(T) with Crystal standard library surface.
+#
+# Language incompatibility note:
+# In iyi, `!` is reserved for error propagation and cannot be part of a method name.
+# The following Crystal spellings cannot exist in iyi:
+#   - `Channel#receive!` (use `receive_or_raise` or `receive?`)
+#   - `Channel#send!`    (use `send_or_raise`)
+#   - `Channel#close!`   (use `close`)
+
+module std/channel
+
+import std/fiber
+using std/fiber::{Fiber}
+
+pub class ClosedError < Exception
+  getter message : String
+
+  def initialize(@message : String = "Channel is closed")
+  end
+end
+
+def raise(err : ClosedError) : NoReturn
+  ::raise(err.message)
+end
+
+class ::Channel(T)
+  alias ClosedError = Std::Channel::ClosedError
+
+  private def raise(err : ClosedError) : NoReturn
+    ::raise(err.message)
+  end
+
+  def capacity : Int32
+    @capacity
+  end
+
+  def empty? : Bool
+    @items.empty?
+  end
+
+  def full? : Bool
+    @capacity > 0 && @items.size >= @capacity
+  end
+
+  def size : Int32
+    @items.size
+  end
+
+  def receive? : T?
+    res = receive
+    if res.is_a?(ChannelClosed) || res.is_a?(Cancelled)
+      nil
+    else
+      res.as(T)
+    end
+  end
+
+  def receive_or_raise : T
+    res = receive
+    if res.is_a?(ChannelClosed)
+      raise ClosedError.new("Channel is closed")
+    elsif res.is_a?(Cancelled)
+      raise ClosedError.new("Channel receive was cancelled")
+    else
+      res.as(T)
+    end
+  end
+
+  def send_or_raise(value : T) : self
+    res = send(value)
+    if res.is_a?(ChannelClosed)
+      raise ClosedError.new("Channel is closed")
+    elsif res.is_a?(Cancelled)
+      raise ClosedError.new("Channel send was cancelled")
+    end
+    self
+  end
+
+  def receive_non_blocking : T?
+    if receive_ready?
+      res = take_now
+      if res.is_a?(ChannelClosed)
+        nil
+      else
+        res.as(T)
+      end
+    else
+      nil
+    end
+  end
+
+  def send_non_blocking(value : T) : Bool
+    if send_ready?
+      res = put_now(value)
+      !res.is_a?(ChannelClosed)
+    else
+      false
+    end
+  end
+
+  def each(&block : T ->) : Nil
+    while val = receive?
+      yield val
+    end
+  end
+
+  def receive_select_action : IyiReceiveSelect(T)
+    IyiReceiveSelect(T).new(self)
+  end
+
+  def send_select_action(value : T) : IyiSendSelect(T)
+    IyiSendSelect(T).new(self, value)
+  end
+
+  def self.receive_first(*channels : *U) forall U
+    loop do
+      {% for i in 0...U.size %}
+        if channels[{{ i }}].receive_ready? && !channels[{{ i }}].empty?
+          res = channels[{{ i }}].take_now
+          unless res.is_a?(ChannelClosed)
+            return res
+          end
+        end
+      {% end %}
+      Fiber.yield
+    end
+  end
+
+  def self.receive_first(channels : Array(Channel(T))) : T forall T
+    loop do
+      channels.each do |ch|
+        if ch.receive_ready? && !ch.empty?
+          res = ch.take_now
+          unless res.is_a?(ChannelClosed)
+            return res.as(T)
+          end
+        end
+      end
+      Fiber.yield
+    end
+  end
+
+  def self.send_first(value, *channels : *U) forall U
+    loop do
+      {% for i in 0...U.size %}
+        if channels[{{ i }}].send_ready?
+          res = channels[{{ i }}].put_now(value)
+          unless res.is_a?(ChannelClosed)
+            return nil
+          end
+        end
+      {% end %}
+      Fiber.yield
+    end
+  end
+
+  def self.send_first(value : T, channels : Array(Channel(T))) : Nil forall T
+    loop do
+      channels.each do |ch|
+        if ch.send_ready?
+          res = ch.put_now(value)
+          unless res.is_a?(ChannelClosed)
+            return nil
+          end
+        end
+      end
+      Fiber.yield
+    end
+  end
+
+  def inspect : String
+    "#<Channel(#{T}):0x#{object_id.to_s(16)}>"
+  end
+
+  def to_s : String
+    inspect
+  end
+end
+
+pub alias Channel = ::Channel

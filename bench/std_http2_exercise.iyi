@@ -1,0 +1,1228 @@
+# Standard HTTP/2 (RFC 9113) exercise: Protocol compliance, multiplexing,
+# flow control, and security verification.
+#
+# Covers:
+# 1. Connection preface & SETTINGS exchange handshake (RFC 9113 3.4, 6.5)
+# 2. All 10 frame types encoding and decoding (Section 6)
+# 3. RFC 9113 Section 5.1 stream state machine (idle, open, half-closed, closed)
+# 4. Multiplexing: multiple concurrent streams interleaved over single connection
+# 5. CONTINUATION frame handling: atomic non-interleaved header block assembly
+# 6. Flow control: 100,000-byte transfer (> 65535 initial window) requiring
+#    load-bearing WINDOW_UPDATE frames to complete
+# 7. Protocol error suite: 16 illegal shapes mapped to h2spec sections
+
+module bench/std_http2_exercise
+
+import std/slice
+import std/hpack
+import std/http
+import std/http2
+
+using std/slice::{Slice, Bytes}
+using std/hpack::{HeaderField, IndexingMode}
+using std/http::{Headers, Request, Response, Status}
+using std/http2::{CLIENT_PREFACE, CLIENT_PREFACE_BYTES, DEFAULT_INITIAL_WINDOW_SIZE, MAX_WINDOW_SIZE, ErrorCode, FrameType, FrameFlag, SettingId, StreamState, FrameHeader, Http2Error, Settings, Stream, Connection, Role, Client, Server}
+
+def assert_true(cond : Bool, label : String) : Nil
+  if cond
+    puts "  pass: #{label}"
+  else
+    puts "  FAIL: #{label} - expected true, got false"
+    raise "assertion failed: #{label}"
+  end
+end
+
+def assert_eq(actual : String, expected : String, label : String) : Nil
+  if actual == expected
+    puts "  pass: #{label}"
+  else
+    puts "  FAIL: #{label} - expected #{expected}, got #{actual}"
+    raise "assertion failed: #{label}"
+  end
+end
+
+def assert_eq_i64(actual : Int64, expected : Int64, label : String) : Nil
+  if actual == expected
+    puts "  pass: #{label}"
+  else
+    puts "  FAIL: #{label} - expected #{expected}, got #{actual}"
+    raise "assertion failed: #{label}"
+  end
+end
+
+def assert_eq_i32(actual : Int32, expected : Int32, label : String) : Nil
+  if actual == expected
+    puts "  pass: #{label}"
+  else
+    puts "  FAIL: #{label} - expected #{expected}, got #{actual}"
+    raise "assertion failed: #{label}"
+  end
+end
+
+# Pipe bytes between two connections until both outbound buffers are drained
+def transfer_bytes(conn_a : Connection, conn_b : Connection) : Int32
+  total = 0
+  loop = true
+  while loop
+    loop = false
+    out_a = conn_a.flush_outbound
+    if !out_a.empty?
+      conn_b.receive(out_a)
+      total = total + out_a.size
+      loop = true
+    end
+
+    out_b = conn_b.flush_outbound
+    if !out_b.empty?
+      conn_a.receive(out_b)
+      total = total + out_b.size
+      loop = true
+    end
+  end
+  total
+end
+
+def init_server_handshake : Connection
+  server = Connection.new(Role::Server)
+  server.start_connection
+  raw_init = [] of UInt8
+  j = 0; while j < CLIENT_PREFACE_BYTES.size
+    raw_init << CLIENT_PREFACE_BYTES[j]; j = j + 1
+  end
+  FrameHeader.new(0, FrameType::SETTINGS, 0_u8, 0_i32).encode(raw_init)
+  server.receive(Bytes.new(raw_init.size) { |idx| raw_init[idx] })
+  server.flush_outbound
+  server
+end
+
+# ---------------------------------------------------------------------------
+# Section 1: Connection Preface & SETTINGS Handshake
+# ---------------------------------------------------------------------------
+
+def test_preface_and_settings_handshake : Nil
+  puts "section 1: connection preface & settings handshake (rfc 9113 3.4, 6.5)"
+
+  client = Connection.new(Role::Client)
+  server = Connection.new(Role::Server)
+
+  client.start_connection
+  server.start_connection
+
+  # Client should have emitted 24-byte preface + SETTINGS frame (9-byte header + payload)
+  client_init_out = client.flush_outbound
+  assert_true(client_init_out.size >= 24 + 9, "client emitted preface and settings")
+
+  # Verify first 24 bytes match RFC 9113 CLIENT_PREFACE
+  preface_str = String.new(24) do |buf|
+    i = 0
+    while i < 24
+      buf[i] = client_init_out[i]
+      i = i + 1
+    end
+  end
+  assert_eq(preface_str, CLIENT_PREFACE, "client preface bytes match RFC 9113 3.4")
+
+  # Deliver client preface and settings to server
+  server.receive(client_init_out)
+  assert_true(server.preface_received, "server successfully accepted client preface")
+
+  # Deliver server initial settings and settings ACK to client
+  server_init_out = server.flush_outbound
+  assert_true(server_init_out.size > 0, "server emitted settings")
+  client.receive(server_init_out)
+
+  # Deliver client's settings ACK to server
+  client_ack_out = client.flush_outbound
+  server.receive(client_ack_out)
+
+  assert_true(client.last_error.nil?, "client completed handshake without error")
+  assert_true(server.last_error.nil?, "server completed handshake without error")
+end
+
+# ---------------------------------------------------------------------------
+# Section 2: Every Frame Type Encoding & Decoding
+# ---------------------------------------------------------------------------
+
+def test_every_frame_type : Nil
+  puts "section 2: every frame type encoding and decoding (rfc 9113 section 6)"
+
+  conn = Connection.new(Role::Client)
+
+  # 1. DATA (0x00)
+  conn.create_stream(1)
+  data_payload = Bytes.new(5) { |i| (65 + i).to_u8 } # "ABCDE"
+  conn.send_frame(FrameType::DATA, FrameFlag::END_STREAM, 1, data_payload)
+  f_out = conn.flush_outbound
+  hdr = FrameHeader.decode(f_out, 0)
+  assert_true(!hdr.is_a?(Http2Error), "DATA frame header decoded")
+  if !hdr.is_a?(Http2Error)
+    assert_eq_i32(hdr[0].type.to_i32, FrameType::DATA.to_i32, "frame type is DATA")
+    assert_eq_i32(hdr[0].stream_id, 1, "DATA stream id is 1")
+    assert_true(hdr[0].end_stream?, "DATA has END_STREAM flag")
+  end
+
+  # 2. HEADERS (0x01)
+  conn.send_frame(FrameType::HEADERS, FrameFlag::END_HEADERS, 3, Bytes.empty)
+  f_out = conn.flush_outbound
+  hdr = FrameHeader.decode(f_out, 0)
+  if !hdr.is_a?(Http2Error)
+    assert_eq_i32(hdr[0].type.to_i32, FrameType::HEADERS.to_i32, "frame type is HEADERS")
+    assert_eq_i32(hdr[0].stream_id, 3, "HEADERS stream id is 3")
+  end
+
+  # 3. PRIORITY (0x02)
+  conn.send_priority(1, 0, 16, false)
+  f_out = conn.flush_outbound
+  hdr = FrameHeader.decode(f_out, 0)
+  if !hdr.is_a?(Http2Error)
+    assert_eq_i32(hdr[0].type.to_i32, FrameType::PRIORITY.to_i32, "frame type is PRIORITY")
+    assert_eq_i32(hdr[0].length, 5, "PRIORITY payload length is 5")
+  end
+
+  # 4. RST_STREAM (0x03)
+  conn.send_rst_stream(1, ErrorCode::CANCEL)
+  f_out = conn.flush_outbound
+  hdr = FrameHeader.decode(f_out, 0)
+  if !hdr.is_a?(Http2Error)
+    assert_eq_i32(hdr[0].type.to_i32, FrameType::RST_STREAM.to_i32, "frame type is RST_STREAM")
+    assert_eq_i32(hdr[0].length, 4, "RST_STREAM payload length is 4")
+  end
+
+  # 5. SETTINGS (0x04)
+  conn.send_settings_ack
+  f_out = conn.flush_outbound
+  hdr = FrameHeader.decode(f_out, 0)
+  if !hdr.is_a?(Http2Error)
+    assert_eq_i32(hdr[0].type.to_i32, FrameType::SETTINGS.to_i32, "frame type is SETTINGS")
+    assert_true(hdr[0].ack?, "SETTINGS frame has ACK flag")
+    assert_eq_i32(hdr[0].length, 0, "SETTINGS ACK payload length is 0")
+  end
+
+  # 6. PUSH_PROMISE (0x05)
+  pp_payload = Bytes.new(4) { |i| i == 3 ? 2_u8 : 0_u8 } # Promised stream 2
+  conn.send_frame(FrameType::PUSH_PROMISE, FrameFlag::END_HEADERS, 1, pp_payload)
+  f_out = conn.flush_outbound
+  hdr = FrameHeader.decode(f_out, 0)
+  if !hdr.is_a?(Http2Error)
+    assert_eq_i32(hdr[0].type.to_i32, FrameType::PUSH_PROMISE.to_i32, "frame type is PUSH_PROMISE")
+  end
+
+  # 7. PING (0x06)
+  ping_data = Bytes.new(8) { |i| i.to_u8 }
+  conn.send_ping(ping_data, false)
+  f_out = conn.flush_outbound
+  hdr = FrameHeader.decode(f_out, 0)
+  if !hdr.is_a?(Http2Error)
+    assert_eq_i32(hdr[0].type.to_i32, FrameType::PING.to_i32, "frame type is PING")
+    assert_eq_i32(hdr[0].length, 8, "PING payload length is 8")
+  end
+
+  # 8. GOAWAY (0x07)
+  conn.send_goaway(1, ErrorCode::NO_ERROR, Bytes.empty)
+  f_out = conn.flush_outbound
+  hdr = FrameHeader.decode(f_out, 0)
+  if !hdr.is_a?(Http2Error)
+    assert_eq_i32(hdr[0].type.to_i32, FrameType::GOAWAY.to_i32, "frame type is GOAWAY")
+    assert_eq_i32(hdr[0].stream_id, 0, "GOAWAY stream id is 0")
+  end
+
+  # 9. WINDOW_UPDATE (0x08)
+  conn.send_window_update(0, 1024_i64)
+  f_out = conn.flush_outbound
+  hdr = FrameHeader.decode(f_out, 0)
+  if !hdr.is_a?(Http2Error)
+    assert_eq_i32(hdr[0].type.to_i32, FrameType::WINDOW_UPDATE.to_i32, "frame type is WINDOW_UPDATE")
+    assert_eq_i32(hdr[0].length, 4, "WINDOW_UPDATE length is 4")
+  end
+
+  # 10. CONTINUATION (0x09)
+  conn.send_frame(FrameType::CONTINUATION, FrameFlag::END_HEADERS, 3, Bytes.empty)
+  f_out = conn.flush_outbound
+  hdr = FrameHeader.decode(f_out, 0)
+  if !hdr.is_a?(Http2Error)
+    assert_eq_i32(hdr[0].type.to_i32, FrameType::CONTINUATION.to_i32, "frame type is CONTINUATION")
+  end
+end
+
+# ---------------------------------------------------------------------------
+# Section 3: Stream State Machine of Section 5.1
+# ---------------------------------------------------------------------------
+
+def test_stream_state_machine : Nil
+  puts "section 3: stream state machine transitions (rfc 9113 5.1)"
+
+  # A. Normal lifecycle: Idle -> Open -> HalfClosedLocal -> Closed
+  s1 = Stream.new(1)
+  assert_true(s1.state == StreamState::Idle, "new stream starts in idle state")
+
+  err = s1.on_send_headers(false)
+  assert_true(err.nil?, "send headers without end_stream succeeds")
+  assert_true(s1.state == StreamState::Open, "stream transitioned to open")
+
+  err = s1.on_send_data(true)
+  assert_true(err.nil?, "send data with end_stream succeeds")
+  assert_true(s1.state == StreamState::HalfClosedLocal, "stream transitioned to half_closed_local")
+
+  err = s1.on_recv_data(true)
+  assert_true(err.nil?, "recv data with end_stream succeeds")
+  assert_true(s1.state == StreamState::Closed, "stream transitioned to closed")
+
+  # B. Remote closure: Idle -> Open -> HalfClosedRemote -> Closed
+  s2 = Stream.new(2)
+  err = s2.on_recv_headers(false)
+  assert_true(err.nil?, "recv headers without end_stream succeeds")
+  assert_true(s2.state == StreamState::Open, "stream 2 is open")
+
+  err = s2.on_recv_headers(true) # trailers with end_stream
+  assert_true(err.nil?, "recv trailers with end_stream succeeds")
+  assert_true(s2.state == StreamState::HalfClosedRemote, "stream 2 is half_closed_remote")
+
+  err = s2.on_send_data(true)
+  assert_true(err.nil?, "send final data from half_closed_remote succeeds")
+  assert_true(s2.state == StreamState::Closed, "stream 2 is closed")
+
+  # C. Immediate close via RST_STREAM
+  s3 = Stream.new(3)
+  s3.on_send_headers(false)
+  assert_true(s3.state == StreamState::Open, "stream 3 is open")
+  s3.on_recv_rst(ErrorCode::CANCEL)
+  assert_true(s3.state == StreamState::Closed, "stream 3 closed by RST_STREAM")
+  assert_true(s3.rst_received, "rst_received recorded")
+  assert_eq_i64(s3.rst_error_code.to_i64, ErrorCode::CANCEL.to_i64, "rst error code matches CANCEL")
+
+  # D. Illegal transition: sending DATA on closed stream
+  err = s3.on_send_data(false)
+  assert_true(!err.nil?, "cannot send DATA on closed stream")
+  if err
+    assert_eq_i64(err.code.to_i64, ErrorCode::STREAM_CLOSED.to_i64, "returns STREAM_CLOSED error")
+  end
+
+  # E. Illegal transition: receiving DATA on closed stream
+  err = s3.on_recv_data(false)
+  assert_true(!err.nil?, "cannot recv DATA on closed stream")
+  if err
+    assert_eq_i64(err.code.to_i64, ErrorCode::STREAM_CLOSED.to_i64, "returns STREAM_CLOSED error")
+  end
+end
+
+# ---------------------------------------------------------------------------
+# Section 4: Multiplexing Concurrent Streams
+# ---------------------------------------------------------------------------
+
+def test_multiplexing_concurrent_streams : Nil
+  puts "section 4: multiplexing concurrent streams over single connection"
+
+  client = Connection.new(Role::Client)
+  server = Connection.new(Role::Server)
+
+  client.start_connection
+  server.start_connection
+  transfer_bytes(client, server)
+
+  # Initiate 3 concurrent requests from client
+  req1 = Request.new("GET", "/first", Headers.new, "payload-1")
+  req2 = Request.new("POST", "/second", Headers.new, "payload-2")
+  req3 = Request.new("GET", "/third", Headers.new, "payload-3")
+
+  s1_res = client.send_request(req1)
+  s2_res = client.send_request(req2)
+  s3_res = client.send_request(req3)
+
+  id1 = s1_res[0]
+  id2 = s2_res[0]
+  id3 = s3_res[0]
+
+  assert_eq_i32(id1, 1, "stream 1 has id 1")
+  assert_eq_i32(id2, 3, "stream 2 has id 3")
+  assert_eq_i32(id3, 5, "stream 3 has id 5")
+
+  # Transfer all client frames to server
+  transfer_bytes(client, server)
+
+  assert_eq_i32(server.completed_requests.size, 3, "server received all 3 concurrent requests")
+
+  # Verify server sees all 3 active streams concurrently in flight
+  active_streams = 0
+  i = 0
+  while i < server.streams.size
+    st = server.streams[i]
+    if st.state != StreamState::Idle && st.state != StreamState::Closed
+      active_streams = active_streams + 1
+    end
+    i = i + 1
+  end
+  puts "  concurrency observed: #{active_streams} streams simultaneously active on server"
+  assert_true(active_streams >= 3, "observed concurrency >= 3")
+
+  # Server responds to streams out-of-order and interleaved:
+  # Respond to stream 3 first, then stream 1, then stream 5
+  resp2 = Response.new(201, Headers.new, "response-to-second")
+  resp1 = Response.new(200, Headers.new, "response-to-first")
+  resp3 = Response.new(200, Headers.new, "response-to-third")
+
+  server.send_response(id2, resp2)
+  server.send_response(id1, resp1)
+  server.send_response(id3, resp3)
+
+  # Transfer response frames back to client
+  transfer_bytes(client, server)
+
+  assert_eq_i32(client.completed_responses.size, 3, "client received all 3 responses")
+
+  # Check responses demultiplexed correctly to each stream
+  r1 : Response? = nil
+  r2 : Response? = nil
+  r3 : Response? = nil
+
+  i = 0
+  while i < client.completed_responses.size
+    item = client.completed_responses[i]
+    if item[0] == id1
+      r1 = item[1]
+    elsif item[0] == id2
+      r2 = item[1]
+    elsif item[0] == id3
+      r3 = item[1]
+    end
+    i = i + 1
+  end
+
+  assert_true(!r1.nil?, "response for stream 1 received")
+  assert_true(!r2.nil?, "response for stream 3 received")
+  assert_true(!r3.nil?, "response for stream 5 received")
+
+  if r1 && r2 && r3
+    assert_eq_i32(r1.status_code, 200, "stream 1 status is 200")
+    assert_eq(r1.body, "payload-1".empty? ? "" : "response-to-first", "stream 1 body is correct")
+    assert_eq_i32(r2.status_code, 201, "stream 3 status is 201")
+    assert_eq(r2.body, "response-to-second", "stream 3 body is correct")
+    assert_eq_i32(r3.status_code, 200, "stream 5 status is 200")
+    assert_eq(r3.body, "response-to-third", "stream 5 body is correct")
+  end
+end
+
+# ---------------------------------------------------------------------------
+# Section 5: CONTINUATION Frames & Atomicity
+# ---------------------------------------------------------------------------
+
+def test_continuation_frames_and_atomicity : Nil
+  puts "section 5: continuation frames and atomic non-interleaved assembly (rfc 9113 6.10)"
+
+  client = Connection.new(Role::Client)
+  server = Connection.new(Role::Server)
+
+  client.start_connection
+  server.start_connection
+  transfer_bytes(client, server)
+
+  # Create a large headers list that will be split across HEADERS + CONTINUATION
+  # We test manual frame composition of HEADERS (without END_HEADERS) followed by CONTINUATION
+  fields = [] of HeaderField
+  fields << HeaderField.new(":method", "GET")
+  fields << HeaderField.new(":path", "/large-headers")
+  fields << HeaderField.new(":scheme", "https")
+  fields << HeaderField.new(":authority", "example.com")
+
+  # Add 20 custom headers to produce a substantial block
+  i = 1
+  while i <= 20
+    fields << HeaderField.new("x-custom-header-#{i}", "value-#{i}-for-continuation-testing")
+    i = i + 1
+  end
+
+  encoded_block = client.hpack_encoder.encode(fields)
+  assert_true(encoded_block.size > 100, "encoded header block has substantial size")
+
+  mid = encoded_block.size // 2
+  frag1 = encoded_block[0, mid]
+  frag2 = encoded_block[mid, encoded_block.size - mid]
+
+  stream_id = 7_i32
+  # Client sends HEADERS without END_HEADERS to server
+  client.send_frame(FrameType::HEADERS, FrameFlag::END_STREAM, stream_id, frag1)
+  raw_bytes = client.flush_outbound
+  server.receive(raw_bytes)
+
+  assert_true(server.expecting_continuation, "server is expecting CONTINUATION frame")
+  assert_eq_i32(server.continuation_stream_id, stream_id, "continuation stream id matches")
+
+  # Client sends CONTINUATION with END_HEADERS to server
+  client.send_frame(FrameType::CONTINUATION, FrameFlag::END_HEADERS, stream_id, frag2)
+  raw_bytes = client.flush_outbound
+  server.receive(raw_bytes)
+
+  assert_true(!server.expecting_continuation, "server finished continuation block")
+  assert_true(server.last_error.nil?, "assembled header block decoded without error")
+
+  st = server.find_stream(stream_id)
+  assert_true(!st.nil?, "stream 7 created on server")
+  if st
+    assert_true(st.headers.size >= 24, "stream 7 received all 24 header fields across fragments")
+  end
+end
+
+# ---------------------------------------------------------------------------
+# Section 6: Flow Control Demonstration (> 65535 Bytes Transfer)
+# ---------------------------------------------------------------------------
+
+def test_flow_control_large_transfer : Nil
+  puts "section 6: flow control with transfer larger than initial window (rfc 9113 5.2, 6.9)"
+
+  client = Connection.new(Role::Client)
+  server = Connection.new(Role::Server)
+
+  client.start_connection
+  server.start_connection
+  transfer_bytes(client, server)
+
+  # Initial window for both stream and connection is DEFAULT_INITIAL_WINDOW_SIZE = 65,535 bytes
+  assert_eq_i64(client.connection_send_window, 65535_i64, "initial client connection send window is 65535")
+
+  stream_id = 1_i32
+  # Send request headers with has_body=true
+  headers = [
+    HeaderField.new(":method", "POST"),
+    HeaderField.new(":path", "/upload"),
+    HeaderField.new(":scheme", "https"),
+    HeaderField.new(":authority", "example.com"),
+  ]
+  client.send_headers(stream_id, headers, false)
+  transfer_bytes(client, server)
+
+  # Generate 100,000 bytes of deterministic test payload
+  # 100,000 > 65,535 initial window by 34,465 bytes!
+  total_payload_size = 100000_i32
+  payload = Bytes.new(total_payload_size) do |i|
+    ((i * 31 + 7) & 0xFF).to_u8
+  end
+
+  # Client attempts to send the 100,000 bytes
+  # It should successfully send exactly 65,535 bytes, then exhaust its flow control window!
+  first_batch_len = 65535_i32
+  first_batch = payload[0, first_batch_len]
+
+  err = client.send_data(stream_id, first_batch, false)
+  assert_true(err.nil?, "first batch of 65535 bytes sent successfully")
+  assert_eq_i64(client.connection_send_window, 0_i64, "connection send window is now completely exhausted (0)")
+
+  st = client.find_stream(stream_id)
+  if st
+    assert_eq_i64(st.send_window, 0_i64, "stream send window is now completely exhausted (0)")
+  end
+
+  # Sending remaining 34,465 bytes queues them in stream.pending_data under flow control backpressure
+  remaining_len = total_payload_size - first_batch_len
+  second_batch = payload[first_batch_len, remaining_len]
+  err_backpressure = client.send_data(stream_id, second_batch, true)
+  assert_true(err_backpressure.nil?, "send_data buffers excess bytes without fatal error")
+  if st
+    assert_eq_i32(st.pending_data.size, remaining_len, "remaining 34465 bytes buffered under backpressure")
+    puts "  load-bearing proof: sender buffered remainder because window is 0"
+  end
+
+  # Deliver the 65,535 bytes to the server
+  transfer_bytes(client, server)
+  server_stream = server.find_stream(stream_id)
+  assert_true(!server_stream.nil?, "server stream 1 found")
+  if server_stream
+    assert_eq_i32(server_stream.data.size, 65535, "server received exactly 65535 bytes so far")
+  end
+
+  # Now receiver replenishes window by sending WINDOW_UPDATE frames!
+  # Replenish by 34,465 bytes on both stream 1 and connection (stream 0)
+  server.send_window_update(stream_id, remaining_len.to_i64)
+  server.send_window_update(0, remaining_len.to_i64)
+
+  # Deliver WINDOW_UPDATE frames from server to client
+  # Client automatically flushes pending_data on receiving WINDOW_UPDATE!
+  transfer_bytes(client, server)
+
+  if st
+    assert_eq_i32(st.pending_data.size, 0, "pending_data was automatically flushed on WINDOW_UPDATE")
+  end
+
+  if server_stream
+    assert_eq_i32(server_stream.data.size, total_payload_size, "server received all 100000 bytes")
+    # Verify content integrity
+    match = true
+    j = 0
+    while j < total_payload_size
+      if server_stream.data[j] != payload[j]
+        match = false
+        break
+      end
+      j = j + 1
+    end
+    assert_true(match, "all 100,000 bytes received match payload exactly")
+    puts "  load-bearing proof: full 100,000 byte transfer completed via window updates"
+  end
+end
+
+# ---------------------------------------------------------------------------
+# Section 7: Protocol Error Suite (16 Illegal Shapes across 9 h2spec sections)
+# ---------------------------------------------------------------------------
+
+def test_protocol_error_suite : Nil
+  puts "section 7: protocol error suite (16 illegal shapes across 9 h2spec sections)"
+
+  # Helper: build a fresh server and complete preface handshake
+  # Then feed a raw malformed frame and verify rejection
+
+  # Shape 1: DATA frame on stream 0 (h2spec 6.1 / RFC 9113 6.1)
+  server = init_server_handshake
+  raw = [] of UInt8
+  hdr = FrameHeader.new(4, FrameType::DATA, 0_u8, 0_i32) # stream 0
+  hdr.encode(raw)
+  raw << 1_u8; raw << 2_u8; raw << 3_u8; raw << 4_u8
+  err = server.receive(Bytes.new(raw.size) { |i| raw[i] })
+  assert_true(!err.nil?, "h2spec 6.1: DATA on stream 0 rejected")
+  if err
+    assert_eq_i64(err.code.to_i64, ErrorCode::PROTOCOL_ERROR.to_i64, "h2spec 6.1 code is PROTOCOL_ERROR")
+    assert_true(err.connection_error, "h2spec 6.1 is a connection error")
+    assert_true(err.message.includes?("DATA frame received on stream 0"), "h2spec 6.1 message is DATA on stream 0")
+  end
+
+  # Shape 2: HEADERS without END_HEADERS followed by DATA (h2spec 6.2, 6.10 / RFC 9113 6.2, 6.10)
+  server = init_server_handshake
+  raw = [] of UInt8
+  # HEADERS on stream 1 without END_HEADERS (flags = 0)
+  FrameHeader.new(3, FrameType::HEADERS, 0_u8, 1_i32).encode(raw)
+  raw << 0x82_u8; raw << 0x87_u8; raw << 0x84_u8
+  # Then followed immediately by a DATA frame instead of CONTINUATION
+  FrameHeader.new(1, FrameType::DATA, 0_u8, 1_i32).encode(raw)
+  raw << 0x41_u8
+  err = server.receive(Bytes.new(raw.size) { |i| raw[i] })
+  assert_true(!err.nil?, "h2spec 6.2/6.10: non-CONTINUATION frame while expecting CONTINUATION rejected")
+  if err
+    assert_eq_i64(err.code.to_i64, ErrorCode::PROTOCOL_ERROR.to_i64, "h2spec 6.2/6.10 code is PROTOCOL_ERROR")
+    assert_true(err.connection_error, "h2spec 6.2/6.10 is connection error")
+    assert_true(err.message.includes?("Expected CONTINUATION frame on stream 1, got DATA"), "h2spec 6.2/6.10 message is expected CONTINUATION")
+  end
+
+  # Shape 3: Stream ID decreasing / non-monotonic (h2spec 5.1.1 / RFC 9113 5.1.1)
+  server = init_server_handshake
+  raw = [] of UInt8
+  # Open stream 5
+  FrameHeader.new(3, FrameType::HEADERS, FrameFlag::END_HEADERS, 5_i32).encode(raw)
+  raw << 0x82_u8; raw << 0x87_u8; raw << 0x84_u8
+  # Then open stream 3 (3 < 5, non-monotonic!)
+  FrameHeader.new(3, FrameType::HEADERS, FrameFlag::END_HEADERS, 3_i32).encode(raw)
+  raw << 0x82_u8; raw << 0x87_u8; raw << 0x84_u8
+  err = server.receive(Bytes.new(raw.size) { |i| raw[i] })
+  assert_true(!err.nil?, "h2spec 5.1.1: decreasing stream ID rejected")
+  if err
+    assert_eq_i64(err.code.to_i64, ErrorCode::PROTOCOL_ERROR.to_i64, "h2spec 5.1.1 code is PROTOCOL_ERROR")
+    assert_true(err.connection_error, "h2spec 5.1.1 is connection error")
+  end
+
+  # Shape 4: Client sending even-numbered stream ID (h2spec 5.1.1 / RFC 9113 5.1.1)
+  server = init_server_handshake
+  raw = [] of UInt8
+  # Client tries to initiate stream 2 (even stream ID)
+  FrameHeader.new(3, FrameType::HEADERS, FrameFlag::END_HEADERS, 2_i32).encode(raw)
+  raw << 0x82_u8; raw << 0x87_u8; raw << 0x84_u8
+  err = server.receive(Bytes.new(raw.size) { |i| raw[i] })
+  assert_true(!err.nil?, "h2spec 5.1.1: client even stream ID rejected")
+  if err
+    assert_eq_i64(err.code.to_i64, ErrorCode::PROTOCOL_ERROR.to_i64, "even stream parity error is PROTOCOL_ERROR")
+  end
+
+  # Shape 5: Frame on closed stream (h2spec 5.1 / RFC 9113 5.1)
+  server = init_server_handshake
+  st = server.create_stream(1)
+  st.state = StreamState::Closed
+  raw = [] of UInt8
+  FrameHeader.new(4, FrameType::DATA, 0_u8, 1_i32).encode(raw)
+  raw << 1_u8; raw << 2_u8; raw << 3_u8; raw << 4_u8
+  err = server.receive(Bytes.new(raw.size) { |i| raw[i] })
+  assert_true(!err.nil?, "h2spec 5.1: frame on closed stream rejected")
+  if err
+    assert_eq_i64(err.code.to_i64, ErrorCode::STREAM_CLOSED.to_i64, "h2spec 5.1 code is STREAM_CLOSED")
+    assert_true(!err.connection_error, "h2spec 5.1 is a stream error")
+    assert_true(err.message.includes?("DATA received on closed/half-closed stream 1"), "h2spec 5.1 message is closed stream")
+  end
+
+  # Shape 6: SETTINGS frame with length not multiple of 6 (h2spec 6.5 / RFC 9113 6.5)
+  server = init_server_handshake
+  raw = [] of UInt8
+  FrameHeader.new(5, FrameType::SETTINGS, 0_u8, 0_i32).encode(raw) # length 5 != multiple of 6
+  raw << 1_u8; raw << 2_u8; raw << 3_u8; raw << 4_u8; raw << 5_u8
+  err = server.receive(Bytes.new(raw.size) { |i| raw[i] })
+  assert_true(!err.nil?, "h2spec 6.5: SETTINGS length not multiple of 6 rejected")
+  if err
+    assert_eq_i64(err.code.to_i64, ErrorCode::FRAME_SIZE_ERROR.to_i64, "h2spec 6.5 code is FRAME_SIZE_ERROR")
+    assert_true(err.connection_error, "h2spec 6.5 is connection error")
+  end
+
+  # Shape 7: SETTINGS frame with ACK and non-zero length (h2spec 6.5 / RFC 9113 6.5)
+  server = init_server_handshake
+  raw = [] of UInt8
+  FrameHeader.new(6, FrameType::SETTINGS, FrameFlag::ACK, 0_i32).encode(raw) # ACK with length 6 != 0
+  raw << 0_u8; raw << 1_u8; raw << 0_u8; raw << 0_u8; raw << 16_u8; raw << 0_u8
+  err = server.receive(Bytes.new(raw.size) { |i| raw[i] })
+  assert_true(!err.nil?, "h2spec 6.5: SETTINGS ACK with non-zero length rejected")
+  if err
+    assert_eq_i64(err.code.to_i64, ErrorCode::FRAME_SIZE_ERROR.to_i64, "SETTINGS ACK non-zero length is FRAME_SIZE_ERROR")
+    assert_true(err.connection_error, "connection error")
+  end
+
+  # Shape 8: SETTINGS frame on non-zero stream (h2spec 6.5 / RFC 9113 6.5)
+  server = init_server_handshake
+  raw = [] of UInt8
+  FrameHeader.new(0, FrameType::SETTINGS, 0_u8, 1_i32).encode(raw) # stream 1 != 0
+  err = server.receive(Bytes.new(raw.size) { |i| raw[i] })
+  assert_true(!err.nil?, "h2spec 6.5: SETTINGS on non-zero stream rejected")
+  if err
+    assert_eq_i64(err.code.to_i64, ErrorCode::PROTOCOL_ERROR.to_i64, "SETTINGS on stream 1 is PROTOCOL_ERROR")
+    assert_true(err.connection_error, "connection error")
+  end
+
+  # Shape 9: PING frame with length other than 8 (h2spec 6.7 / RFC 9113 6.7)
+  server = init_server_handshake
+  raw = [] of UInt8
+  FrameHeader.new(4, FrameType::PING, 0_u8, 0_i32).encode(raw) # length 4 != 8
+  raw << 1_u8; raw << 2_u8; raw << 3_u8; raw << 4_u8
+  err = server.receive(Bytes.new(raw.size) { |i| raw[i] })
+  assert_true(!err.nil?, "h2spec 6.7: PING with invalid length rejected")
+  if err
+    assert_eq_i64(err.code.to_i64, ErrorCode::FRAME_SIZE_ERROR.to_i64, "PING bad length is FRAME_SIZE_ERROR")
+  end
+
+  # Shape 10: PING frame on non-zero stream (h2spec 6.7 / RFC 9113 6.7)
+  server = init_server_handshake
+  raw = [] of UInt8
+  FrameHeader.new(8, FrameType::PING, 0_u8, 1_i32).encode(raw) # stream 1 != 0
+  raw << 1_u8; raw << 2_u8; raw << 3_u8; raw << 4_u8; raw << 5_u8; raw << 6_u8; raw << 7_u8; raw << 8_u8
+  err = server.receive(Bytes.new(raw.size) { |i| raw[i] })
+  assert_true(!err.nil?, "h2spec 6.7: PING on non-zero stream rejected")
+  if err
+    assert_eq_i64(err.code.to_i64, ErrorCode::PROTOCOL_ERROR.to_i64, "PING on stream 1 is PROTOCOL_ERROR")
+  end
+
+  # Shape 11: WINDOW_UPDATE with 0 increment (h2spec 6.9 / RFC 9113 6.9)
+  server = init_server_handshake
+  raw = [] of UInt8
+  FrameHeader.new(4, FrameType::WINDOW_UPDATE, 0_u8, 0_i32).encode(raw)
+  raw << 0_u8; raw << 0_u8; raw << 0_u8; raw << 0_u8 # increment = 0
+  err = server.receive(Bytes.new(raw.size) { |i| raw[i] })
+  assert_true(!err.nil?, "h2spec 6.9: WINDOW_UPDATE increment 0 rejected")
+  if err
+    assert_eq_i64(err.code.to_i64, ErrorCode::PROTOCOL_ERROR.to_i64, "WINDOW_UPDATE 0 increment is PROTOCOL_ERROR")
+  end
+
+  # Shape 12: WINDOW_UPDATE causing window overflow > 2^31-1 (h2spec 6.9.1 / RFC 9113 6.9.1)
+  server = init_server_handshake
+  raw = [] of UInt8
+  FrameHeader.new(4, FrameType::WINDOW_UPDATE, 0_u8, 0_i32).encode(raw)
+  # Max increment = 2^31 - 1 = 0x7FFFFFFF
+  # Added to default window 65535, it exceeds 2^31 - 1!
+  raw << 0x7F_u8; raw << 0xFF_u8; raw << 0xFF_u8; raw << 0xFF_u8
+  err = server.receive(Bytes.new(raw.size) { |i| raw[i] })
+  assert_true(!err.nil?, "h2spec 6.9.1: WINDOW_UPDATE window overflow rejected")
+  if err
+    assert_eq_i64(err.code.to_i64, ErrorCode::FLOW_CONTROL_ERROR.to_i64, "window overflow is FLOW_CONTROL_ERROR")
+  end
+
+  # Shape 13: RST_STREAM with length other than 4 (h2spec 6.4 / RFC 9113 6.4)
+  server = init_server_handshake
+  raw = [] of UInt8
+  FrameHeader.new(3, FrameType::RST_STREAM, 0_u8, 1_i32).encode(raw) # length 3 != 4
+  raw << 0_u8; raw << 0_u8; raw << 0_u8
+  err = server.receive(Bytes.new(raw.size) { |i| raw[i] })
+  assert_true(!err.nil?, "h2spec 6.4: RST_STREAM invalid length rejected")
+  if err
+    assert_eq_i64(err.code.to_i64, ErrorCode::FRAME_SIZE_ERROR.to_i64, "RST_STREAM bad length is FRAME_SIZE_ERROR")
+  end
+
+  # Shape 14: RST_STREAM on idle stream (h2spec 6.4 / RFC 9113 5.1, 6.4)
+  server = init_server_handshake
+  raw = [] of UInt8
+  FrameHeader.new(4, FrameType::RST_STREAM, 0_u8, 9_i32).encode(raw) # stream 9 is idle
+  raw << 0_u8; raw << 0_u8; raw << 0_u8; raw << 1_u8
+  err = server.receive(Bytes.new(raw.size) { |i| raw[i] })
+  assert_true(!err.nil?, "h2spec 6.4: RST_STREAM on idle stream rejected")
+  if err
+    assert_eq_i64(err.code.to_i64, ErrorCode::PROTOCOL_ERROR.to_i64, "RST_STREAM on idle stream is PROTOCOL_ERROR")
+  end
+
+  # Shape 15: Invalid connection preface (h2spec 3.5 / RFC 9113 3.4)
+  server = Connection.new(Role::Server)
+  server.start_connection
+  bad_preface = Bytes.new(24) { 0x41_u8 } # "AAAAAAAA..."
+  err = server.receive(bad_preface)
+  assert_true(!err.nil?, "h2spec 3.5: invalid client preface rejected")
+  if err
+    assert_eq_i64(err.code.to_i64, ErrorCode::PROTOCOL_ERROR.to_i64, "invalid preface is PROTOCOL_ERROR")
+  end
+
+  # Shape 16: CONTINUATION on different stream than preceding HEADERS (h2spec 6.2, 6.10)
+  server = init_server_handshake
+  raw = [] of UInt8
+  # HEADERS on stream 1 without END_HEADERS
+  FrameHeader.new(3, FrameType::HEADERS, 0_u8, 1_i32).encode(raw)
+  raw << 0x82_u8; raw << 0x87_u8; raw << 0x84_u8
+  # CONTINUATION on stream 3 instead of stream 1!
+  FrameHeader.new(3, FrameType::CONTINUATION, FrameFlag::END_HEADERS, 3_i32).encode(raw)
+  raw << 0x82_u8; raw << 0x87_u8; raw << 0x84_u8
+  err = server.receive(Bytes.new(raw.size) { |i| raw[i] })
+  assert_true(!err.nil?, "h2spec 6.10: CONTINUATION on different stream rejected")
+  if err
+    assert_eq_i64(err.code.to_i64, ErrorCode::PROTOCOL_ERROR.to_i64, "wrong stream CONTINUATION is PROTOCOL_ERROR")
+  end
+
+  puts "  all 16 illegal shapes successfully rejected with exact RFC error codes"
+end
+
+# ---------------------------------------------------------------------------
+# Main Runner
+# ---------------------------------------------------------------------------
+
+def test_remediation_findings : Nil
+  puts "section 8: remediation of 18 adversarial review findings"
+
+  # Finding 1: CONTINUATION target stream for PUSH_PROMISE (RFC 9113 6.6, 6.10)
+  client1 = Connection.new(Role::Client)
+  server1 = Connection.new(Role::Server)
+  client1.start_connection
+  server1.start_connection
+  transfer_bytes(client1, server1)
+  client1.send_headers(1, [HeaderField.new(":method", "GET"), HeaderField.new(":path", "/"), HeaderField.new(":scheme", "https")], true)
+  transfer_bytes(client1, server1)
+  push_fields = [HeaderField.new(":method", "GET"), HeaderField.new(":path", "/pushed"), HeaderField.new(":scheme", "https")]
+  enc_push = server1.hpack_encoder.encode(push_fields)
+  mid1 = enc_push.size // 2
+  raw_pp = [] of UInt8
+  FrameHeader.new(4 + mid1, FrameType::PUSH_PROMISE, 0_u8, 1_i32).encode(raw_pp)
+  raw_pp << 0_u8; raw_pp << 0_u8; raw_pp << 0_u8; raw_pp << 2_u8
+  j = 0; while j < mid1
+    raw_pp << enc_push[j]; j = j + 1
+  end
+  rem_pp_len = enc_push.size - mid1
+  FrameHeader.new(rem_pp_len, FrameType::CONTINUATION, FrameFlag::END_HEADERS, 1_i32).encode(raw_pp)
+  j = mid1; while j < enc_push.size
+    raw_pp << enc_push[j]; j = j + 1
+  end
+  client1.receive(Bytes.new(raw_pp.size) { |idx| raw_pp[idx] })
+  pushed_req = client1.get_pushed_request(2)
+  assert_true(!pushed_req.nil?, "finding 1: pushed request delivered to client")
+  if pushed_req
+    assert_eq(pushed_req.target, "/pushed", "finding 1: pushed request target is /pushed")
+    assert_eq(pushed_req.method, "GET", "finding 1: pushed request method is GET")
+  end
+
+  # Finding 2: PRIORITY frame before HEADERS on idle stream cannot bypass monotonicity or parity
+  server2 = init_server_handshake
+  raw_prio = [] of UInt8
+  FrameHeader.new(5, FrameType::PRIORITY, 0_u8, 9_i32).encode(raw_prio)
+  raw_prio << 0_u8; raw_prio << 0_u8; raw_prio << 0_u8; raw_prio << 0_u8; raw_prio << 15_u8
+  server2.receive(Bytes.new(raw_prio.size) { |idx| raw_prio[idx] })
+  raw_h9 = [] of UInt8
+  FrameHeader.new(3, FrameType::HEADERS, FrameFlag::END_HEADERS, 9_i32).encode(raw_h9)
+  raw_h9 << 0x82_u8; raw_h9 << 0x87_u8; raw_h9 << 0x84_u8
+  server2.receive(Bytes.new(raw_h9.size) { |idx| raw_h9[idx] })
+  raw_bad_h = [] of UInt8
+  FrameHeader.new(3, FrameType::HEADERS, FrameFlag::END_HEADERS, 3_i32).encode(raw_bad_h)
+  raw_bad_h << 0x82_u8; raw_bad_h << 0x87_u8; raw_bad_h << 0x84_u8
+  err_prio_mono = server2.receive(Bytes.new(raw_bad_h.size) { |idx| raw_bad_h[idx] })
+  assert_true(!err_prio_mono.nil?, "finding 2: stream monotonicity enforced after PRIORITY frame")
+
+  # Finding 3: Implicit stream closure on skipped stream ID
+  server3 = init_server_handshake
+  raw_skip = [] of UInt8
+  FrameHeader.new(3, FrameType::HEADERS, FrameFlag::END_HEADERS, 1_i32).encode(raw_skip)
+  raw_skip << 0x82_u8; raw_skip << 0x87_u8; raw_skip << 0x84_u8
+  FrameHeader.new(3, FrameType::HEADERS, FrameFlag::END_HEADERS, 7_i32).encode(raw_skip)
+  raw_skip << 0x82_u8; raw_skip << 0x87_u8; raw_skip << 0x84_u8
+  server3.receive(Bytes.new(raw_skip.size) { |idx| raw_skip[idx] })
+  raw_rst3 = [] of UInt8
+  FrameHeader.new(4, FrameType::RST_STREAM, 0_u8, 3_i32).encode(raw_rst3)
+  raw_rst3 << 0_u8; raw_rst3 << 0_u8; raw_rst3 << 0_u8; raw_rst3 << 8_u8
+  err_rst3 = server3.receive(Bytes.new(raw_rst3.size) { |idx| raw_rst3[idx] })
+  assert_true(err_rst3.nil?, "finding 3: RST_STREAM on implicitly closed stream 3 is ignored")
+
+  # Finding 3b: HEADERS with END_STREAM on ReservedRemote transitions to Closed (RFC 9113 5.1)
+  client_rr = Connection.new(Role::Client)
+  server_rr = Connection.new(Role::Server)
+  client_rr.start_connection; server_rr.start_connection; transfer_bytes(client_rr, server_rr)
+  client_rr.send_headers(1, [HeaderField.new(":method", "GET"), HeaderField.new(":path", "/"), HeaderField.new(":scheme", "https")], true)
+  transfer_bytes(client_rr, server_rr)
+  enc_pr = server_rr.hpack_encoder.encode([HeaderField.new(":method", "GET"), HeaderField.new(":path", "/res"), HeaderField.new(":scheme", "https")])
+  raw_pr = [] of UInt8
+  FrameHeader.new(4 + enc_pr.size, FrameType::PUSH_PROMISE, FrameFlag::END_HEADERS, 1_i32).encode(raw_pr)
+  raw_pr << 0_u8; raw_pr << 0_u8; raw_pr << 0_u8; raw_pr << 2_u8
+  j = 0; while j < enc_pr.size
+    raw_pr << enc_pr[j]; j = j + 1
+  end
+  client_rr.receive(Bytes.new(raw_pr.size) { |idx| raw_pr[idx] })
+  resp_pr = [HeaderField.new(":status", "200")]
+  enc_resp_pr = server_rr.hpack_encoder.encode(resp_pr)
+  raw_resp_pr = [] of UInt8
+  FrameHeader.new(enc_resp_pr.size, FrameType::HEADERS, FrameFlag::END_HEADERS | FrameFlag::END_STREAM, 2_i32).encode(raw_resp_pr)
+  j = 0; while j < enc_resp_pr.size
+    raw_resp_pr << enc_resp_pr[j]; j = j + 1
+  end
+  client_rr.receive(Bytes.new(raw_resp_pr.size) { |idx| raw_resp_pr[idx] })
+  s2 = client_rr.find_stream(2)
+  assert_true(!s2.nil?, "promised stream 2 exists")
+  if s2
+    assert_true(s2.state == StreamState::Closed, "finding 3b: HEADERS with END_STREAM on ReservedRemote transitions to Closed")
+  end
+
+  # Finding 4: Inbound frame length > MAX_FRAME_SIZE rejected before buffering
+  server4 = init_server_handshake
+  raw_giant = [] of UInt8
+  FrameHeader.new(16777215, FrameType::DATA, 0_u8, 1_i32).encode(raw_giant)
+  err_giant = server4.receive(Bytes.new(raw_giant.size) { |idx| raw_giant[idx] })
+  assert_true(!err_giant.nil?, "finding 4: oversized frame rejected immediately before buffering")
+  if err_giant
+    assert_eq_i64(err_giant.code.to_i64, ErrorCode::FRAME_SIZE_ERROR.to_i64, "finding 4 error code is FRAME_SIZE_ERROR")
+  end
+
+  # Finding 5 & 6: Malformed headers produce stream error with RST_STREAM, sibling stream survives
+  server5 = init_server_handshake
+  bad_h = [HeaderField.new(":method", "GET"), HeaderField.new(":path", "/"), HeaderField.new(":scheme", "https"), HeaderField.new("X-Upper", "val")]
+  bad_enc = server5.hpack_encoder.encode(bad_h)
+  raw_m5 = [] of UInt8
+  FrameHeader.new(bad_enc.size, FrameType::HEADERS, FrameFlag::END_HEADERS, 1_i32).encode(raw_m5)
+  j = 0; while j < bad_enc.size
+    raw_m5 << bad_enc[j]; j = j + 1
+  end
+  err_m5 = server5.receive(Bytes.new(raw_m5.size) { |idx| raw_m5[idx] })
+  assert_true(!err_m5.nil?, "finding 5: uppercase header rejected")
+  if err_m5
+    assert_true(!err_m5.connection_error, "finding 5: malformed header is stream error, not connection error")
+    assert_true(!server5.closed, "finding 5: connection is not closed")
+  end
+  out_rst5 = server5.flush_outbound
+  assert_true(out_rst5.size >= 9, "finding 6: RST_STREAM frame emitted for stream error")
+
+  # Finding 7: SETTINGS_MAX_CONCURRENT_STREAMS enforced with REFUSED_STREAM
+  server7 = Connection.new(Role::Server)
+  server7.local_settings.max_concurrent_streams = 2
+  server7.start_connection
+  raw_init7 = [] of UInt8
+  j = 0; while j < CLIENT_PREFACE_BYTES.size
+    raw_init7 << CLIENT_PREFACE_BYTES[j]; j = j + 1
+  end
+  FrameHeader.new(0, FrameType::SETTINGS, 0_u8, 0_i32).encode(raw_init7)
+  server7.receive(Bytes.new(raw_init7.size) { |idx| raw_init7[idx] })
+  server7.flush_outbound
+  h_ok = [HeaderField.new(":method", "GET"), HeaderField.new(":path", "/"), HeaderField.new(":scheme", "https")]
+  enc_ok = server7.hpack_encoder.encode(h_ok)
+
+  # Server has stream 2 reserved (RFC 9113 5.1.2: does NOT count against limit)
+  res_stream = server7.create_stream(2)
+  res_stream.state = StreamState::ReservedLocal
+  assert_eq_i32(server7.active_stream_count, 0, "finding 7: reserved stream does not count toward active_stream_count")
+
+  raw_7 = [] of UInt8
+  FrameHeader.new(enc_ok.size, FrameType::HEADERS, FrameFlag::END_HEADERS, 1_i32).encode(raw_7)
+  j = 0; while j < enc_ok.size
+    raw_7 << enc_ok[j]; j = j + 1
+  end
+  FrameHeader.new(enc_ok.size, FrameType::HEADERS, FrameFlag::END_HEADERS, 3_i32).encode(raw_7)
+  j = 0; while j < enc_ok.size
+    raw_7 << enc_ok[j]; j = j + 1
+  end
+  server7.receive(Bytes.new(raw_7.size) { |idx| raw_7[idx] })
+  assert_eq_i32(server7.active_stream_count, 2, "finding 7: 2 active streams open")
+  raw_7_exceed = [] of UInt8
+  FrameHeader.new(enc_ok.size, FrameType::HEADERS, FrameFlag::END_HEADERS, 5_i32).encode(raw_7_exceed)
+  j = 0; while j < enc_ok.size
+    raw_7_exceed << enc_ok[j]; j = j + 1
+  end
+  err_7 = server7.receive(Bytes.new(raw_7_exceed.size) { |idx| raw_7_exceed[idx] })
+  assert_true(!err_7.nil?, "finding 7: max concurrent streams limit enforced")
+  if err_7
+    assert_eq_i64(err_7.code.to_i64, ErrorCode::REFUSED_STREAM.to_i64, "finding 7 error is REFUSED_STREAM")
+  end
+
+  # Finding 8: send_data buffers excess bytes without error and flushes on WINDOW_UPDATE
+  client8 = Connection.new(Role::Client)
+  server8 = Connection.new(Role::Server)
+  client8.start_connection; server8.start_connection
+  transfer_bytes(client8, server8)
+  client8.send_headers(1, h_ok, false)
+  transfer_bytes(client8, server8)
+  p70k = Bytes.new(70000) { |idx| (idx & 0xFF).to_u8 }
+  err8 = client8.send_data(1, p70k, true)
+  assert_true(err8.nil?, "finding 8: send_data does not return fatal error on window exhaustion")
+  st8 = client8.find_stream(1)
+  if st8
+    assert_eq_i32(st8.pending_data.size, 4465, "finding 8: 4465 bytes held in pending buffer")
+  end
+
+  # Finding 9: DATA frame padding included in flow control accounting
+  server9 = init_server_handshake
+  server9.send_headers(1, h_ok, false)
+  raw_pad = [] of UInt8
+  FrameHeader.new(15, FrameType::DATA, FrameFlag::PADDED, 1_i32).encode(raw_pad)
+  raw_pad << 10_u8
+  raw_pad << 1_u8; raw_pad << 2_u8; raw_pad << 3_u8; raw_pad << 4_u8
+  j = 0; while j < 10
+    raw_pad << 0_u8; j = j + 1
+  end
+  init_recv_w = server9.connection_recv_window
+  server9.receive(Bytes.new(raw_pad.size) { |idx| raw_pad[idx] })
+  assert_eq_i64(server9.connection_recv_window, init_recv_w - 15_i64, "finding 9: flow control deducts full 15 bytes including padding")
+
+  # Finding 10: Non-SETTINGS frame as first frame after preface rejected
+  server10 = Connection.new(Role::Server)
+  server10.start_connection; server10.receive(CLIENT_PREFACE_BYTES); server10.flush_outbound
+  raw_ping_first = [] of UInt8
+  FrameHeader.new(8, FrameType::PING, 0_u8, 0_i32).encode(raw_ping_first)
+  j = 0; while j < 8
+    raw_ping_first << 0_u8; j = j + 1
+  end
+  err10 = server10.receive(Bytes.new(raw_ping_first.size) { |idx| raw_ping_first[idx] })
+  assert_true(!err10.nil?, "finding 10: PING as first frame after preface rejected")
+  if err10
+    assert_eq_i64(err10.code.to_i64, ErrorCode::PROTOCOL_ERROR.to_i64, "finding 10 error is PROTOCOL_ERROR")
+  end
+
+  # Finding 11: Client rejects server-sent SETTINGS_ENABLE_PUSH
+  client11 = Connection.new(Role::Client)
+  client11.start_connection; client11.flush_outbound
+  raw_push_set = [] of UInt8
+  FrameHeader.new(6, FrameType::SETTINGS, 0_u8, 0_i32).encode(raw_push_set)
+  raw_push_set << 0_u8; raw_push_set << 2_u8
+  raw_push_set << 0_u8; raw_push_set << 0_u8; raw_push_set << 0_u8; raw_push_set << 0_u8
+  err11 = client11.receive(Bytes.new(raw_push_set.size) { |idx| raw_push_set[idx] })
+  assert_true(!err11.nil?, "finding 11: client rejects server SETTINGS_ENABLE_PUSH")
+  if err11
+    assert_eq_i64(err11.code.to_i64, ErrorCode::PROTOCOL_ERROR.to_i64, "finding 11 error is PROTOCOL_ERROR")
+  end
+
+  # Finding 12: PRIORITY frame with bad length is connection error FRAME_SIZE_ERROR
+  server12 = init_server_handshake
+  raw_prio4 = [] of UInt8
+  FrameHeader.new(4, FrameType::PRIORITY, 0_u8, 1_i32).encode(raw_prio4)
+  raw_prio4 << 0_u8; raw_prio4 << 0_u8; raw_prio4 << 0_u8; raw_prio4 << 0_u8
+  err12 = server12.receive(Bytes.new(raw_prio4.size) { |idx| raw_prio4[idx] })
+  assert_true(!err12.nil?, "finding 12: PRIORITY length != 5 rejected")
+  if err12
+    assert_true(err12.connection_error, "finding 12: PRIORITY bad length is connection error")
+  end
+
+  # Finding 13: Pseudo-headers validation including Classic and Extended CONNECT
+  server13 = init_server_handshake
+  # A. Missing mandatory pseudo-headers
+  h_empty_pseudo = [HeaderField.new("content-type", "text/plain")]
+  enc_ep = server13.hpack_encoder.encode(h_empty_pseudo)
+  raw_ep = [] of UInt8
+  FrameHeader.new(enc_ep.size, FrameType::HEADERS, FrameFlag::END_HEADERS, 1_i32).encode(raw_ep)
+  j = 0; while j < enc_ep.size
+    raw_ep << enc_ep[j]; j = j + 1
+  end
+  err13 = server13.receive(Bytes.new(raw_ep.size) { |idx| raw_ep[idx] })
+  assert_true(!err13.nil?, "finding 13: missing mandatory request pseudo-headers rejected")
+
+  # B. Classic CONNECT (RFC 9113 8.5): :method and :authority present, :scheme and :path omitted
+  server_connect = init_server_handshake
+  h_classic_connect = [HeaderField.new(":method", "CONNECT"), HeaderField.new(":authority", "example.com:443")]
+  enc_cc = server_connect.hpack_encoder.encode(h_classic_connect)
+  raw_cc = [] of UInt8
+  FrameHeader.new(enc_cc.size, FrameType::HEADERS, FrameFlag::END_HEADERS, 1_i32).encode(raw_cc)
+  j = 0; while j < enc_cc.size
+    raw_cc << enc_cc[j]; j = j + 1
+  end
+  err_cc = server_connect.receive(Bytes.new(raw_cc.size) { |idx| raw_cc[idx] })
+  assert_true(err_cc.nil?, "finding 13: classic CONNECT without :scheme and :path accepted")
+
+  # C. Classic CONNECT with :path -> rejected per RFC 9113 8.5
+  server_bad_connect = init_server_handshake
+  h_bad_connect = [HeaderField.new(":method", "CONNECT"), HeaderField.new(":authority", "example.com:443"), HeaderField.new(":path", "/")]
+  enc_bc = server_bad_connect.hpack_encoder.encode(h_bad_connect)
+  raw_bc = [] of UInt8
+  FrameHeader.new(enc_bc.size, FrameType::HEADERS, FrameFlag::END_HEADERS, 1_i32).encode(raw_bc)
+  j = 0; while j < enc_bc.size
+    raw_bc << enc_bc[j]; j = j + 1
+  end
+  err_bc = server_bad_connect.receive(Bytes.new(raw_bc.size) { |idx| raw_bc[idx] })
+  assert_true(!err_bc.nil?, "finding 13: classic CONNECT with :path rejected")
+
+  # D. Extended CONNECT (RFC 8441): :method, :protocol, :scheme, :authority, :path present
+  server_ext_connect = init_server_handshake
+  h_ext_connect = [
+    HeaderField.new(":method", "CONNECT"),
+    HeaderField.new(":protocol", "websocket"),
+    HeaderField.new(":scheme", "https"),
+    HeaderField.new(":authority", "example.com"),
+    HeaderField.new(":path", "/chat"),
+  ]
+  enc_ec = server_ext_connect.hpack_encoder.encode(h_ext_connect)
+  raw_ec = [] of UInt8
+  FrameHeader.new(enc_ec.size, FrameType::HEADERS, FrameFlag::END_HEADERS, 1_i32).encode(raw_ec)
+  j = 0; while j < enc_ec.size
+    raw_ec << enc_ec[j]; j = j + 1
+  end
+  err_ec = server_ext_connect.receive(Bytes.new(raw_ec.size) { |idx| raw_ec[idx] })
+  assert_true(err_ec.nil?, "finding 13: extended CONNECT with :protocol, :scheme, :path accepted")
+
+  # Finding 14: Trailers preserved on Response and accessible on Request
+  client14 = Connection.new(Role::Client)
+  server14 = Connection.new(Role::Server)
+  client14.start_connection; server14.start_connection; transfer_bytes(client14, server14)
+  client14.send_headers(1, h_ok, false)
+  client14.send_data(1, Bytes.new(5) { 0x41_u8 }, false)
+  client14.send_headers(1, [HeaderField.new("checksum", "sha256-abc12345")], true)
+  transfer_bytes(client14, server14)
+  req_tr = server14.request_trailers(1)
+  assert_eq(req_tr["checksum"]? || "", "sha256-abc12345", "finding 14: request trailer header preserved and readable")
+
+  # Finding 15: PUSH_PROMISE on idle stream rejected
+  client15 = Connection.new(Role::Client)
+  client15.start_connection
+  raw_set0 = [] of UInt8
+  FrameHeader.new(0, FrameType::SETTINGS, 0_u8, 0_i32).encode(raw_set0)
+  client15.receive(Bytes.new(raw_set0.size) { |idx| raw_set0[idx] })
+  client15.flush_outbound
+  raw_pp99 = [] of UInt8
+  FrameHeader.new(7, FrameType::PUSH_PROMISE, FrameFlag::END_HEADERS, 99_i32).encode(raw_pp99)
+  raw_pp99 << 0_u8; raw_pp99 << 0_u8; raw_pp99 << 0_u8; raw_pp99 << 2_u8
+  raw_pp99 << 0x82_u8; raw_pp99 << 0x87_u8; raw_pp99 << 0x84_u8
+  err15 = client15.receive(Bytes.new(raw_pp99.size) { |idx| raw_pp99[idx] })
+  assert_true(!err15.nil?, "finding 15: PUSH_PROMISE on idle stream rejected")
+
+  # Finding 16: PUSH_PROMISE promised stream ID monotonicity
+  client16 = Connection.new(Role::Client)
+  server16 = Connection.new(Role::Server)
+  client16.start_connection; server16.start_connection; transfer_bytes(client16, server16)
+  client16.send_headers(1, h_ok, true); transfer_bytes(client16, server16)
+  raw_pp4 = [] of UInt8
+  FrameHeader.new(7, FrameType::PUSH_PROMISE, FrameFlag::END_HEADERS, 1_i32).encode(raw_pp4)
+  raw_pp4 << 0_u8; raw_pp4 << 0_u8; raw_pp4 << 0_u8; raw_pp4 << 4_u8
+  raw_pp4 << 0x82_u8; raw_pp4 << 0x87_u8; raw_pp4 << 0x84_u8
+  client16.receive(Bytes.new(raw_pp4.size) { |idx| raw_pp4[idx] })
+  raw_pp2 = [] of UInt8
+  FrameHeader.new(7, FrameType::PUSH_PROMISE, FrameFlag::END_HEADERS, 1_i32).encode(raw_pp2)
+  raw_pp2 << 0_u8; raw_pp2 << 0_u8; raw_pp2 << 0_u8; raw_pp2 << 2_u8
+  raw_pp2 << 0x82_u8; raw_pp2 << 0x87_u8; raw_pp2 << 0x84_u8
+  err16 = client16.receive(Bytes.new(raw_pp2.size) { |idx| raw_pp2[idx] })
+  assert_true(!err16.nil?, "finding 16: decreasing promised stream ID rejected")
+
+  # Finding 17: Repeated headers concatenation
+  server17 = init_server_handshake
+  h_repeat = [
+    HeaderField.new(":method", "GET"),
+    HeaderField.new(":path", "/"),
+    HeaderField.new(":scheme", "https"),
+    HeaderField.new("cookie", "user=alice"),
+    HeaderField.new("cookie", "token=secret123"),
+    HeaderField.new("accept", "text/html"),
+    HeaderField.new("accept", "application/json"),
+  ]
+  enc_rep = server17.hpack_encoder.encode(h_repeat)
+  raw_rep = [] of UInt8
+  FrameHeader.new(enc_rep.size, FrameType::HEADERS, FrameFlag::END_HEADERS | FrameFlag::END_STREAM, 1_i32).encode(raw_rep)
+  j = 0; while j < enc_rep.size
+    raw_rep << enc_rep[j]; j = j + 1
+  end
+  server17.receive(Bytes.new(raw_rep.size) { |idx| raw_rep[idx] })
+  req17 : Request? = nil
+  idx17 = 0
+  while idx17 < server17.completed_requests.size
+    item17 = server17.completed_requests[idx17]
+    if item17[0] == 1
+      req17 = item17[1]
+    end
+    idx17 = idx17 + 1
+  end
+  assert_true(!req17.nil?, "finding 17: request created")
+  if req17
+    assert_eq(req17.headers["cookie"]? || "", "user=alice; token=secret123", "finding 17: repeated cookies joined with semicolon")
+    assert_eq(req17.headers["accept"]? || "", "text/html, application/json", "finding 17: repeated accept joined with comma")
+  end
+
+  # Finding 18: GOAWAY last-stream-id boundary in both directions (RFC 9113 6.8)
+  # A. Client receives GOAWAY(last_stream_id = 1) from server
+  client18 = Connection.new(Role::Client)
+  client18.start_connection; client18.flush_outbound
+  raw_set18 = [] of UInt8
+  FrameHeader.new(0, FrameType::SETTINGS, 0_u8, 0_i32).encode(raw_set18)
+  client18.receive(Bytes.new(raw_set18.size) { |idx| raw_set18[idx] })
+  client18.flush_outbound
+
+  # Client initiated stream 1 before GOAWAY
+  client18.send_headers(1, h_ok, false)
+  client18.flush_outbound
+
+  # Server sends GOAWAY with last_stream_id = 1
+  raw_gw = [] of UInt8
+  FrameHeader.new(8, FrameType::GOAWAY, 0_u8, 0_i32).encode(raw_gw)
+  raw_gw << 0_u8; raw_gw << 0_u8; raw_gw << 0_u8; raw_gw << 1_u8 # last_stream_id = 1
+  raw_gw << 0_u8; raw_gw << 0_u8; raw_gw << 0_u8; raw_gw << 0_u8 # NO_ERROR
+  client18.receive(Bytes.new(raw_gw.size) { |idx| raw_gw[idx] })
+
+  # In-flight stream 1 (1 <= 1) response is accepted
+  h_resp18 = [HeaderField.new(":status", "200")]
+  enc_resp18 = client18.hpack_encoder.encode(h_resp18)
+  raw_resp18 = [] of UInt8
+  FrameHeader.new(enc_resp18.size, FrameType::HEADERS, FrameFlag::END_HEADERS | FrameFlag::END_STREAM, 1_i32).encode(raw_resp18)
+  j = 0; while j < enc_resp18.size
+    raw_resp18 << enc_resp18[j]; j = j + 1
+  end
+  err_resp18 = client18.receive(Bytes.new(raw_resp18.size) { |idx| raw_resp18[idx] })
+  assert_true(err_resp18.nil?, "finding 18: in-flight stream 1 <= last_stream_id accepted after GOAWAY")
+
+  # Server receives GOAWAY(last_stream_id = 1) from client
+  server_recv_gw = init_server_handshake
+  raw_client_gw = [] of UInt8
+  FrameHeader.new(8, FrameType::GOAWAY, 0_u8, 0_i32).encode(raw_client_gw)
+  raw_client_gw << 0_u8; raw_client_gw << 0_u8; raw_client_gw << 0_u8; raw_client_gw << 1_u8 # last_stream_id = 1
+  raw_client_gw << 0_u8; raw_client_gw << 0_u8; raw_client_gw << 0_u8; raw_client_gw << 0_u8 # NO_ERROR
+  server_recv_gw.receive(Bytes.new(raw_client_gw.size) { |idx| raw_client_gw[idx] })
+
+  # Newly initiated stream 3 (3 > 1) from peer is rejected by server
+  raw_s3 = [] of UInt8
+  FrameHeader.new(enc_ok.size, FrameType::HEADERS, FrameFlag::END_HEADERS, 3_i32).encode(raw_s3)
+  j = 0; while j < enc_ok.size
+    raw_s3 << enc_ok[j]; j = j + 1
+  end
+  err_s3 = server_recv_gw.receive(Bytes.new(raw_s3.size) { |idx| raw_s3[idx] })
+  assert_true(!err_s3.nil?, "finding 18: newly initiated stream 3 > received GOAWAY last_stream_id rejected")
+
+  # PUSH_PROMISE with promised stream 4 (4 > 1) is rejected
+  raw_pp_gw = [] of UInt8
+  FrameHeader.new(7, FrameType::PUSH_PROMISE, FrameFlag::END_HEADERS, 1_i32).encode(raw_pp_gw)
+  raw_pp_gw << 0_u8; raw_pp_gw << 0_u8; raw_pp_gw << 0_u8; raw_pp_gw << 4_u8
+  raw_pp_gw << 0x82_u8; raw_pp_gw << 0x87_u8; raw_pp_gw << 0x84_u8
+  err_pp_gw = client18.receive(Bytes.new(raw_pp_gw.size) { |idx| raw_pp_gw[idx] })
+  assert_true(!err_pp_gw.nil?, "finding 18: promised stream 4 > last_stream_id rejected after GOAWAY")
+
+  # Client attempting to initiate new stream via send_request is rejected
+  req18 = Request.new("GET", "/test", Headers.new, "")
+  s18_res = client18.send_request(req18)
+  assert_true(!s18_res[1].nil?, "finding 18: send_request after GOAWAY rejected")
+  err18_sh = client18.send_headers(3, h_ok, true)
+  assert_true(!err18_sh.nil?, "finding 18: send_headers after GOAWAY rejected")
+
+  # B. Inbound to server: server sent GOAWAY with last_stream_id = 1
+  server18 = init_server_handshake
+  server18.send_goaway(1, ErrorCode::NO_ERROR, Bytes.empty)
+  server18.flush_outbound
+  # Peer attempts to open stream 3 (3 > 1) -> rejected!
+  raw_post_gw = [] of UInt8
+  FrameHeader.new(enc_ok.size, FrameType::HEADERS, FrameFlag::END_HEADERS, 3_i32).encode(raw_post_gw)
+  j = 0; while j < enc_ok.size
+    raw_post_gw << enc_ok[j]; j = j + 1
+  end
+  err_post_gw = server18.receive(Bytes.new(raw_post_gw.size) { |idx| raw_post_gw[idx] })
+  assert_true(!err_post_gw.nil?, "finding 18: inbound new stream exceeding GOAWAY last_stream_id rejected")
+  puts "  all 18 adversarial findings verified"
+end
+
+def run_all : Nil
+  puts "== running std/http2 exercise suite =="
+  test_preface_and_settings_handshake
+  test_every_frame_type
+  test_stream_state_machine
+  test_multiplexing_concurrent_streams
+  test_continuation_frames_and_atomicity
+  test_flow_control_large_transfer
+  test_protocol_error_suite
+  test_remediation_findings
+  puts "all std/http2 checks passed"
+end
+
+run_all

@@ -1,0 +1,46 @@
+# Standard regular expression library demonstration.
+#
+#   ./bin/iyi run samples/iyi/std_regex.iyi
+
+import std/regex
+
+# 1. Matching and captures
+re = Regex.new("([a-z]+)@([a-z.]+)")
+m = re.match("Contact: developer@example.com")
+if m
+  puts "Full match: #{m[0]}"
+  puts "User: #{m[1]}, Host: #{m[2]}"
+  puts "Pre: '#{m.pre_match}', Post: '#{m.post_match}'"
+end
+
+# 2. Named capture groups
+url_re = Regex.new("(?<proto>https?)://(?<domain>[a-z.-]+)(?<path>/[a-z0-9/-]+)?")
+m_url = url_re.match("Visit https://iyi-lang.org/docs today")
+if m_url
+  puts "Protocol: #{m_url["proto"]}"
+  puts "Domain: #{m_url["domain"]}"
+  puts "Path: #{m_url["path"]}"
+end
+
+# 3. Scanning multiple occurrences
+hex_re = Regex.new("[0-9a-fA-F]{2}")
+tokens = hex_re.scan("MAC: 00:1A:2B:3C:4D:5E")
+puts "Found #{tokens.size} hex octets:"
+tokens.each do |tok|
+  puts "  octet: #{tok[0]}"
+end
+
+# 4. Splitting on regex delimiter
+csv_re = Regex.new("\\s*,\\s*")
+fields = csv_re.split("apple, banana , cherry ,date")
+puts "Fields (#{fields.size}): #{fields.join(" | ")}"
+
+# 5. Global substitutions with backslash capture expansion
+kv_re = Regex.new("([a-z]+)=([0-9]+)")
+reformatted = kv_re.gsub("width=800, height=600", "\\1: \\2px")
+puts "Reformatted: #{reformatted}"
+
+# 6. Escaping literal text
+query = "file.tar.gz"
+safe_re = Regex.new(Regex.escape(query))
+puts "Escaped pattern matches exact string: #{safe_re.match?("file.tar.gz")}"

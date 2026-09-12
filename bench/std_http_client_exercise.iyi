@@ -1,0 +1,131 @@
+module main
+
+import std/http_client
+using std/http::{Headers, Request, Response, Status}
+using std/http_client::{AltSvcEntry, Client, NegotiatedResponse, Protocol, Route, Upstream}
+{% if (flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64))) || (flag?(:darwin) && flag?(:aarch64)) || (flag?(:win32) && flag?(:x86_64)) %}
+  _ = IyiScheduler.current
+{% end %}
+
+pub def assert(value : Bool, message : String) : Nil
+  unless value
+    puts "assertion failed: #{message}"
+    __iyi_exit(1)
+  end
+end
+
+pub class RecordingUpstream < Upstream
+  getter calls : Int32
+  getter last_route : Route?
+  getter last_request : Request?
+
+  @protocol : String
+  @body : String
+  @alt_svc : String?
+
+  def initialize(@protocol : String, @body : String, @alt_svc : String? = nil)
+    @calls = 0
+    @last_route = nil
+    @last_request = nil
+  end
+
+  def execute(request : Request, route : Route) : NegotiatedResponse
+    @calls = @calls + 1
+    @last_route = route
+    @last_request = request
+    assert(route.offered_protocols.includes?(@protocol), "origin selected unoffered protocol #{@protocol}")
+    headers = Headers.new
+    headers["Content-Length"] = @body.bytesize.to_s
+    if alt = @alt_svc
+      headers["Alt-Svc"] = alt
+    end
+    NegotiatedResponse.new(Response.new(Status.new(200), headers, @body), @protocol)
+  end
+end
+
+puts "== Section 1: One application client surface"
+plain_origin = RecordingUpstream.new(Protocol::HTTP1, "plain")
+plain = Client.new(direct: plain_origin)
+h1_response = plain.get("http://app.example.test/")
+assert(h1_response.status_code == 200, "plain HTTP request returns 200")
+assert(plain.last_protocol == Protocol::HTTP1, "plain HTTP selects HTTP/1.1")
+puts "  client-api: get returns the shared Response model without a protocol choice"
+
+puts "== Section 2: TLS ALPN chooses HTTP/2 or HTTP/1.1"
+h2_origin = RecordingUpstream.new(Protocol::HTTP2, "h2")
+alpn_client = Client.new(direct: h2_origin)
+h2_response = alpn_client.get("https://h2.example.test/resource")
+assert(h2_response.status_code == 200, "ALPN HTTP/2 request returns 200")
+assert(alpn_client.last_protocol == Protocol::HTTP2, "TLS ALPN selected h2")
+h1_tls_origin = RecordingUpstream.new(Protocol::HTTP1, "h1")
+fallback_client = Client.new(direct: h1_tls_origin)
+h1_tls_response = fallback_client.get("https://h1.example.test/resource")
+assert(h1_tls_response.status_code == 200, "ALPN HTTP/1.1 fallback returns 200")
+assert(fallback_client.last_protocol == Protocol::HTTP1, "TLS ALPN selected HTTP/1.1 fallback")
+assert(h2_origin.last_route.as(Route).offered_protocols == [Protocol::HTTP2, Protocol::HTTP1], "ALPN offer order prefers h2")
+assert(h1_tls_origin.last_route.as(Route).offered_protocols == [Protocol::HTTP2, Protocol::HTTP1], "HTTP/1.1 origin received the same ALPN offer")
+puts "  alpn: the client offered h2 then http/1.1; the origin selected either without application input"
+
+puts "== Section 3: Alt-Svc moves the next request to HTTP/3"
+direct = RecordingUpstream.new(Protocol::HTTP2, "first", "h3=\":8443\"; ma=60")
+h3 = RecordingUpstream.new(Protocol::HTTP3, "second")
+alt_client = Client.new(http3: h3, direct: direct)
+first = alt_client.get("https://api.example.test/v1")
+second = alt_client.get("https://api.example.test/v2")
+assert(first.body == "first", "first request uses direct negotiated transport")
+assert(second.body == "second", "second request uses learned HTTP/3 transport")
+assert(direct.calls == 1, "direct transport called once before Alt-Svc")
+assert(h3.calls == 1, "HTTP/3 transport called after Alt-Svc")
+route = h3.last_route
+assert(!route.nil?, "HTTP/3 route recorded")
+if selected_route = route
+  assert(selected_route.host == "api.example.test", "Alt-Svc empty host keeps origin host")
+  assert(selected_route.port == 8443, "Alt-Svc selected advertised port")
+  assert(selected_route.offered_protocols == [Protocol::HTTP3], "Alt-Svc route offers only h3")
+end
+assert(alt_client.last_protocol == Protocol::HTTP3, "last protocol records negotiated h3")
+puts "  alt-svc: first h2 response advertised h3; next request used the learned endpoint"
+
+clear_direct = RecordingUpstream.new(Protocol::HTTP2, "direct", "h3=\":8443\"; ma=0")
+clear_h3 = RecordingUpstream.new(Protocol::HTTP3, "wrong")
+clear_client = Client.new(http3: clear_h3, direct: clear_direct)
+clear_client.get("https://clear.example.test/first")
+clear_client.get("https://clear.example.test/second")
+assert(clear_h3.calls == 0, "ma=0 clears HTTP/3 route")
+assert(clear_direct.calls == 2, "ma=0 keeps direct negotiation")
+
+puts "== Section 4: Upstream proxy owns protocol selection"
+proxy = RecordingUpstream.new(Protocol::HTTP3, "proxied")
+proxy_client = Client.new(proxy: proxy, direct: RecordingUpstream.new(Protocol::HTTP1, "wrong"))
+proxied = proxy_client.post("https://service.example.test/jobs", "payload")
+assert(proxied.body == "proxied", "proxy response returned")
+assert(proxy.calls == 1, "proxy received request")
+proxy_route = proxy.last_route
+assert(!proxy_route.nil?, "proxy route recorded")
+if selected_proxy_route = proxy_route
+  assert(selected_proxy_route.offered_protocols == [Protocol::HTTP3, Protocol::HTTP2, Protocol::HTTP1], "proxy receives ordered protocol offers")
+end
+assert(proxy_client.last_protocol == Protocol::HTTP3, "proxy reports its negotiated upstream protocol")
+puts "  proxy: upstream received h3, h2, http/1.1 offers and selected h3"
+
+puts "== Section 5: Application request and response stay protocol-neutral"
+protocols = [Protocol::HTTP1, Protocol::HTTP2, Protocol::HTTP3]
+i = 0
+while i < protocols.size
+  upstream = RecordingUpstream.new(protocols[i], "same response")
+  client = Client.new(proxy: upstream)
+  response = client.get("https://service.example.test/resource")
+  assert(response.status_code == 200, "shared status for #{protocols[i]}")
+  assert(response.body == "same response", "shared body for #{protocols[i]}")
+  request = upstream.last_request
+  assert(!request.nil?, "shared request delivered for #{protocols[i]}")
+  if delivered = request
+    assert(delivered.method == "GET", "shared method for #{protocols[i]}")
+    assert(delivered.target == "https://service.example.test/resource", "shared target for #{protocols[i]}")
+  end
+  i = i + 1
+end
+puts "  protocol-neutral: the same get call and shared models covered h1, h2 and h3"
+
+puts
+puts "all std/http_client checks passed"

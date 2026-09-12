@@ -1570,8 +1570,8 @@ describe Iyi::IyiMod do
   it "ships a generic type's bodies, and the consumer specialises them" do
     with_tempdir("iyimod_mono_generic") do
       Dir.mkdir_p "std"
-      File.write "std/box.iyi", <<-IYI
-        module std/box
+      File.write "std/boxed.iyi", <<-IYI
+        module std/boxed
 
         pub struct Box(T)
           @item : T
@@ -1587,10 +1587,10 @@ describe Iyi::IyiMod do
       File.write "main.iyi", <<-IYI
         module main
 
-        import std/box
+        import std/boxed
 
-        puts Std::Box::Box(Int32).new(7).item
-        puts Std::Box::Box(String).new("seven").item
+        puts Std::Boxed::Box(Int32).new(7).item
+        puts Std::Boxed::Box(String).new("seven").item
         IYI
 
       source = Iyi::Compiler::Source.new(File.expand_path("main.iyi"), File.read("main.iyi"))
@@ -1601,10 +1601,10 @@ describe Iyi::IyiMod do
       producer.compile source, File.expand_path("from-source")
       `./from-source`.chomp.should eq "7\nseven"
 
-      artifact = Iyi::IyiMod.read(File.join("mods", "std", "box.iyimod"))
+      artifact = Iyi::IyiMod.read(File.join("mods", "std", "boxed.iyimod"))
       artifact.mono_bodies.keys.should contain "Box#item()"
 
-      File.delete "std/box.iyi"
+      File.delete "std/boxed.iyi"
 
       consumer = create_spec_compiler
       consumer.prelude = "iyi/prelude"
@@ -1627,8 +1627,8 @@ describe Iyi::IyiMod do
   it "specialises an imported generic however the consumer reaches it" do
     with_tempdir("iyimod_generic_reach") do
       Dir.mkdir_p "std"
-      File.write "std/box.iyi", <<-IYI
-        module std/box
+      File.write "std/boxed.iyi", <<-IYI
+        module std/boxed
 
         pub trait Show
           abstract def show : String
@@ -1654,11 +1654,11 @@ describe Iyi::IyiMod do
       File.write "main.iyi", <<-IYI
         module main
 
-        import std/box
+        import std/boxed
 
-        puts Std::Box::Box.new(21).map { |v| v + v }.value
-        puts Std::Box::Box.new(1).show
-        puts Std::Box::Box.new(Std::Box::Box.new(5)).value.value
+        puts Std::Boxed::Box.new(21).map { |v| v + v }.value
+        puts Std::Boxed::Box.new(1).show
+        puts Std::Boxed::Box.new(Std::Boxed::Box.new(5)).value.value
         IYI
 
       source = Iyi::Compiler::Source.new(File.expand_path("main.iyi"), File.read("main.iyi"))
@@ -1669,7 +1669,7 @@ describe Iyi::IyiMod do
       producer.compile source, File.expand_path("from-source")
       `./from-source`.chomp.should eq "42\nshown\n5"
 
-      File.delete "std/box.iyi"
+      File.delete "std/boxed.iyi"
 
       consumer = create_spec_compiler
       consumer.prelude = "iyi/prelude"
@@ -2741,8 +2741,8 @@ describe Iyi::IyiMod do
   it "carries a type's fields" do
     with_tempdir("iyimod_fields") do
       Dir.mkdir_p "std"
-      File.write "std/box.iyi", <<-IYI
-        module std/box
+      File.write "std/boxed.iyi", <<-IYI
+        module std/boxed
 
         pub struct Box(T)
           @item : T
@@ -2760,9 +2760,9 @@ describe Iyi::IyiMod do
       File.write "main.iyi", <<-IYI
         module main
 
-        import std/box
+        import std/boxed
 
-        puts Std::Box::Box(Int32).new(7).item
+        puts Std::Boxed::Box(Int32).new(7).item
         IYI
 
       source = Iyi::Compiler::Source.new(File.expand_path("main.iyi"), File.read("main.iyi"))
@@ -2773,7 +2773,7 @@ describe Iyi::IyiMod do
       producer.no_codegen = true
       producer.compile source, File.expand_path("unused")
 
-      declaration = Iyi::IyiMod.read(File.join("mods", "std", "box.iyimod"))
+      declaration = Iyi::IyiMod.read(File.join("mods", "std", "boxed.iyimod"))
         .exports.types.find! { |candidate| candidate.name == "Box" }
 
       # In the order they were declared, because that order is the layout: a

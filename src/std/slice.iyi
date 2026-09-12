@@ -12,6 +12,8 @@ module std/slice
 
 import std/enumerable
 using std/enumerable::{Enumerable}
+import std/indexable
+using std/indexable::{Indexable, IndexableMutable}
 
 # `pub`, because an alias is part of a module's surface like anything else: an
 # unexported one is unreachable from a consumer, which R-2 now says out loud.
@@ -32,6 +34,19 @@ pub struct Slice(T)
   def initialize(@pointer : Pointer(T), size : Int32, @read_only : Bool = false)
     raise "negative size: #{size}" if size < 0
     @size = size
+  end
+
+  # Allocates a slice of size elements initialized by yielding each index.
+  def initialize(size : Int32, & : Int32 -> T)
+    raise "negative size: #{size}" if size < 0
+    @size = size
+    @read_only = false
+    @pointer = size == 0 ? Pointer(T).new(0_u64) : Pointer(T).malloc(size.to_u64)
+    i = 0
+    while i < size
+      @pointer[i] = yield i
+      i = i + 1
+    end
   end
 
   # Allocates a slice of *size* elements on the heap.
@@ -406,6 +421,10 @@ pub struct Slice(T)
   def ==(other) : Bool
     false
   end
+
+  def to_slice : Slice(T)
+    self
+  end
 end
 
 impl Enumerable for Slice(T) forall T
@@ -417,5 +436,28 @@ impl Enumerable for Slice(T) forall T
       yield @pointer[i]
       i = i + 1
     end
+  end
+end
+
+impl Indexable for Slice(T) forall T
+  type Elem = T
+
+  def unsafe_fetch(index : Int32) : T
+    @pointer[index]
+  end
+end
+
+impl IndexableMutable for Slice(T) forall T
+  type Elem = T
+
+  def unsafe_put(index : Int32, value : T) : T
+    raise "cannot write to read-only Slice" if @read_only
+    @pointer[index] = value
+  end
+end
+
+class ::Array(T)
+  def to_slice : Std::Slice::Slice(T)
+    Std::Slice::Slice(T).new(to_unsafe, size)
   end
 end

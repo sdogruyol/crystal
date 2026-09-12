@@ -1,0 +1,290 @@
+# WinError represents Windows System Error Codes.
+
+module std/winerror
+pub import std/errno
+
+struct ::UInt32
+  @[Primitive(:convert)]
+  def to_i32 : Int32
+  end
+
+  @[Primitive(:convert)]
+  def to_u64 : UInt64
+  end
+
+  @[Primitive(:binary)]
+  def ==(other : UInt32) : Bool
+  end
+
+  @[Primitive(:binary)]
+  def !=(other : UInt32) : Bool
+  end
+end
+
+pub enum WinError : UInt32
+  ERROR_SUCCESS                   =    0_u32
+  NO_ERROR                        =    0_u32
+  ERROR_INVALID_FUNCTION          =    1_u32
+  ERROR_FILE_NOT_FOUND            =    2_u32
+  ERROR_PATH_NOT_FOUND            =    3_u32
+  ERROR_TOO_MANY_OPEN_FILES       =    4_u32
+  ERROR_ACCESS_DENIED             =    5_u32
+  ERROR_INVALID_HANDLE            =    6_u32
+  ERROR_ARENA_TRASHED             =    7_u32
+  ERROR_NOT_ENOUGH_MEMORY         =    8_u32
+  ERROR_INVALID_BLOCK             =    9_u32
+  ERROR_BAD_ENVIRONMENT           =   10_u32
+  ERROR_BAD_FORMAT                =   11_u32
+  ERROR_INVALID_ACCESS            =   12_u32
+  ERROR_INVALID_DATA              =   13_u32
+  ERROR_OUTOFMEMORY               =   14_u32
+  ERROR_INVALID_DRIVE             =   15_u32
+  ERROR_CURRENT_DIRECTORY         =   16_u32
+  ERROR_NOT_SAME_DEVICE           =   17_u32
+  ERROR_NO_MORE_FILES             =   18_u32
+  ERROR_WRITE_PROTECT             =   19_u32
+  ERROR_BAD_UNIT                  =   20_u32
+  ERROR_NOT_READY                 =   21_u32
+  ERROR_BAD_COMMAND               =   22_u32
+  ERROR_CRC                       =   23_u32
+  ERROR_BAD_LENGTH                =   24_u32
+  ERROR_SEEK                      =   25_u32
+  ERROR_NOT_DOS_DISK              =   26_u32
+  ERROR_SECTOR_NOT_FOUND          =   27_u32
+  ERROR_OUT_OF_PAPER              =   28_u32
+  ERROR_WRITE_FAULT               =   29_u32
+  ERROR_READ_FAULT                =   30_u32
+  ERROR_GEN_FAILURE               =   31_u32
+  ERROR_SHARING_VIOLATION         =   32_u32
+  ERROR_LOCK_VIOLATION            =   33_u32
+  ERROR_WRONG_DISK                =   34_u32
+  ERROR_SHARING_BUFFER_EXCEEDED   =   36_u32
+  ERROR_HANDLE_EOF                =   38_u32
+  ERROR_HANDLE_DISK_FULL          =   39_u32
+  ERROR_NOT_SUPPORTED             =   50_u32
+  ERROR_REM_NOT_LIST              =   51_u32
+  ERROR_DUP_NAME                  =   52_u32
+  ERROR_BAD_NETPATH               =   53_u32
+  ERROR_NETWORK_BUSY              =   54_u32
+  ERROR_DEV_NOT_EXIST             =   55_u32
+  ERROR_TOO_MANY_CMDS             =   56_u32
+  ERROR_ADAP_HDW_ERR              =   57_u32
+  ERROR_BAD_NET_RESP              =   58_u32
+  ERROR_UNEXP_NET_ERR             =   59_u32
+  ERROR_BAD_REM_ADAP              =   60_u32
+  ERROR_PRINTQ_FULL               =   61_u32
+  ERROR_NO_SPOOL_SPACE            =   62_u32
+  ERROR_PRINT_CANCELLED           =   63_u32
+  ERROR_NETNAME_DELETED           =   64_u32
+  ERROR_NETWORK_ACCESS_DENIED     =   65_u32
+  ERROR_BAD_DEV_TYPE              =   66_u32
+  ERROR_BAD_NET_NAME              =   67_u32
+  ERROR_TOO_MANY_NAMES            =   68_u32
+  ERROR_TOO_MANY_SESS             =   69_u32
+  ERROR_SHARING_PAUSED            =   70_u32
+  ERROR_REQ_NOT_ACCEP             =   71_u32
+  ERROR_REDIR_PAUSED              =   72_u32
+  ERROR_FILE_EXISTS               =   80_u32
+  ERROR_CANNOT_MAKE               =   82_u32
+  ERROR_FAIL_I24                  =   83_u32
+  ERROR_OUT_OF_STRUCTURES         =   84_u32
+  ERROR_ALREADY_ASSIGNED          =   85_u32
+  ERROR_INVALID_PASSWORD          =   86_u32
+  ERROR_INVALID_PARAMETER         =   87_u32
+  ERROR_NET_WRITE_FAULT           =   88_u32
+  ERROR_NO_PROC_SLOTS             =   89_u32
+  ERROR_TOO_MANY_SEMAPHORES       =  100_u32
+  ERROR_EXCL_SEM_ALREADY_OWNED    =  101_u32
+  ERROR_SEM_IS_SET                =  102_u32
+  ERROR_TOO_MANY_SEM_REQUESTS     =  103_u32
+  ERROR_INVALID_AT_INTERRUPT_TIME =  104_u32
+  ERROR_SEM_OWNER_DIED            =  105_u32
+  ERROR_SEM_USER_LIMIT            =  106_u32
+  ERROR_DISK_CHANGE               =  107_u32
+  ERROR_DRIVE_LOCKED              =  108_u32
+  ERROR_BROKEN_PIPE               =  109_u32
+  ERROR_OPEN_FAILED               =  110_u32
+  ERROR_BUFFER_OVERFLOW           =  111_u32
+  ERROR_DISK_FULL                 =  112_u32
+  ERROR_NO_MORE_SEARCH_HANDLES    =  113_u32
+  ERROR_INVALID_TARGET_HANDLE     =  114_u32
+  ERROR_INVALID_CATEGORY          =  117_u32
+  ERROR_INVALID_VERIFY_SWITCH     =  118_u32
+  ERROR_BAD_DRIVER_LEVEL          =  119_u32
+  ERROR_CALL_NOT_IMPLEMENTED      =  120_u32
+  ERROR_SEM_TIMEOUT               =  121_u32
+  ERROR_INSUFFICIENT_BUFFER       =  122_u32
+  ERROR_INVALID_NAME              =  123_u32
+  ERROR_INVALID_LEVEL             =  124_u32
+  ERROR_NO_VOLUME_LABEL           =  125_u32
+  ERROR_MOD_NOT_FOUND             =  126_u32
+  ERROR_PROC_NOT_FOUND            =  127_u32
+  ERROR_WAIT_NO_CHILDREN          =  128_u32
+  ERROR_CHILD_NOT_COMPLETE        =  129_u32
+  ERROR_DIRECT_ACCESS_HANDLE      =  130_u32
+  ERROR_NEGATIVE_SEEK             =  131_u32
+  ERROR_SEEK_ON_DEVICE            =  132_u32
+  ERROR_DIR_NOT_EMPTY             =  145_u32
+  ERROR_SIGNAL_REFUSED            =  156_u32
+  ERROR_NOT_LOCKED                =  158_u32
+  ERROR_BAD_PATHNAME              =  161_u32
+  ERROR_BUSY                      =  170_u32
+  ERROR_ALREADY_EXISTS            =  183_u32
+  ERROR_MORE_DATA                 =  234_u32
+  ERROR_NO_MORE_ITEMS             =  259_u32
+  ERROR_OPERATION_ABORTED         =  995_u32
+  ERROR_IO_INCOMPLETE             =  996_u32
+  ERROR_IO_PENDING                =  997_u32
+  ERROR_NO_SUCH_PRIVILEGE         = 1313_u32
+  ERROR_PRIVILEGE_NOT_HELD        = 1314_u32
+
+  # Winsock error codes
+  WSAEINTR           = 10004_u32
+  WSAEBADF           = 10009_u32
+  WSAEACCES          = 10013_u32
+  WSAEFAULT          = 10014_u32
+  WSAEINVAL          = 10022_u32
+  WSAEMFILE          = 10024_u32
+  WSAEWOULDBLOCK     = 10035_u32
+  WSAEINPROGRESS     = 10036_u32
+  WSAEALREADY        = 10037_u32
+  WSAENOTSOCK        = 10038_u32
+  WSAEDESTADDRREQ    = 10039_u32
+  WSAEMSGSIZE        = 10040_u32
+  WSAEPROTOTYPE      = 10041_u32
+  WSAENOPROTOOPT     = 10042_u32
+  WSAEPROTONOSUPPORT = 10043_u32
+  WSAESOCKTNOSUPPORT = 10044_u32
+  WSAEOPNOTSUPP      = 10045_u32
+  WSAEPFNOSUPPORT    = 10046_u32
+  WSAEAFNOSUPPORT    = 10047_u32
+  WSAEADDRINUSE      = 10048_u32
+  WSAEADDRNOTAVAIL   = 10049_u32
+  WSAENETDOWN        = 10050_u32
+  WSAENETUNREACH     = 10051_u32
+  WSAENETRESET       = 10052_u32
+  WSAECONNABORTED    = 10053_u32
+  WSAECONNRESET      = 10054_u32
+  WSAENOBUFS         = 10055_u32
+  WSAEISCONN         = 10056_u32
+  WSAENOTCONN        = 10057_u32
+  WSAESHUTDOWN       = 10058_u32
+  WSAETOOMANYREFS    = 10059_u32
+  WSAETIMEDOUT       = 10060_u32
+  WSAECONNREFUSED    = 10061_u32
+  WSAELOOP           = 10062_u32
+  WSAENAMETOOLONG    = 10063_u32
+  WSAEHOSTDOWN       = 10064_u32
+  WSAEHOSTUNREACH    = 10065_u32
+  WSAENOTEMPTY       = 10066_u32
+  WSAEPROCLIM        = 10067_u32
+  WSAEUSERS          = 10068_u32
+  WSAEDQUOT          = 10069_u32
+  WSAESTALE          = 10070_u32
+  WSAEREMOTE         = 10071_u32
+
+  def message : String
+    case self
+    when ERROR_SUCCESS              then "The operation completed successfully."
+    when ERROR_INVALID_FUNCTION     then "Incorrect function."
+    when ERROR_FILE_NOT_FOUND       then "The system cannot find the file specified."
+    when ERROR_PATH_NOT_FOUND       then "The system cannot find the path specified."
+    when ERROR_TOO_MANY_OPEN_FILES  then "The system cannot open the file."
+    when ERROR_ACCESS_DENIED        then "Access is denied."
+    when ERROR_INVALID_HANDLE       then "The handle is invalid."
+    when ERROR_NOT_ENOUGH_MEMORY    then "Not enough storage is available to process this command."
+    when ERROR_OUTOFMEMORY          then "Not enough storage is available to complete this operation."
+    when ERROR_NOT_SUPPORTED        then "The request is not supported."
+    when ERROR_FILE_EXISTS          then "The file exists."
+    when ERROR_CANNOT_MAKE          then "The directory or file cannot be created."
+    when ERROR_INVALID_PARAMETER    then "The parameter is incorrect."
+    when ERROR_BROKEN_PIPE          then "The pipe has been ended."
+    when ERROR_DISK_FULL            then "There is not enough space on the disk."
+    when ERROR_CALL_NOT_IMPLEMENTED then "This function is not implemented on this system."
+    when ERROR_SEM_TIMEOUT          then "The semaphore timeout period has expired."
+    when ERROR_INSUFFICIENT_BUFFER  then "The data area passed to a system call is too small."
+    when ERROR_INVALID_NAME         then "The filename, directory name, or volume label syntax is incorrect."
+    when ERROR_MOD_NOT_FOUND        then "The specified module could not be found."
+    when ERROR_PROC_NOT_FOUND       then "The specified procedure could not be found."
+    when ERROR_WAIT_NO_CHILDREN     then "There are no child processes to wait for."
+    when ERROR_CHILD_NOT_COMPLETE   then "The child process has not finished."
+    when ERROR_DIR_NOT_EMPTY        then "The directory is not empty."
+    when ERROR_ALREADY_EXISTS       then "Cannot create a file when that file already exists."
+    when ERROR_MORE_DATA            then "More data is available."
+    when ERROR_NO_MORE_ITEMS        then "No more data is available."
+    when ERROR_OPERATION_ABORTED    then "The I/O operation has been aborted because of either a thread exit or an application request."
+    when ERROR_IO_INCOMPLETE        then "Overlapped I/O event is not in a signaled state."
+    when ERROR_IO_PENDING           then "Overlapped I/O operation is in progress."
+    when ERROR_NO_SUCH_PRIVILEGE    then "A specified privilege does not exist."
+    when ERROR_PRIVILEGE_NOT_HELD   then "A required privilege is not held by the client."
+    when WSAEINTR                   then "A blocking operation was interrupted by a call to WSACancelBlockingCall."
+    when WSAEBADF                   then "The file handle supplied is not valid."
+    when WSAEACCES                  then "An attempt was made to access a socket in a way forbidden by its access permissions."
+    when WSAEFAULT                  then "The system detected an invalid pointer address in attempting to use a pointer argument in a call."
+    when WSAEINVAL                  then "An invalid argument was supplied."
+    when WSAEMFILE                  then "Too many open sockets."
+    when WSAEWOULDBLOCK             then "A non-blocking socket operation could not be completed immediately."
+    when WSAEINPROGRESS             then "A blocking operation is currently executing."
+    when WSAEALREADY                then "An operation was attempted on a non-blocking socket that already had an operation in progress."
+    when WSAENOTSOCK                then "An operation was attempted on something that is not a socket."
+    when WSAEDESTADDRREQ            then "A required address was omitted from an operation on a socket."
+    when WSAEMSGSIZE                then "A message sent on a datagram socket was larger than the internal message buffer or some other network limit, or the buffer used to receive a datagram into was smaller than the datagram itself."
+    when WSAEPROTOTYPE              then "A protocol was specified in the socket function call that does not support the semantics of the socket type requested."
+    when WSAENOPROTOOPT             then "An unknown, invalid, or unsupported option or level was specified in a getsockopt or setsockopt call."
+    when WSAEPROTONOSUPPORT         then "The requested protocol has not been configured into the system, or no implementation for it exists."
+    when WSAESOCKTNOSUPPORT         then "The support for the specified socket type does not exist in this address family."
+    when WSAEOPNOTSUPP              then "The attempted operation is not supported for the type of object referenced."
+    when WSAEPFNOSUPPORT            then "The protocol family has not been configured into the system or no implementation for it exists."
+    when WSAEAFNOSUPPORT            then "An address incompatible with the requested protocol was used."
+    when WSAEADDRINUSE              then "Only one usage of each socket address (protocol/network address/port) is normally permitted."
+    when WSAEADDRNOTAVAIL           then "The requested address is not valid in its context."
+    when WSAENETDOWN                then "A socket operation encountered a dead network."
+    when WSAENETUNREACH             then "A socket operation was attempted to an unreachable network."
+    when WSAENETRESET               then "The connection has been broken due to keep-alive activity detecting a failure while the operation was in progress."
+    when WSAECONNABORTED            then "An established connection was aborted by the software in your host machine."
+    when WSAECONNRESET              then "An existing connection was forcibly closed by the remote host."
+    when WSAENOBUFS                 then "An operation on a socket could not be performed because the system lacked sufficient buffer space or because a queue was full."
+    when WSAEISCONN                 then "A connect request was made on an already connected socket."
+    when WSAENOTCONN                then "A request to send or receive data was disallowed because the socket is not connected and (when sending on a datagram socket using a sendto call) no address was supplied."
+    when WSAESHUTDOWN               then "A request to send or receive data was disallowed because the socket had already been shut down in that direction with a previous shutdown call."
+    when WSAETOOMANYREFS            then "Too many references to some kernel object."
+    when WSAETIMEDOUT               then "A connection attempt failed because the connected party did not properly respond after a period of time, or established connection failed because connected host has failed to respond."
+    when WSAECONNREFUSED            then "No connection could be made because the target machine actively refused it."
+    when WSAELOOP                   then "Cannot translate name."
+    when WSAENAMETOOLONG            then "Name component or name was too long."
+    when WSAEHOSTDOWN               then "A socket operation failed because the destination host was down."
+    when WSAEHOSTUNREACH            then "A socket operation was attempted to an unreachable host."
+    when WSAENOTEMPTY               then "Cannot remove a directory that is not empty."
+    when WSAEUSERS                  then "The Windows Sockets implementation may have a limit on the number of applications that may use it simultaneously."
+    when WSAEDQUOT                  then "Ran out of quota."
+    when WSAESTALE                  then "File handle reference is no longer available."
+    when WSAEREMOTE                 then "Item is not available locally."
+    else                                 "Unknown error"
+    end
+  end
+
+  def self.value : self
+    {% if flag?(:win32) %}
+      # On real win32 target, would invoke GetLastError
+      WinError::ERROR_SUCCESS
+    {% else %}
+      WinError::ERROR_SUCCESS
+    {% end %}
+  end
+
+  def self.value=(winerror : self) : self
+    winerror
+  end
+
+  def self.wsa_value : self
+    WinError::ERROR_SUCCESS
+  end
+
+  def self.wsa_value=(winerror : self) : self
+    winerror
+  end
+
+  def self.from_ntstatus(status : UInt32) : self
+    WinError.new(status)
+  end
+end

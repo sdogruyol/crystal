@@ -1,4 +1,4 @@
-# Implementation of the `crystal tool format` command
+# Implementation of the `iyi tool format` command
 #
 # This is just the command-line part. The formatter
 # logic is in `crystal/tools/formatter.cr`.
@@ -14,10 +14,10 @@ class Iyi::Command
       opts.banner = <<-USAGE
         Usage: #{Command.program_name} tool format [options] [- | file or directory ...]
 
-        Formats iyi and Crystal code in place.
+        Formats iyi code in place.
 
         If a file or directory is omitted,
-        Crystal source files beneath the working directory are formatted.
+        iyi source files beneath the working directory are formatted.
 
         To format STDIN to STDOUT, use '-' in place of any path arguments.
 
@@ -86,9 +86,9 @@ class Iyi::Command
       excludes.map! { |p| Iyi.normalize_path p }
       excludes = excludes - includes
       if files.empty?
-        # iyi: both extensions, because this fork formats both languages and
-        # a directory of `.iyi` files is the ordinary case here.
-        files = Dir["./**/*.cr"] + Dir["./**/*.iyi"]
+        # A command called `iyi` owns `.iyi`. The compatibility command owns
+        # `.cr`; neither command crosses the line during discovery.
+        files = Dir["./**/*.iyi"]
       else
         files.map! { |p| Iyi.normalize_path p }
       end
@@ -123,7 +123,7 @@ class Iyi::Command
         end
       elsif Dir.exists?(filename)
         filename = ::Path[filename.chomp('/')].to_posix
-        filenames = Dir["#{filename}/**/*.cr"] + Dir["#{filename}/**/*.iyi"]
+        filenames = Dir["#{filename}/**/*.iyi"]
         format_many filenames
       else
         print_error "file or directory does not exist: #{filename}"
@@ -150,7 +150,7 @@ class Iyi::Command
         end
       end
     rescue ex : InvalidByteSequenceError
-      print_error "file '#{filename}' is not a valid Crystal source file: #{ex.message}"
+      print_error "file '#{filename}' is not a valid iyi source file: #{ex.message}"
       @status_code = 1
     rescue ex : Iyi::SyntaxException
       print_error "syntax error in '#{filename}:#{ex.line_number}:#{ex.column_number}': #{ex.message}"
@@ -159,9 +159,12 @@ class Iyi::Command
       if @show_backtrace
         ex.inspect_with_backtrace @stderr
         @stderr.puts
-        print_error "couldn't format '#{filename}', please report a bug including the contents of it: https://github.com/crystal-lang/crystal/issues"
+        print_error "couldn't format '#{filename}', please report a bug including the contents of it: https://github.com/sdogruyol/iyi/issues"
       else
-        print_error "there's a bug formatting '#{filename}', to show more information, please run:\n\n  $ crystal tool format --show-backtrace #{@format_stdin ? "-" : "'#{filename}'"}\n"
+        print_error "there's a bug formatting '#{filename}', to show more information, please run:
+
+  $ iyi tool format --show-backtrace #{@format_stdin ? "-" : "'#{filename}'"}
+"
       end
       @status_code = 1
     end

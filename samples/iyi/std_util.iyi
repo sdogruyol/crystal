@@ -1,0 +1,59 @@
+# Standard utilities: CSV, Log, and OptionParser.
+#
+#   ./bin/iyi run samples/iyi/std_util.iyi
+#
+# Demonstrates RFC 4180 CSV generation and parsing with embedded newlines,
+# levelled logging with hierarchy, and command-line option parsing.
+
+module samples/std_util
+
+import std/csv
+using std/csv::{CSV}
+
+import std/log
+using std/log::{Log, Logger, Severity, MemoryBackend}
+
+import std/option_parser
+using std/option_parser::{OptionParser}
+
+# 1. OptionParser
+opt = OptionParser.new
+opt.banner = "Usage: sample [options]"
+verbose = false
+output = "out.csv"
+
+opt.on("-v", "--verbose", "Enable verbose output") { verbose = true }
+opt.on("-o FILE", "--output=FILE", "Output destination") { |f| output = f }
+opt.parse(["-v", "-o", "results.csv"])
+
+puts "OptionParser:"
+puts "  verbose: #{verbose}"
+puts "  output:  #{output}"
+
+# 2. Log
+mem = MemoryBackend.new
+logger = Logger.new("app", Severity::Info, mem)
+db_logger = logger.for("db")
+
+logger.info("application starting")
+logger.debug("hidden debug message")
+db_logger.info("database connected")
+
+puts "Log output:"
+mem.output.each do |line|
+  puts "  #{line}"
+end
+
+# 3. CSV
+csv_text = CSV.build do |b|
+  b.row(["Name", "Notes"])
+  b.row(["Alice", "Includes, comma"])
+  b.row(["Bob", "Multiline\nnotes"])
+end
+
+print csv_text
+
+puts "Parsed CSV rows:"
+CSV.each_row(csv_text) do |row|
+  puts "  #{row.inspect}"
+end

@@ -1,0 +1,57 @@
+# Standard compression library demonstration.
+#
+#   ./bin/iyi run samples/iyi/std_compress.iyi
+#
+# Demonstrates native DEFLATE, Zlib, and Gzip compression/decompression
+# with Adler-32 and CRC-32 checksums in pure iyi.
+
+module samples/std_compress
+
+import std/slice
+using std/slice::{Slice}
+
+import std/compress
+using std/compress::{Deflate, Inflate, Zlib, Gzip, Adler32, CRC32}
+
+# 1. Prepare sample text data
+msg = "DEFLATE compression in pure iyi without external C libraries! " +
+      "DEFLATE compression in pure iyi without external C libraries! " +
+      "DEFLATE compression in pure iyi without external C libraries!"
+
+bytes = Std::Slice::Slice(UInt8).new(msg.bytesize, 0_u8)
+i = 0
+while i < msg.bytesize
+  bytes[i] = msg[i].ord.to_u8
+  i = i + 1
+end
+
+puts "Original payload size: #{bytes.size} bytes"
+
+# 2. Checksums
+puts "Adler-32: #{Adler32.checksum(bytes)}"
+puts "CRC-32:   #{CRC32.checksum(bytes)}"
+
+# 3. DEFLATE levels: Stored (0), Fixed (1), Dynamic (6)
+c0 = Deflate.compress(bytes, 0)
+puts "DEFLATE level 0 (stored):  #{c0.size} bytes"
+raise "level 0 mismatch" unless Inflate.decompress(c0) == bytes
+
+c1 = Deflate.compress(bytes, 1)
+puts "DEFLATE level 1 (fixed):   #{c1.size} bytes"
+raise "level 1 mismatch" unless Inflate.decompress(c1) == bytes
+
+c6 = Deflate.compress(bytes, 6)
+puts "DEFLATE level 6 (dynamic): #{c6.size} bytes"
+raise "level 6 mismatch" unless Inflate.decompress(c6) == bytes
+
+# 4. Zlib container (RFC 1950)
+z = Zlib.compress(bytes, 6)
+puts "Zlib container:            #{z.size} bytes"
+raise "zlib mismatch" unless Zlib.decompress(z) == bytes
+
+# 5. Gzip container (RFC 1952)
+g = Gzip.compress(bytes, 6)
+puts "Gzip container:            #{g.size} bytes"
+raise "gzip mismatch" unless Gzip.decompress(g) == bytes
+
+puts "Compression and decompression verified successfully!"

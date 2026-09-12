@@ -1,0 +1,66 @@
+# HTTP protocol types, wire serialization, chunked encoding, and cookies.
+#
+#   ./bin/iyi run samples/iyi/std_http.iyi
+#
+# Demonstrates:
+# - Constructing requests and responses with case-insensitive headers
+# - Parsing and serializing HTTP/1.1 wire format
+# - Chunked transfer encoding with trailing headers
+# - Cookie and Set-Cookie parsing with SameSite and attributes
+# - Query and form parameters integration
+
+module samples/std_http
+
+import std/http
+using std/http::{Status, Headers, Cookie, Cookies, SameSite, Request, Response, HttpError}
+
+# 1. Building and serializing an HTTP Request
+req = Request.new("POST", "/api/v1/items?filter=active&sort=desc")
+req.headers["Host"] = "api.example.com"
+req.headers["Accept"] = "application/json"
+req.headers["User-Agent"] = "iyi-http/1.0"
+req.body = "{\"item\": \"laptop\", \"qty\": 1}"
+
+# Access query parameters
+puts "Request target: #{req.target}"
+puts "Filter param:   #{req.query_params["filter"]}"
+
+# Serialize to wire format
+wire_req = req.serialize.or_panic
+puts "\n--- Serialized Request ---"
+puts wire_req
+
+# 2. Parsing the wire request back
+parsed_req = Request.parse(wire_req).or_panic
+puts "Parsed Method: #{parsed_req.method}"
+puts "Parsed Host:   #{parsed_req.headers["host"]}"
+puts "Parsed Body:   #{parsed_req.body}"
+
+# 3. Building and serializing a Chunked Response with Trailers
+resp = Response.new(Status::OK, body: "streamed log data line 1\nstreamed log data line 2\n")
+resp.headers["Content-Type"] = "text/plain"
+resp.headers["Server"] = "iyi-web/1.0"
+
+# Set-Cookie with attributes
+cookie = Cookie.new("session", "token_abc123",
+  path: "/",
+  domain: "example.com",
+  secure: true,
+  http_only: true,
+  samesite: SameSite::Strict)
+resp.cookies << cookie
+
+# Trailing headers
+trailers = Headers.new
+trailers["X-Checksum-SHA256"] = "e3b0c44298fc1c149afbf4c8996fb924"
+
+wire_resp = resp.serialize(chunked: true, trailers: trailers).or_panic
+puts "\n--- Serialized Chunked Response with Trailers ---"
+puts wire_resp
+
+# 4. Parsing the chunked response
+parsed_resp = Response.parse(wire_resp).or_panic
+puts "Response Status:   #{parsed_resp.status_code} #{parsed_resp.status_message}"
+puts "Response Body:     #{parsed_resp.body.strip}"
+puts "Response Checksum: #{parsed_resp.trailers["X-Checksum-SHA256"]}"
+puts "Response Cookie:   #{parsed_resp.cookies["session"].value} (SameSite=#{parsed_resp.cookies["session"].samesite.to_s})"

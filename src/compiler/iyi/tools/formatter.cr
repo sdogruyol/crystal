@@ -3483,8 +3483,10 @@ module Iyi
       false
     end
 
-    # iyi: `import app/greeter`, and `pub import app/greeter` — the facade
-    # form, which re-exports what it imports (R-2).
+    # iyi: `import app/greeter`, and `pub import app/greeter`, the R-2 facade
+    # form that re-exports what it imports. Note this node spells the flag
+    # `exported` rather than `exported?`, so a scan for the predicate form
+    # does not find it.
     def visit(node : ImportDecl)
       write_keyword :pub, " " if node.exported
       write_keyword :import, " "

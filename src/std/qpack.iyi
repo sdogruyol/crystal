@@ -1,0 +1,1007 @@
+# Standard QPACK: Header Compression for HTTP/3 (RFC 9204)
+#
+# Implements:
+# - RFC 9204 99-entry Static Table (Appendix A)
+# - Dynamic Table with FIFO eviction by size (Section 3.2)
+# - Unidirectional Encoder Stream instructions (Section 4.3):
+#     * Set Dynamic Table Capacity (4.3.1)
+#     * Insert with Name Reference (4.3.2)
+#     * Insert with Literal Name (4.3.3)
+#     * Duplicate (4.3.4)
+# - Unidirectional Decoder Stream instructions (Section 4.4):
+#     * Section Acknowledgment (4.4.1)
+#     * Stream Cancellation (4.4.2)
+#     * Insert Count Increment (4.4.3)
+# - Request/Response Stream Field Line representations (Section 4.5):
+#     * Encoded Field Section Prefix (4.5.1): Required Insert Count and Base
+#     * Indexed Field Line (4.5.2)
+#     * Indexed Field Line with Post-Base Index (4.5.3)
+#     * Literal Field Line with Name Reference (4.5.4)
+#     * Literal Field Line with Post-Base Name Reference (4.5.5)
+#     * Literal Field Line with Literal Name (4.5.6)
+# - Out-of-order stream handling:
+#     * Blocked stream tracking and limit enforcement (SETTINGS_QPACK_BLOCKED_STREAMS)
+#     * Immediate detection and rejection of unsatisfiable Required Insert Count
+#     * Automatic resolution and decoding when table entries arrive
+# - Security defenses:
+#     * Decompression bomb protection: bounds decoded uncompressed header size
+#     * Dynamic table capacity limit enforcement (SETTINGS_QPACK_MAX_TABLE_CAPACITY)
+#     * Never-indexed (N-bit) protection preserved
+#
+# Primitives:
+# - Prefix integers and Canonical Huffman encoding are reused from RFC 7541
+#   via std/hpack (owned by StdHpack).
+
+module std/qpack
+
+import std/traits
+import std/slice
+import std/text
+import std/hpack
+
+using std/slice::{Slice, Bytes}
+using std/hpack::{Integer, Huffman, HpackError}
+
+# ---------------------------------------------------------------------------
+# Qpack Error Codes and Error Structure
+# ---------------------------------------------------------------------------
+
+pub QPACK_DECOMPRESSION_FAILED = 0x0200_u64
+pub QPACK_ENCODER_STREAM_ERROR = 0x0201_u64
+pub QPACK_DECODER_STREAM_ERROR = 0x0202_u64
+
+pub struct QpackError
+  getter code : UInt64
+  getter message : String
+
+  def initialize(@code : UInt64, @message : String)
+  end
+
+  def to_s : String
+    "QpackError(0x#{@code.to_s}): #{@message}"
+  end
+end
+
+# ---------------------------------------------------------------------------
+# TableEntry and FieldLine
+# ---------------------------------------------------------------------------
+
+pub struct TableEntry
+  getter name : String
+  getter value : String
+
+  def initialize(@name : String, @value : String)
+  end
+
+  def size : Int32
+    @name.bytesize + @value.bytesize + 32
+  end
+end
+
+pub struct FieldLine
+  getter name : String
+  getter value : String
+  getter never_index : Bool
+
+  def initialize(@name : String, @value : String, @never_index : Bool = false)
+  end
+
+  def size : Int32
+    @name.bytesize + @value.bytesize + 32
+  end
+
+  def ==(other : FieldLine) : Bool
+    @name == other.name && @value == other.value && @never_index == other.never_index
+  end
+
+  def to_s : String
+    "(#{@name}: #{@value})"
+  end
+end
+
+pub struct BlockedStream
+  getter stream_id : UInt64
+  getter req_insert_count : Int64
+  getter base : Int64
+  getter payload : Bytes
+  getter payload_offset : Int32
+
+  def initialize(@stream_id : UInt64, @req_insert_count : Int64, @base : Int64, @payload : Bytes, @payload_offset : Int32)
+  end
+end
+
+# ---------------------------------------------------------------------------
+# Static Table (RFC 9204 Appendix A, 99 entries)
+# ---------------------------------------------------------------------------
+pub STATIC_TABLE = [
+  TableEntry.new(":authority", ""),
+  TableEntry.new(":path", "/"),
+  TableEntry.new("age", "0"),
+  TableEntry.new("content-disposition", ""),
+  TableEntry.new("content-length", "0"),
+  TableEntry.new("cookie", ""),
+  TableEntry.new("date", ""),
+  TableEntry.new("etag", ""),
+  TableEntry.new("if-modified-since", ""),
+  TableEntry.new("if-none-match", ""),
+  TableEntry.new("last-modified", ""),
+  TableEntry.new("link", ""),
+  TableEntry.new("location", ""),
+  TableEntry.new("referer", ""),
+  TableEntry.new("set-cookie", ""),
+  TableEntry.new(":method", "CONNECT"),
+  TableEntry.new(":method", "DELETE"),
+  TableEntry.new(":method", "GET"),
+  TableEntry.new(":method", "HEAD"),
+  TableEntry.new(":method", "OPTIONS"),
+  TableEntry.new(":method", "POST"),
+  TableEntry.new(":method", "PUT"),
+  TableEntry.new(":scheme", "http"),
+  TableEntry.new(":scheme", "https"),
+  TableEntry.new(":status", "103"),
+  TableEntry.new(":status", "200"),
+  TableEntry.new(":status", "304"),
+  TableEntry.new(":status", "404"),
+  TableEntry.new(":status", "503"),
+  TableEntry.new("accept", "*/*"),
+  TableEntry.new("accept", "application/dns-message"),
+  TableEntry.new("accept-encoding", "gzip, deflate, br"),
+  TableEntry.new("accept-ranges", "bytes"),
+  TableEntry.new("access-control-allow-headers", "cache-control"),
+  TableEntry.new("access-control-allow-headers", "content-type"),
+  TableEntry.new("access-control-allow-origin", "*"),
+  TableEntry.new("cache-control", "max-age=0"),
+  TableEntry.new("cache-control", "max-age=2592000"),
+  TableEntry.new("cache-control", "max-age=604800"),
+  TableEntry.new("cache-control", "no-cache"),
+  TableEntry.new("cache-control", "no-store"),
+  TableEntry.new("cache-control", "public, max-age=31536000"),
+  TableEntry.new("content-encoding", "br"),
+  TableEntry.new("content-encoding", "gzip"),
+  TableEntry.new("content-type", "application/dns-message"),
+  TableEntry.new("content-type", "application/javascript"),
+  TableEntry.new("content-type", "application/json"),
+  TableEntry.new("content-type", "application/x-www-form-urlencoded"),
+  TableEntry.new("content-type", "image/gif"),
+  TableEntry.new("content-type", "image/jpeg"),
+  TableEntry.new("content-type", "image/png"),
+  TableEntry.new("content-type", "text/css"),
+  TableEntry.new("content-type", "text/html;charset=utf-8"),
+  TableEntry.new("content-type", "text/plain"),
+  TableEntry.new("content-type", "text/plain;charset=utf-8"),
+  TableEntry.new("range", "bytes=0-"),
+  TableEntry.new("strict-transport-security", "max-age=31536000"),
+  TableEntry.new("strict-transport-security", "max-age=31536000;includesubdomains"),
+  TableEntry.new("strict-transport-security", "max-age=31536000;includesubdomains;preload"),
+  TableEntry.new("vary", "accept-encoding"),
+  TableEntry.new("vary", "origin"),
+  TableEntry.new("x-content-type-options", "nosniff"),
+  TableEntry.new("x-xss-protection", "1; mode=block"),
+  TableEntry.new(":status", "100"),
+  TableEntry.new(":status", "204"),
+  TableEntry.new(":status", "206"),
+  TableEntry.new(":status", "302"),
+  TableEntry.new(":status", "400"),
+  TableEntry.new(":status", "403"),
+  TableEntry.new(":status", "421"),
+  TableEntry.new(":status", "425"),
+  TableEntry.new(":status", "500"),
+  TableEntry.new("accept-language", ""),
+  TableEntry.new("access-control-allow-credentials", "FALSE"),
+  TableEntry.new("access-control-allow-credentials", "TRUE"),
+  TableEntry.new("access-control-allow-headers", "*"),
+  TableEntry.new("access-control-allow-methods", "get"),
+  TableEntry.new("access-control-allow-methods", "get, post, options"),
+  TableEntry.new("access-control-allow-methods", "options"),
+  TableEntry.new("access-control-expose-headers", "content-length"),
+  TableEntry.new("access-control-request-headers", "content-type"),
+  TableEntry.new("access-control-request-method", "get"),
+  TableEntry.new("access-control-request-method", "post"),
+  TableEntry.new("alt-svc", "clear"),
+  TableEntry.new("authorization", ""),
+  TableEntry.new("content-security-policy", "script-src 'none';object-src 'none';base-uri 'none'"),
+  TableEntry.new("early-data", "1"),
+  TableEntry.new("expect-ct", ""),
+  TableEntry.new("forwarded", ""),
+  TableEntry.new("if-range", ""),
+  TableEntry.new("origin", ""),
+  TableEntry.new("purpose", "prefetch"),
+  TableEntry.new("server", ""),
+  TableEntry.new("timing-allow-origin", "*"),
+  TableEntry.new("upgrade-insecure-requests", "1"),
+  TableEntry.new("user-agent", ""),
+  TableEntry.new("x-forwarded-for", ""),
+  TableEntry.new("x-frame-options", "deny"),
+  TableEntry.new("x-frame-options", "sameorigin"),
+]
+
+# ---------------------------------------------------------------------------
+pub class Qpack
+  STATIC_TABLE = Std::Qpack::STATIC_TABLE
+
+  # Static Table Lookups
+  # ---------------------------------------------------------------------------
+
+  def self.get_static(index : Int32) : TableEntry?
+    if index >= 0 && index < STATIC_TABLE.size
+      STATIC_TABLE[index]
+    else
+      nil
+    end
+  end
+
+  def self.find_static(name : String, value : String) : Int32?
+    i = 0
+    while i < STATIC_TABLE.size
+      e = STATIC_TABLE[i]
+      if e.name == name && e.value == value
+        return i
+      end
+      i = i + 1
+    end
+    nil
+  end
+
+  def self.find_static_name(name : String) : Int32?
+    i = 0
+    while i < STATIC_TABLE.size
+      e = STATIC_TABLE[i]
+      if e.name == name
+        return i
+      end
+      i = i + 1
+    end
+    nil
+  end
+
+  # ---------------------------------------------------------------------------
+  # String Literal and Prefix Codecs
+  # ---------------------------------------------------------------------------
+
+  def self.encode_string(str : String, prefix_bits : Int32, prefix_byte : UInt8, buffer : Array(UInt8), use_huffman : Bool = false) : Nil
+    huff_len = Huffman.encoded_size(str)
+    if use_huffman && huff_len < str.bytesize
+      flag = (1_u8.unsafe_shl(prefix_bits - 1))
+      Integer.encode(huff_len.to_u64, prefix_bits - 1, prefix_byte | flag, buffer)
+      Huffman.encode(str, buffer)
+    else
+      Integer.encode(str.bytesize.to_u64, prefix_bits - 1, prefix_byte, buffer)
+      i = 0
+      while i < str.bytesize
+        buffer << str.to_unsafe[i]
+        i = i + 1
+      end
+    end
+  end
+
+  def self.decode_string(bytes : Bytes, offset : Int32, prefix_bits : Int32) : Tuple(String, Int32) | QpackError
+    if offset >= bytes.size
+      return QpackError.new(QPACK_DECOMPRESSION_FAILED, "Unexpected EOF decoding string prefix")
+    end
+    flag = (1_u8.unsafe_shl(prefix_bits - 1))
+    huffman = (bytes[offset] & flag) != 0_u8
+
+    res_len = Integer.decode(bytes, offset, prefix_bits - 1)
+    if res_len.is_a?(HpackError)
+      return QpackError.new(QPACK_DECOMPRESSION_FAILED, "Integer decode error in string length: #{res_len.message}")
+    end
+    length = res_len[0].to_i32
+    cur_offset = res_len[1]
+
+    if cur_offset + length > bytes.size
+      return QpackError.new(QPACK_DECOMPRESSION_FAILED, "Unexpected EOF reading string literal of length #{length}")
+    end
+
+    if huffman
+      str_res = Huffman.decode(bytes, cur_offset, length)
+      if str_res.is_a?(HpackError)
+        return QpackError.new(QPACK_DECOMPRESSION_FAILED, "Huffman decode error: #{str_res.message}")
+      end
+      {str_res, cur_offset + length}
+    else
+      str = String.new(length) do |buf|
+        buf.copy_from((bytes + cur_offset).to_unsafe, length)
+      end
+      {str, cur_offset + length}
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Prefix Encoding and Decoding (RFC 9204 Section 4.5.1)
+  # ---------------------------------------------------------------------------
+
+  def self.encode_prefix(req_insert_count : Int64, base : Int64, max_table_capacity : Int32, buffer : Array(UInt8)) : Nil
+    max_entries = max_table_capacity // 32
+    if req_insert_count == 0_i64
+      Integer.encode(0_u64, 8, 0_u8, buffer)
+      Integer.encode(0_u64, 7, 0_u8, buffer)
+    else
+      full_range = (2 * max_entries).to_i64
+      enc_insert_count = (req_insert_count % full_range) + 1_i64
+      Integer.encode(enc_insert_count.to_u64, 8, 0_u8, buffer)
+      if base >= req_insert_count
+        delta_base = (base - req_insert_count).to_u64
+        Integer.encode(delta_base, 7, 0_u8, buffer)
+      else
+        delta_base = (req_insert_count - base - 1_i64).to_u64
+        Integer.encode(delta_base, 7, 0x80_u8, buffer)
+      end
+    end
+  end
+
+  def self.decode_prefix(bytes : Bytes, offset : Int32, total_inserts : Int64, max_table_capacity : Int32) : Tuple(Int64, Int64, Int32) | QpackError
+    res_ric = Integer.decode(bytes, offset, 8)
+    if res_ric.is_a?(HpackError)
+      return QpackError.new(QPACK_DECOMPRESSION_FAILED, "Decode ReqInsertCount error: #{res_ric.message}")
+    end
+    enc_ric = res_ric[0].to_i64
+    offset = res_ric[1]
+
+    max_entries = max_table_capacity // 32
+    full_range = (2 * max_entries).to_i64
+
+    req_insert_count = 0_i64
+    if enc_ric == 0_i64
+      req_insert_count = 0_i64
+    else
+      if full_range == 0_i64 || enc_ric > full_range
+        return QpackError.new(QPACK_DECOMPRESSION_FAILED, "Invalid EncodedInsertCount: #{enc_ric}")
+      end
+      max_value = total_inserts + max_entries.to_i64
+      max_wrapped = (max_value // full_range) * full_range
+      req_insert_count = max_wrapped + enc_ric - 1_i64
+      if req_insert_count > max_value
+        if req_insert_count <= full_range
+          return QpackError.new(QPACK_DECOMPRESSION_FAILED, "EncodedInsertCount #{enc_ric} exceeds max value #{max_value}")
+        end
+        req_insert_count = req_insert_count - full_range
+      end
+      if req_insert_count == 0_i64
+        return QpackError.new(QPACK_DECOMPRESSION_FAILED, "Decoded ReqInsertCount is zero from non-zero EncodedInsertCount")
+      end
+    end
+
+    if offset >= bytes.size
+      return QpackError.new(QPACK_DECOMPRESSION_FAILED, "Unexpected EOF decoding Base")
+    end
+    sign = (bytes[offset] & 0x80_u8) != 0_u8
+    res_delta = Integer.decode(bytes, offset, 7)
+    if res_delta.is_a?(HpackError)
+      return QpackError.new(QPACK_DECOMPRESSION_FAILED, "Decode DeltaBase error: #{res_delta.message}")
+    end
+    delta_base = res_delta[0].to_i64
+    offset = res_delta[1]
+
+    base = 0_i64
+    if !sign
+      base = req_insert_count + delta_base
+    else
+      if req_insert_count <= delta_base
+        return QpackError.new(QPACK_DECOMPRESSION_FAILED, "Invalid Base: ReqInsertCount (#{req_insert_count}) <= DeltaBase (#{delta_base}) with sign=1")
+      end
+      base = req_insert_count - delta_base - 1_i64
+    end
+
+    {req_insert_count, base, offset}
+  end
+
+  # ---------------------------------------------------------------------------
+  # Decoder Stream Instruction Encoders (RFC 9204 Section 4.4)
+  # ---------------------------------------------------------------------------
+
+  def self.encode_section_ack(stream_id : UInt64, buffer : Array(UInt8)) : Nil
+    Integer.encode(stream_id, 7, 0x80_u8, buffer)
+  end
+
+  def self.encode_stream_cancel(stream_id : UInt64, buffer : Array(UInt8)) : Nil
+    Integer.encode(stream_id, 6, 0x40_u8, buffer)
+  end
+
+  def self.encode_insert_count_increment(increment : UInt64, buffer : Array(UInt8)) : Nil
+    Integer.encode(increment, 6, 0x00_u8, buffer)
+  end
+
+  # ---------------------------------------------------------------------------
+end
+
+# Dynamic Table (RFC 9204 Section 3.2)
+# ---------------------------------------------------------------------------
+
+pub class DynamicTable
+  getter capacity : Int32
+  getter max_capacity : Int32
+  getter size : Int32
+  getter insert_count : Int64
+  getter dropped_count : Int64
+  getter entries : Array(TableEntry)
+
+  def initialize(@max_capacity : Int32 = 0)
+    @capacity = 0
+    @size = 0
+    @insert_count = 0_i64
+    @dropped_count = 0_i64
+    @entries = [] of TableEntry
+  end
+
+  def max_entries : Int32
+    @max_capacity // 32
+  end
+
+  def set_capacity(new_cap : Int32) : Nil | QpackError
+    if new_cap > @max_capacity
+      return QpackError.new(QPACK_ENCODER_STREAM_ERROR, "Capacity #{new_cap} exceeds max table capacity #{@max_capacity}")
+    end
+    @capacity = new_cap
+    evict_to_capacity
+    nil
+  end
+
+  private def evict_to_capacity
+    while @size > @capacity && !@entries.empty?
+      evicted = @entries.shift
+      @size = @size - evicted.size
+      @dropped_count = @dropped_count + 1_i64
+    end
+  end
+
+  def insert(name : String, value : String) : Nil | QpackError
+    entry = TableEntry.new(name, value)
+    entry_sz = entry.size
+    if entry_sz > @capacity
+      while !@entries.empty?
+        evicted = @entries.shift
+        @size = @size - evicted.size
+        @dropped_count = @dropped_count + 1_i64
+      end
+      @insert_count = @insert_count + 1_i64
+      @dropped_count = @insert_count
+      return nil
+    end
+
+    while (@size + entry_sz) > @capacity && !@entries.empty?
+      evicted = @entries.shift
+      @size = @size - evicted.size
+      @dropped_count = @dropped_count + 1_i64
+    end
+
+    @entries << entry
+    @size = @size + entry_sz
+    @insert_count = @insert_count + 1_i64
+    nil
+  end
+
+  def duplicate(rel_index : Int64) : Nil | QpackError
+    abs_index = @insert_count - rel_index - 1_i64
+    entry = get_by_absolute(abs_index)
+    if entry.nil?
+      return QpackError.new(QPACK_ENCODER_STREAM_ERROR, "Duplicate of invalid or evicted index: #{abs_index}")
+    end
+    insert(entry.name, entry.value)
+  end
+
+  def get_by_absolute(abs_index : Int64) : TableEntry?
+    if abs_index < @dropped_count || abs_index >= @insert_count
+      return nil
+    end
+    idx = (abs_index - @dropped_count).to_i32
+    if idx >= 0 && idx < @entries.size
+      @entries[idx]
+    else
+      nil
+    end
+  end
+
+  def get_by_relative(base : Int64, rel_index : Int64) : TableEntry?
+    abs_index = base - 1_i64 - rel_index
+    get_by_absolute(abs_index)
+  end
+
+  def get_by_post_base(base : Int64, post_base_index : Int64) : TableEntry?
+    abs_index = base + post_base_index
+    get_by_absolute(abs_index)
+  end
+
+  def find(name : String, value : String) : Int64?
+    i = @entries.size - 1
+    while i >= 0
+      e = @entries[i]
+      if e.name == name && e.value == value
+        return @dropped_count + i.to_i64
+      end
+      i = i - 1
+    end
+    nil
+  end
+
+  def find_name(name : String) : Int64?
+    i = @entries.size - 1
+    while i >= 0
+      if @entries[i].name == name
+        return @dropped_count + i.to_i64
+      end
+      i = i - 1
+    end
+    nil
+  end
+end
+
+# ---------------------------------------------------------------------------
+# Qpack Encoder (RFC 9204 Section 2.1, 4.3, 4.5)
+# ---------------------------------------------------------------------------
+
+pub class Encoder
+  getter dynamic_table : DynamicTable
+  getter max_table_capacity : Int32
+  getter max_blocked_streams : Int32
+  getter known_received_count : Int64
+  @stream_references : Hash(UInt64, Array(Int64))
+
+  def initialize(@max_table_capacity : Int32 = 0, @max_blocked_streams : Int32 = 0)
+    @dynamic_table = DynamicTable.new(@max_table_capacity)
+    @known_received_count = 0_i64
+    @stream_references = Hash(UInt64, Array(Int64)).new
+  end
+
+  def set_capacity(capacity : Int32, buffer : Array(UInt8)) : Nil | QpackError
+    err = @dynamic_table.set_capacity(capacity)
+    return err if err
+    Integer.encode(capacity.to_u64, 5, 0x20_u8, buffer)
+    nil
+  end
+
+  def insert_with_name_ref(static_ref : Bool, name_index : UInt64, value : String, buffer : Array(UInt8), use_huffman : Bool = false) : Nil | QpackError
+    name = ""
+    if static_ref
+      entry = Qpack.get_static(name_index.to_i32)
+      return QpackError.new(QPACK_ENCODER_STREAM_ERROR, "Invalid static name index: #{name_index}") unless entry
+      name = entry.name
+    else
+      abs_idx = @dynamic_table.insert_count - name_index.to_i64 - 1_i64
+      entry = @dynamic_table.get_by_absolute(abs_idx)
+      return QpackError.new(QPACK_ENCODER_STREAM_ERROR, "Invalid dynamic name index: #{name_index}") unless entry
+      name = entry.name
+    end
+
+    err = @dynamic_table.insert(name, value)
+    return err if err
+
+    prefix_byte = static_ref ? 0xc0_u8 : 0x80_u8
+    Integer.encode(name_index, 6, prefix_byte, buffer)
+    Qpack.encode_string(value, 8, 0_u8, buffer, use_huffman: use_huffman)
+    nil
+  end
+
+  def insert_with_literal_name(name : String, value : String, buffer : Array(UInt8), use_huffman : Bool = false) : Nil | QpackError
+    err = @dynamic_table.insert(name, value)
+    return err if err
+
+    Qpack.encode_string(name, 6, 0x40_u8, buffer, use_huffman: use_huffman)
+    Qpack.encode_string(value, 8, 0_u8, buffer, use_huffman: use_huffman)
+    nil
+  end
+
+  def duplicate(rel_index : UInt64, buffer : Array(UInt8)) : Nil | QpackError
+    err = @dynamic_table.duplicate(rel_index.to_i64)
+    return err if err
+
+    Integer.encode(rel_index, 5, 0x00_u8, buffer)
+    nil
+  end
+
+  def encode(stream_id : UInt64, fields : Array(FieldLine), encoder_stream : Array(UInt8), field_section : Array(UInt8), allow_indexing : Bool = true, use_huffman : Bool = false, base : Int64? = nil) : Nil | QpackError
+    actual_base = base ? base : @dynamic_table.insert_count
+    req_insert_count = 0_i64
+    stream_buf = [] of UInt8
+    referenced_indices = [] of Int64
+
+    fields.each do |field|
+      # 1. Exact match in static table
+      s_idx = Qpack.find_static(field.name, field.value)
+      if s_idx
+        # Indexed Field Line (Static Table): 11 + 6-bit index
+        Integer.encode(s_idx.to_u64, 6, 0xc0_u8, stream_buf)
+        next
+      end
+
+      # 2. Exact match in dynamic table
+      d_idx = @dynamic_table.find(field.name, field.value)
+      if d_idx
+        req_insert_count = d_idx + 1_i64 if d_idx + 1_i64 > req_insert_count
+        referenced_indices << d_idx
+        encode_dynamic_indexed(stream_buf, actual_base, d_idx)
+        next
+      end
+
+      # 3. Dynamic table insertion if allowed
+      if allow_indexing && !field.never_index && @dynamic_table.capacity > 0 && field.size <= @dynamic_table.capacity
+        s_name_idx = Qpack.find_static_name(field.name)
+        if s_name_idx
+          err = insert_with_name_ref(true, s_name_idx.to_u64, field.value, encoder_stream, use_huffman: use_huffman)
+          return err if err
+        else
+          d_name_idx = @dynamic_table.find_name(field.name)
+          if d_name_idx
+            rel_name_idx = (@dynamic_table.insert_count - d_name_idx - 1_i64).to_u64
+            err = insert_with_name_ref(false, rel_name_idx, field.value, encoder_stream, use_huffman: use_huffman)
+            return err if err
+          else
+            err = insert_with_literal_name(field.name, field.value, encoder_stream, use_huffman: use_huffman)
+            return err if err
+          end
+        end
+
+        new_abs_idx = @dynamic_table.insert_count - 1_i64
+        req_insert_count = new_abs_idx + 1_i64 if new_abs_idx + 1_i64 > req_insert_count
+        referenced_indices << new_abs_idx
+        encode_dynamic_indexed(stream_buf, actual_base, new_abs_idx)
+        next
+      end
+
+      # 4. Literal field line
+      s_name_idx = Qpack.find_static_name(field.name)
+      if s_name_idx
+        # Literal with Static Name Reference (Figure 15)
+        # 01 (0x40) + N (0x20) + T=1 (0x10) + 4-bit name index
+        prefix_byte = 0x50_u8 | (field.never_index ? 0x20_u8 : 0x00_u8)
+        Integer.encode(s_name_idx.to_u64, 4, prefix_byte, stream_buf)
+        Qpack.encode_string(field.value, 8, 0_u8, stream_buf, use_huffman: use_huffman)
+      else
+        d_name_idx = @dynamic_table.find_name(field.name)
+        if d_name_idx
+          req_insert_count = d_name_idx + 1_i64 if d_name_idx + 1_i64 > req_insert_count
+          referenced_indices << d_name_idx
+          if d_name_idx < actual_base
+            rel_idx = (actual_base - 1_i64 - d_name_idx).to_u64
+            prefix_byte = 0x40_u8 | (field.never_index ? 0x20_u8 : 0x00_u8)
+            Integer.encode(rel_idx, 4, prefix_byte, stream_buf)
+            Qpack.encode_string(field.value, 8, 0_u8, stream_buf, use_huffman: use_huffman)
+          else
+            post_base_idx = (d_name_idx - actual_base).to_u64
+            prefix_byte = field.never_index ? 0x08_u8 : 0x00_u8
+            Integer.encode(post_base_idx, 3, prefix_byte, stream_buf)
+            Qpack.encode_string(field.value, 8, 0_u8, stream_buf, use_huffman: use_huffman)
+          end
+        else
+          # Literal with Literal Name (Figure 17)
+          # 001 (0x20) + N (0x10) + Name length (4-bit prefix)
+          prefix_byte = 0x20_u8 | (field.never_index ? 0x10_u8 : 0x00_u8)
+          Qpack.encode_string(field.name, 4, prefix_byte, stream_buf, use_huffman: use_huffman)
+          Qpack.encode_string(field.value, 8, 0_u8, stream_buf, use_huffman: use_huffman)
+        end
+      end
+    end
+
+    # Prepend prefix
+    Qpack.encode_prefix(req_insert_count, actual_base, @max_table_capacity, field_section)
+    stream_buf.each { |b| field_section << b }
+
+    if req_insert_count > 0_i64
+      @stream_references[stream_id] = referenced_indices
+    end
+    nil
+  end
+
+  private def encode_dynamic_indexed(buffer : Array(UInt8), base : Int64, abs_idx : Int64) : Nil
+    if abs_idx < base
+      rel_idx = (base - 1_i64 - abs_idx).to_u64
+      # Indexed Field Line (Dynamic Table): 10 + 6-bit index
+      Integer.encode(rel_idx, 6, 0x80_u8, buffer)
+    else
+      post_base_idx = (abs_idx - base).to_u64
+      # Indexed Field Line with Post-Base Index: 0001 + 4-bit index
+      Integer.encode(post_base_idx, 4, 0x10_u8, buffer)
+    end
+  end
+
+  def process_decoder_stream(bytes : Bytes, offset : Int32 = 0) : Int32 | QpackError
+    cur_offset = offset
+    while cur_offset < bytes.size
+      b = bytes[cur_offset]
+      if (b & 0x80_u8) != 0_u8
+        # Section Acknowledgment: 1 + 7-bit stream ID
+        res = Integer.decode(bytes, cur_offset, 7)
+        return QpackError.new(QPACK_DECODER_STREAM_ERROR, res.message) if res.is_a?(HpackError)
+        stream_id = res[0]
+        cur_offset = res[1]
+        @stream_references.delete(stream_id)
+      elsif (b & 0x40_u8) != 0_u8
+        # Stream Cancellation: 01 + 6-bit stream ID
+        res = Integer.decode(bytes, cur_offset, 6)
+        return QpackError.new(QPACK_DECODER_STREAM_ERROR, res.message) if res.is_a?(HpackError)
+        stream_id = res[0]
+        cur_offset = res[1]
+        @stream_references.delete(stream_id)
+      else
+        # Insert Count Increment: 00 + 6-bit increment
+        res = Integer.decode(bytes, cur_offset, 6)
+        return QpackError.new(QPACK_DECODER_STREAM_ERROR, res.message) if res.is_a?(HpackError)
+        inc = res[0].to_i64
+        cur_offset = res[1]
+        if inc == 0_i64 || (@known_received_count + inc) > @dynamic_table.insert_count
+          return QpackError.new(QPACK_DECODER_STREAM_ERROR, "Invalid increment: #{inc}")
+        end
+        @known_received_count = @known_received_count + inc
+      end
+    end
+    cur_offset
+  end
+end
+
+# ---------------------------------------------------------------------------
+# Qpack Decoder (RFC 9204 Section 2.2, 4.4, 4.5)
+# ---------------------------------------------------------------------------
+
+pub class Decoder
+  getter dynamic_table : DynamicTable
+  getter max_table_capacity : Int32
+  getter max_blocked_streams : Int32
+  getter max_header_list_size : Int32
+  getter blocked_streams : Array(BlockedStream)
+  getter acknowledged_streams : Array(UInt64)
+
+  def initialize(@max_table_capacity : Int32 = 0, @max_blocked_streams : Int32 = 0, @max_header_list_size : Int32 = 65536)
+    @dynamic_table = DynamicTable.new(@max_table_capacity)
+    @blocked_streams = [] of BlockedStream
+    @acknowledged_streams = [] of UInt64
+  end
+
+  def blocked_streams_count : Int32
+    @blocked_streams.size
+  end
+
+  def is_stream_blocked?(stream_id : UInt64) : Bool
+    i = 0
+    while i < @blocked_streams.size
+      return true if @blocked_streams[i].stream_id == stream_id
+      i = i + 1
+    end
+    false
+  end
+
+  def cancel_stream(stream_id : UInt64, decoder_stream : Array(UInt8)) : Nil
+    new_blocked = [] of BlockedStream
+    @blocked_streams.each do |st|
+      if st.stream_id != stream_id
+        new_blocked << st
+      end
+    end
+    @blocked_streams = new_blocked
+    Qpack.encode_stream_cancel(stream_id, decoder_stream)
+  end
+
+  def process_encoder_stream(bytes : Bytes, offset : Int32 = 0) : Int32 | QpackError
+    cur_offset = offset
+    while cur_offset < bytes.size
+      b = bytes[cur_offset]
+      if (b & 0x80_u8) != 0_u8
+        # Insert with Name Reference (4.3.2): 1 + T + 6-bit index
+        static_ref = (b & 0x40_u8) != 0_u8
+        res_idx = Integer.decode(bytes, cur_offset, 6)
+        return QpackError.new(QPACK_ENCODER_STREAM_ERROR, res_idx.message) if res_idx.is_a?(HpackError)
+        name_idx = res_idx[0]
+        cur_offset = res_idx[1]
+
+        res_str = Qpack.decode_string(bytes, cur_offset, 8)
+        return res_str if res_str.is_a?(QpackError)
+        val = res_str[0]
+        cur_offset = res_str[1]
+
+        name = ""
+        if static_ref
+          entry = Qpack.get_static(name_idx.to_i32)
+          return QpackError.new(QPACK_ENCODER_STREAM_ERROR, "Invalid static name index: #{name_idx}") unless entry
+          name = entry.name
+        else
+          abs_idx = @dynamic_table.insert_count - name_idx.to_i64 - 1_i64
+          entry = @dynamic_table.get_by_absolute(abs_idx)
+          return QpackError.new(QPACK_ENCODER_STREAM_ERROR, "Invalid dynamic name index: #{name_idx}") unless entry
+          name = entry.name
+        end
+
+        err = @dynamic_table.insert(name, val)
+        return err if err
+      elsif (b & 0x40_u8) != 0_u8
+        # Insert with Literal Name (4.3.3): 01 + H + 5-bit length
+        res_name = Qpack.decode_string(bytes, cur_offset, 6)
+        return res_name if res_name.is_a?(QpackError)
+        name = res_name[0]
+        cur_offset = res_name[1]
+
+        res_val = Qpack.decode_string(bytes, cur_offset, 8)
+        return res_val if res_val.is_a?(QpackError)
+        val = res_val[0]
+        cur_offset = res_val[1]
+
+        err = @dynamic_table.insert(name, val)
+        return err if err
+      elsif (b & 0x20_u8) != 0_u8
+        # Set Dynamic Table Capacity (4.3.1): 001 + 5-bit capacity
+        res_cap = Integer.decode(bytes, cur_offset, 5)
+        return QpackError.new(QPACK_ENCODER_STREAM_ERROR, res_cap.message) if res_cap.is_a?(HpackError)
+        cap = res_cap[0].to_i32
+        cur_offset = res_cap[1]
+
+        err = @dynamic_table.set_capacity(cap)
+        return err if err
+      else
+        # Duplicate (4.3.4): 000 + 5-bit index
+        res_dup = Integer.decode(bytes, cur_offset, 5)
+        return QpackError.new(QPACK_ENCODER_STREAM_ERROR, res_dup.message) if res_dup.is_a?(HpackError)
+        rel_idx = res_dup[0].to_i64
+        cur_offset = res_dup[1]
+
+        err = @dynamic_table.duplicate(rel_idx)
+        return err if err
+      end
+    end
+    cur_offset
+  end
+
+  def decode_field_section(stream_id : UInt64, payload : Bytes, decoder_stream : Array(UInt8)) : Array(FieldLine)? | QpackError
+    res_prefix = Qpack.decode_prefix(payload, 0, @dynamic_table.insert_count, @max_table_capacity)
+    return res_prefix if res_prefix.is_a?(QpackError)
+    req_insert_count = res_prefix[0]
+    base = res_prefix[1]
+    offset = res_prefix[2]
+
+    if req_insert_count > @dynamic_table.insert_count
+      # Stream is blocked!
+      # Check if req_insert_count can ever be satisfied
+      max_entries = @max_table_capacity // 32
+      if max_entries == 0 || req_insert_count > (@dynamic_table.insert_count + max_entries.to_i64)
+        return QpackError.new(QPACK_DECOMPRESSION_FAILED, "Required Insert Count #{req_insert_count} can never be satisfied with max capacity #{@max_table_capacity}")
+      end
+
+      # Check blocked streams limit
+      if @blocked_streams.size + 1 > @max_blocked_streams
+        return QpackError.new(QPACK_DECOMPRESSION_FAILED, "Blocked streams limit exceeded: #{@max_blocked_streams}")
+      end
+
+      if !is_stream_blocked?(stream_id)
+        @blocked_streams << BlockedStream.new(stream_id, req_insert_count, base, payload, offset)
+      end
+      return nil # Blocked
+    end
+
+    # Decode field lines
+    decode_lines(stream_id, payload, offset, base, req_insert_count, decoder_stream)
+  end
+
+  def check_blocked_streams(decoder_stream : Array(UInt8)) : Array(Tuple(UInt64, Array(FieldLine))) | QpackError
+    unblocked = [] of Tuple(UInt64, Array(FieldLine))
+    still_blocked = [] of BlockedStream
+
+    i = 0
+    while i < @blocked_streams.size
+      st = @blocked_streams[i]
+      if @dynamic_table.insert_count >= st.req_insert_count
+        res = decode_lines(st.stream_id, st.payload, st.payload_offset, st.base, st.req_insert_count, decoder_stream)
+        if res.is_a?(QpackError)
+          return res
+        end
+        unblocked << {st.stream_id, res}
+      else
+        still_blocked << st
+      end
+      i = i + 1
+    end
+    @blocked_streams = still_blocked
+    unblocked
+  end
+
+  private def decode_lines(stream_id : UInt64, payload : Bytes, offset : Int32, base : Int64, req_insert_count : Int64, decoder_stream : Array(UInt8)) : Array(FieldLine) | QpackError
+    lines = [] of FieldLine
+    total_size = 0_i32
+    cur_offset = offset
+
+    while cur_offset < payload.size
+      b = payload[cur_offset]
+      if (b & 0x80_u8) != 0_u8
+        # Indexed Field Line (4.5.2): 1 + T + 6-bit index
+        static_ref = (b & 0x40_u8) != 0_u8
+        res_idx = Integer.decode(payload, cur_offset, 6)
+        return QpackError.new(QPACK_DECOMPRESSION_FAILED, res_idx.message) if res_idx.is_a?(HpackError)
+        idx = res_idx[0]
+        cur_offset = res_idx[1]
+
+        if static_ref
+          entry = Qpack.get_static(idx.to_i32)
+          return QpackError.new(QPACK_DECOMPRESSION_FAILED, "Invalid static index: #{idx}") unless entry
+          lines << FieldLine.new(entry.name, entry.value)
+          total_size = total_size + lines.last.size
+        else
+          entry = @dynamic_table.get_by_relative(base, idx.to_i64)
+          return QpackError.new(QPACK_DECOMPRESSION_FAILED, "Invalid dynamic index: #{idx} at base #{base}") unless entry
+          lines << FieldLine.new(entry.name, entry.value)
+          total_size = total_size + lines.last.size
+        end
+      elsif (b & 0xf0_u8) == 0x10_u8
+        # Indexed Field Line with Post-Base Index (4.5.3): 0001 + 4-bit index
+        res_idx = Integer.decode(payload, cur_offset, 4)
+        return QpackError.new(QPACK_DECOMPRESSION_FAILED, res_idx.message) if res_idx.is_a?(HpackError)
+        post_idx = res_idx[0]
+        cur_offset = res_idx[1]
+
+        entry = @dynamic_table.get_by_post_base(base, post_idx.to_i64)
+        return QpackError.new(QPACK_DECOMPRESSION_FAILED, "Invalid post-base index: #{post_idx} at base #{base}") unless entry
+        lines << FieldLine.new(entry.name, entry.value)
+        total_size = total_size + lines.last.size
+      elsif (b & 0xc0_u8) == 0x40_u8
+        # Literal Field Line with Name Reference (4.5.4): 01 + N + T + 4-bit index
+        never_idx = (b & 0x20_u8) != 0_u8
+        static_ref = (b & 0x10_u8) != 0_u8
+        res_idx = Integer.decode(payload, cur_offset, 4)
+        return QpackError.new(QPACK_DECOMPRESSION_FAILED, res_idx.message) if res_idx.is_a?(HpackError)
+        name_idx = res_idx[0]
+        cur_offset = res_idx[1]
+
+        res_val = Qpack.decode_string(payload, cur_offset, 8)
+        return res_val if res_val.is_a?(QpackError)
+        val = res_val[0]
+        cur_offset = res_val[1]
+
+        name = ""
+        if static_ref
+          entry = Qpack.get_static(name_idx.to_i32)
+          return QpackError.new(QPACK_DECOMPRESSION_FAILED, "Invalid static name index: #{name_idx}") unless entry
+          name = entry.name
+        else
+          entry = @dynamic_table.get_by_relative(base, name_idx.to_i64)
+          return QpackError.new(QPACK_DECOMPRESSION_FAILED, "Invalid dynamic name index: #{name_idx} at base #{base}") unless entry
+          name = entry.name
+        end
+
+        lines << FieldLine.new(name, val, never_index: never_idx)
+        total_size = total_size + lines.last.size
+      elsif (b & 0xf0_u8) == 0x00_u8
+        # Literal Field Line with Post-Base Name Reference (4.5.5): 0000 + N + 3-bit index
+        never_idx = (b & 0x08_u8) != 0_u8
+        res_idx = Integer.decode(payload, cur_offset, 3)
+        return QpackError.new(QPACK_DECOMPRESSION_FAILED, res_idx.message) if res_idx.is_a?(HpackError)
+        post_name_idx = res_idx[0]
+        cur_offset = res_idx[1]
+
+        res_val = Qpack.decode_string(payload, cur_offset, 8)
+        return res_val if res_val.is_a?(QpackError)
+        val = res_val[0]
+        cur_offset = res_val[1]
+
+        entry = @dynamic_table.get_by_post_base(base, post_name_idx.to_i64)
+        return QpackError.new(QPACK_DECOMPRESSION_FAILED, "Invalid post-base name index: #{post_name_idx} at base #{base}") unless entry
+        name = entry.name
+
+        lines << FieldLine.new(name, val, never_index: never_idx)
+        total_size = total_size + lines.last.size
+      elsif (b & 0xe0_u8) == 0x20_u8
+        # Literal Field Line with Literal Name (4.5.6): 001 + N + Name string (4-bit prefix)
+        never_idx = (b & 0x10_u8) != 0_u8
+        res_name = Qpack.decode_string(payload, cur_offset, 4)
+        return res_name if res_name.is_a?(QpackError)
+        name = res_name[0]
+        cur_offset = res_name[1]
+
+        res_val = Qpack.decode_string(payload, cur_offset, 8)
+        return res_val if res_val.is_a?(QpackError)
+        val = res_val[0]
+        cur_offset = res_val[1]
+
+        lines << FieldLine.new(name, val, never_index: never_idx)
+        total_size = total_size + lines.last.size
+      else
+        return QpackError.new(QPACK_DECOMPRESSION_FAILED, "Unknown field line representation prefix: 0x#{b.to_s(16)}")
+      end
+
+      # Decompression-bomb defense: limit decoded size
+      if total_size > @max_header_list_size
+        return QpackError.new(QPACK_DECOMPRESSION_FAILED, "Decompressed header list size #{total_size} exceeds limit #{@max_header_list_size}")
+      end
+    end
+
+    if req_insert_count > 0_i64
+      Qpack.encode_section_ack(stream_id, decoder_stream)
+      @acknowledged_streams << stream_id
+    end
+
+    lines
+  end
+end

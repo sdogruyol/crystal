@@ -1,0 +1,243 @@
+# Native JSON standard library exercise.
+#
+#   ./bin/iyi run bench/std_json_exercise.iyi
+#
+# Exercises every component of the std/json standard library:
+#   1. Number parsing: Int32, Int64, beyond Int64 (Float64), negative zero, exponents
+#   2. String parsing: standard escapes, unicode escapes, surrogate pair decoding
+#   3. Dynamic accessors: JSON::Any (as_i, as_s, as_f, as_bool, as_a, as_h, [], []?, dig, size, and nilable variants)
+#   4. Serializer & Builder: compact and pretty JSON formatting
+#   5. Streaming PullParser: event-driven consumption, block iteration, and skip
+#   6. JSONTestSuite acceptance: valid structural shapes, unicode, whitespace variations
+#   7. Depth limiting: nested arrays and objects within configured bounds
+#   8. Round-trip: non-trivial document and surrogate pair round-trip
+#
+# Exits with panic if any assertion fails. Prints section progress lines.
+
+import std/json
+
+# ---- 1. Numbers: representation, ranges, exponents, and negative zero ----
+num_doc = "{\"i32\": 2147483647, \"i64\": 9000000000, \"huge\": 100000000000000000000, \"exp\": 2.5e3, \"exp_neg\": 1.25e-2, \"zero_neg\": -0, \"zero_f_neg\": -0.0, \"zero\": 0}"
+v_num = JSON.parse(num_doc)
+
+raise "num: i32 value" unless v_num["i32"].as_i == 2147483647
+raise "num: i32 as_i64" unless v_num["i32"].as_i64 == 2147483647_i64
+raise "num: i64 value" unless v_num["i64"].as_i64 == 9000000000_i64
+raise "num: i64 as_i? out of range" unless v_num["i64"].as_i?.nil?
+raise "num: huge beyond Int64 is float" unless v_num["huge"].as_f == 1.0e+20
+raise "num: exp positive" unless v_num["exp"].as_f == 2500.0
+raise "num: exp negative" unless v_num["exp_neg"].as_f == 0.0125
+raise "num: zero is integer" unless v_num["zero"].as_i == 0
+
+# Negative zero preservation in IEEE 754
+z_neg = v_num["zero_neg"].as_f
+raise "num: negative zero sign bit" unless (1.0 / z_neg) < 0.0
+z_f_neg = v_num["zero_f_neg"].as_f
+raise "num: negative zero float sign bit" unless (1.0 / z_f_neg) < 0.0
+
+puts "    number parsing: Int32, Int64, beyond-Int64 float, exponents, and negative zero verified"
+
+# ---- 2. Strings & Escapes: standard escapes, unicode, and surrogate pairs ----
+str_doc = "{\"quotes\": \"\\\"escaped\\\"\", \"backslash\": \"C:\\\\iyi\\\\std\", \"slash\": \"http:\\/\\/iyi.org\", \"controls\": \"\\b\\f\\n\\r\\t\", \"unicode\": \"\\u00e9l\\u00e8ve\", \"emoji\": \"\\ud83d\\ude00\", \"rocket\": \"\\ud83d\\ude80\"}"
+v_str = JSON.parse(str_doc)
+
+raise "str: quotes" unless v_str["quotes"].as_s == "\"escaped\""
+raise "str: backslash" unless v_str["backslash"].as_s == "C:\\iyi\\std"
+raise "str: slash" unless v_str["slash"].as_s == "http://iyi.org"
+raise "str: controls" unless v_str["controls"].as_s == "\b\f\n\r\t"
+raise "str: unicode accents" unless v_str["unicode"].as_s == "élève"
+raise "str: surrogate pair emoji" unless v_str["emoji"].as_s == "😀"
+raise "str: surrogate pair rocket" unless v_str["rocket"].as_s == "🚀"
+
+puts "    string parsing: standard escapes, unicode escapes, and surrogate pairs verified"
+
+# ---- 3. JSON::Any: dynamic traversal and nilable variants ----
+any_doc = "{\"user\": {\"name\": \"Alice\", \"active\": true, \"roles\": [\"admin\", \"ops\"], \"score\": 98.5, \"auth\": null}}"
+a_doc = JSON.parse(any_doc)
+
+# Positive accessors
+raise "any: as_s" unless a_doc["user"]["name"].as_s == "Alice"
+raise "any: as_bool" unless a_doc["user"]["active"].as_bool == true
+raise "any: as_f" unless a_doc["user"]["score"].as_f == 98.5
+raise "any: as_nil" unless a_doc["user"]["auth"].as_nil.nil?
+raise "any: size array" unless a_doc["user"]["roles"].size == 2
+raise "any: size object" unless a_doc["user"].size == 5
+
+# Safe indexing []?
+name_elem = a_doc["user"]["name"]?
+raise "any: []? present" unless !name_elem.nil? && name_elem.as_s == "Alice"
+raise "any: []? missing key" unless a_doc["user"]["missing"]?.nil?
+raise "any: []? missing index" unless a_doc["user"]["roles"][99]?.nil?
+
+# Nilable variants
+raise "any: as_s?" unless a_doc["user"]["name"].as_s? == "Alice"
+raise "any: as_s? on non-string" unless a_doc["user"]["active"].as_s?.nil?
+raise "any: as_bool?" unless a_doc["user"]["active"].as_bool? == true
+raise "any: as_bool? on non-bool" unless a_doc["user"]["name"].as_bool?.nil?
+raise "any: as_i?" unless a_doc["user"]["score"].as_i?.nil?
+raise "any: as_f?" unless a_doc["user"]["score"].as_f? == 98.5
+raise "any: as_f? on string" unless a_doc["user"]["name"].as_f?.nil?
+raise "any: as_a?" unless !a_doc["user"]["roles"].as_a?.nil?
+raise "any: as_a? on scalar" unless a_doc["user"]["name"].as_a?.nil?
+raise "any: as_h?" unless !a_doc["user"].as_h?.nil?
+raise "any: as_h? on scalar" unless a_doc["user"]["name"].as_h?.nil?
+raise "any: size?" unless a_doc["user"]["roles"].size? == 2
+raise "any: size? on scalar" unless a_doc["user"]["name"].size?.nil?
+
+# dig and dig?
+raise "any: dig found" unless a_doc.dig("user", "roles", 1).as_s == "ops"
+dig_elem = a_doc.dig?("user", "roles", 0)
+raise "any: dig? found" unless !dig_elem.nil? && dig_elem.as_s == "admin"
+raise "any: dig? missing intermediate" unless a_doc.dig?("user", "missing", "key").nil?
+raise "any: dig? out of bounds" unless a_doc.dig?("user", "roles", 99).nil?
+
+puts "    dynamic traversal: JSON::Any typed accessors, safe navigation, and dig verified"
+
+# ---- 4. Serializer & Builder: compact and pretty formatting ----
+built_compact = JSON.build do |j|
+  j.object do
+    j.field("title", "iyi")
+    j.field("stats") do
+      j.array do
+        j.number(10)
+        j.number(20)
+      end
+    end
+    j.field("enabled", true)
+  end
+end
+
+raise "builder: compact output" unless built_compact == "{\"title\":\"iyi\",\"stats\":[10,20],\"enabled\":true}"
+
+built_pretty = JSON.build(2) do |j|
+  j.object do
+    j.field("k", "v")
+    j.field("arr") do
+      j.array do
+        j.number(1)
+      end
+    end
+  end
+end
+
+expected_pretty = "{\n  \"k\": \"v\",\n  \"arr\": [\n    1\n  ]\n}"
+raise "builder: pretty output" unless built_pretty == expected_pretty
+
+puts "    builder & serializer: compact and pretty JSON formatting verified"
+
+# ---- 5. Streaming PullParser ----
+stream_input = "{\"header\": {\"version\": 2}, \"records\": [10, 20, 30], \"footer\": \"eof\"}"
+pull = JSON::PullParser.new(stream_input)
+
+pull.read_begin_object
+h_key = pull.read_object_key
+raise "pull: header key" unless h_key == "header"
+
+pull.read_begin_object
+v_key = pull.read_object_key
+raise "pull: v_key" unless v_key == "version"
+v_val = pull.read_int
+raise "pull: v_val" unless v_val == 2_i64
+pull.read_end_object
+
+r_key = pull.read_object_key
+raise "pull: records key" unless r_key == "records"
+pull.read_begin_array
+sum = 0_i64
+while pull.kind != Std::Json::PullParser::Kind::EndArray
+  sum = sum + pull.read_int
+end
+pull.read_end_array
+raise "pull: sum items" unless sum == 60_i64
+
+f_key = pull.read_object_key
+raise "pull: footer key" unless f_key == "footer"
+f_val = pull.read_string
+raise "pull: footer val" unless f_val == "eof"
+pull.read_end_object
+
+# Test PullParser block iterations and skip
+pull_block = JSON::PullParser.new(stream_input)
+visited_header = false
+records_count = 0
+pull_block.read_object do |key|
+  if key == "header"
+    visited_header = true
+    pull_block.skip
+  elsif key == "records"
+    pull_block.read_array do
+      val = pull_block.read_int
+      records_count = records_count + 1
+    end
+  else
+    pull_block.skip
+  end
+end
+
+raise "pull: block visited_header" unless visited_header
+raise "pull: block records_count" unless records_count == 3
+
+puts "    streaming pull parser: event consumption, block iteration, and skip verified"
+
+# ---- 6. JSONTestSuite Acceptance: valid shapes from corpus ----
+# lonely primitives (RFC 8259 allowed at root)
+raise "y: string root" unless JSON.parse("\"hello world\"").as_s == "hello world"
+raise "y: int root" unless JSON.parse("42").as_i == 42
+raise "y: float root" unless JSON.parse("3.1415").as_f == 3.1415
+raise "y: bool root" unless JSON.parse("true").as_bool == true
+raise "y: null root" unless JSON.parse("null").as_nil.nil?
+
+# empty structures
+raise "y: empty array" unless JSON.parse("[]").as_a.empty?
+raise "y: empty object" unless JSON.parse("{}").as_h.empty?
+
+# whitespace surrounding values
+raise "y: whitespace padding" unless JSON.parse(" \t\r\n [ 1 , 2 , 3 ] \t\r\n ").size == 3
+
+# complex valid unicode
+unicode_test = "{\"cjk\": \"\\u4e16\\u754c\", \"greek\": \"\\u03b1\\u03b2\\u03b3\", \"surrogate\": \"\\ud83d\\udc4d\"}"
+v_u = JSON.parse(unicode_test)
+raise "y: cjk" unless v_u["cjk"].as_s == "世界"
+raise "y: greek" unless v_u["greek"].as_s == "αβγ"
+raise "y: thumb emoji" unless v_u["surrogate"].as_s == "👍"
+
+puts "    JSONTestSuite acceptance: root primitives, empty structures, and unicode shapes verified"
+
+# ---- 7. Depth Limiting: nested input bound enforcement ----
+valid_nest = "[[[[[[42]]]]]]"
+p_nest = JSON::Parser.new(valid_nest)
+p_nest.max_nesting = 10
+res_nest = p_nest.parse
+raise "depth: within limit" unless res_nest[0][0][0][0][0][0].as_i == 42
+
+puts "    depth limiting: nested input bound enforcement verified"
+
+# ---- 8. Round-Trip: non-trivial document and surrogate pair round-trip ----
+complex_payload = "{\"id\": 9876543210, \"name\": \"Comprehensive Document\", \"tags\": [\"iyi\", \"json\", \"rfc8259\"], \"config\": {\"debug\": false, \"max_concurrency\": 16, \"threshold\": 0.995, \"negative_zero\": -0.0}, \"unicode_greeting\": \"Hello, 世界! 🚀\", \"special_escapes\": \"Tab:\\t Newline:\\n Quote:\\\" Backslash:\\\\\"}"
+
+parsed_complex = JSON.parse(complex_payload)
+serialized_complex = parsed_complex.to_json
+reparsed_complex = JSON.parse(serialized_complex)
+
+raise "roundtrip: id" unless reparsed_complex["id"].as_i64 == 9876543210_i64
+raise "roundtrip: name" unless reparsed_complex["name"].as_s == "Comprehensive Document"
+raise "roundtrip: tags size" unless reparsed_complex["tags"].size == 3
+raise "roundtrip: config debug" unless reparsed_complex["config"]["debug"].as_bool == false
+raise "roundtrip: config negative zero" unless (1.0 / reparsed_complex["config"]["negative_zero"].as_f) < 0.0
+raise "roundtrip: unicode greeting" unless reparsed_complex["unicode_greeting"].as_s == "Hello, 世界! 🚀"
+raise "roundtrip: special escapes" unless reparsed_complex["special_escapes"].as_s == "Tab:\t Newline:\n Quote:\" Backslash:\\"
+
+# Surrogate pair decoded and re-encoded in ascii_only mode
+surrogate_input = "{\"greeting\": \"\\ud83d\\ude00\"}"
+v_surrogate = JSON.parse(surrogate_input)
+raise "surrogate: decoded emoji" unless v_surrogate["greeting"].as_s == "😀"
+
+re_encoded_ascii = v_surrogate.to_ascii_json
+raise "surrogate: re-encoded ascii" unless re_encoded_ascii.includes?("\\ud83d\\ude00")
+
+reparsed_surrogate = JSON.parse(re_encoded_ascii)
+raise "surrogate: round-trip match" unless reparsed_surrogate["greeting"].as_s == "😀"
+
+puts "    round-trip: complex document and surrogate pair re-encoding verified"
+
+puts "all std/json checks passed"

@@ -1,0 +1,504 @@
+# Universally Unique Identifier (UUID) standard library module for iyi.
+#
+# Implements RFC 4122 and RFC 9562 UUID specifications (v1, v2, v3, v4, v5, v6, v7, v8).
+#
+# Pure iyi implementation with zero external C library dependencies.
+
+module std/uuid
+
+pub import std/slice
+using std/slice::{Slice, Bytes}
+pub import std/static_array
+using std/static_array::{StaticArray}
+pub import std/random
+using std/random::{Random}
+pub import std/digest
+pub import std/time
+using std/time::{Time, Span}
+
+using std/digest::{MD5, SHA1}
+
+struct ::Enum
+  def ==(other : self) : Bool
+    value == other.value
+  end
+
+  def ===(other : self) : Bool
+    value == other.value
+  end
+
+  def <=>(other : self) : Int32
+    value <=> other.value
+  end
+end
+
+struct ::UUID
+  enum Variant
+    Unknown   = 0
+    NCS       = 1
+    RFC4122   = 2
+    RFC9562   = 2
+    Microsoft = 3
+    Future    = 4
+  end
+
+  enum Version
+    Unknown = 0
+    V1      = 1
+    V2      = 2
+    V3      = 3
+    V4      = 4
+    V5      = 5
+    V6      = 6
+    V7      = 7
+    V8      = 8
+  end
+
+  enum Domain
+    Person = 0
+    Group  = 1
+    Org    = 2
+  end
+
+  alias MAC = StaticArray(UInt8, 6)
+
+  module Namespace
+    DNS  = UUID.new("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
+    URL  = UUID.new("6ba7b811-9dad-11d1-80b4-00c04fd430c8")
+    OID  = UUID.new("6ba7b812-9dad-11d1-80b4-00c04fd430c8")
+    X500 = UUID.new("6ba7b814-9dad-11d1-80b4-00c04fd430c8")
+  end
+
+  class Error < Exception
+    getter message : String
+
+    def initialize(@message : String = "")
+    end
+  end
+
+  @bytes : StaticArray(UInt8, 16)
+
+  def initialize(@bytes : StaticArray(UInt8, 16), variant : Variant? = nil, version : Version? = nil)
+    case variant
+    when Variant::NCS
+      @bytes[8] = (@bytes[8] & 0x7f_u8)
+    when Variant::RFC4122, Variant::RFC9562
+      @bytes[8] = (@bytes[8] & 0x3f_u8) | 0x80_u8
+    when Variant::Microsoft
+      @bytes[8] = (@bytes[8] & 0x1f_u8) | 0xc0_u8
+    when Variant::Future
+      @bytes[8] = (@bytes[8] & 0x1f_u8) | 0xe0_u8
+    else
+    end
+
+    if ver = version
+      v_num = ver.value.to_u8
+      @bytes[6] = (@bytes[6] & 0x0f_u8) | v_num.unsafe_shl(4_u8)
+    end
+  end
+
+  def self.new(slice : Std::Slice::Slice(UInt8), variant : Variant? = nil, version : Version? = nil) : self
+    raise "Invalid bytes length #{slice.size}, expected 16" unless slice.size == 16
+    bytes = uninitialized StaticArray(UInt8, 16)
+    i = 0
+    while i < 16
+      bytes[i] = slice[i]
+      i += 1
+    end
+    new(bytes, variant, version)
+  end
+
+  def self.new(uuid : UUID, variant : Variant? = nil, version : Version? = nil) : self
+    new(uuid.bytes, variant, version)
+  end
+
+  def self.new(value : String, variant : Variant? = nil, version : Version? = nil) : self
+    parse?(value, variant, version) || raise "Invalid UUID string format: #{value.inspect}"
+  end
+
+  private def self.hex_val(b : UInt8) : UInt8?
+    if b >= 48_u8 && b <= 57_u8
+      b - 48_u8
+    elsif b >= 65_u8 && b <= 70_u8
+      b - 65_u8 + 10_u8
+    elsif b >= 97_u8 && b <= 102_u8
+      b - 97_u8 + 10_u8
+    else
+      nil
+    end
+  end
+
+  private def self.hex_pair(str : String, offset : Int32) : UInt8?
+    p = str.to_unsafe
+    h1 = hex_val(p[offset])
+    return nil unless h1
+    h2 = hex_val(p[offset + 1])
+    return nil unless h2
+    h1.unsafe_shl(4_u8) | h2
+  end
+
+  def self.parse?(value : String, variant : Variant? = nil, version : Version? = nil) : UUID?
+    len = value.bytesize
+    bytes = uninitialized StaticArray(UInt8, 16)
+    ptr = value.to_unsafe
+
+    if len == 36 # Hyphenated
+      return nil unless ptr[8] == 45_u8 && ptr[13] == 45_u8 && ptr[18] == 45_u8 && ptr[23] == 45_u8
+      offsets = {0, 2, 4, 6, 9, 11, 14, 16, 19, 21, 24, 26, 28, 30, 32, 34}
+      {% for i in 0...16 %}
+        h = hex_pair(value, offsets[{{i}}])
+        return nil unless h
+        bytes[{{i}}] = h
+      {% end %}
+    elsif len == 32 # Hexstring
+      {% for i in 0...16 %}
+        h = hex_pair(value, {{i}} * 2)
+        return nil unless h
+        bytes[{{i}}] = h
+      {% end %}
+    elsif len == 45 # URN
+      return nil unless value.starts_with?("urn:uuid:")
+      offsets = {9, 11, 13, 15, 18, 20, 23, 25, 28, 30, 33, 35, 37, 39, 41, 43}
+      {% for i in 0...16 %}
+        h = hex_pair(value, offsets[{{i}}])
+        return nil unless h
+        bytes[{{i}}] = h
+      {% end %}
+    else
+      return nil
+    end
+
+    new(bytes, variant, version)
+  end
+
+  def self.random(random : Random = Random::Secure, variant : Variant = Variant::RFC4122, version : Version = Version::V4) : self
+    b = uninitialized StaticArray(UInt8, 16)
+    random.random_bytes(b.to_slice)
+    new(b, variant, version)
+  end
+
+  def self.v4(random : Random = Random::Secure) : self
+    random(random)
+  end
+
+  def self.empty : self
+    b = StaticArray(UInt8, 16).new(0_u8)
+    new(b, Variant::NCS, Version::V4)
+  end
+
+  def self.v1(*, clock_seq : UInt16? = nil, node_id : MAC? = nil) : self
+    t = Std::Time::Time.utc
+    now = (t.seconds.to_u64 * 10000000_u64) + (t.nanoseconds.to_u64 // 100_u64) + 122192928000000000_u64
+    seq = clock_seq ? clock_seq.to_u64 : ((t.nanoseconds.to_u64 // 1000000_u64) & 0x3fff_u64) | 0x8000_u64
+
+    b = uninitialized StaticArray(UInt8, 16)
+    b[0] = (now.unsafe_shr(24_u64) & 0xff_u64).to_u8
+    b[1] = (now.unsafe_shr(16_u64) & 0xff_u64).to_u8
+    b[2] = (now.unsafe_shr(8_u64) & 0xff_u64).to_u8
+    b[3] = (now & 0xff_u64).to_u8
+
+    b[4] = (now.unsafe_shr(40_u64) & 0xff_u64).to_u8
+    b[5] = (now.unsafe_shr(32_u64) & 0xff_u64).to_u8
+
+    b[6] = ((now.unsafe_shr(56_u64) & 0x0f_u64) | 0x10_u64).to_u8
+    b[7] = (now.unsafe_shr(48_u64) & 0xff_u64).to_u8
+
+    b[8] = (seq.unsafe_shr(8_u64) & 0xff_u64).to_u8
+    b[9] = (seq & 0xff_u64).to_u8
+
+    if n = node_id
+      i = 0
+      while i < 6
+        b[10 + i] = n[i]
+        i += 1
+      end
+    else
+      Random::Secure.random_bytes(Std::Slice::Slice(UInt8).new(b.to_unsafe + 10, 6, false))
+      b[10] = b[10] | 0x01_u8
+    end
+
+    new(b, version: Version::V1, variant: Variant::RFC4122)
+  end
+
+  def self.v2(domain : Domain, id : Int, node_id : MAC? = nil) : self
+    uuid = v1(node_id: node_id).bytes
+    uuid[6] = (uuid[6] & 0x0f_u8) | 0x20_u8
+    uuid[9] = domain.value.to_u8
+    id64 = id.to_u64
+    uuid[0] = (id64.unsafe_shr(24_u64) & 0xff_u64).to_u8
+    uuid[1] = (id64.unsafe_shr(16_u64) & 0xff_u64).to_u8
+    uuid[2] = (id64.unsafe_shr(8_u64) & 0xff_u64).to_u8
+    uuid[3] = (id64 & 0xff_u64).to_u8
+    new(uuid, version: Version::V2, variant: Variant::RFC4122)
+  end
+
+  def self.v3(name : String, namespace : UUID) : self
+    md5 = Std::Digest::MD5.new
+    md5.update(namespace.to_slice)
+    md5.update(name.to_slice)
+    digest = md5.final
+    new(digest[0, 16], version: Version::V3, variant: Variant::RFC4122)
+  end
+
+  def self.v3_dns(name : String) : self
+    v3(name, Namespace::DNS)
+  end
+
+  def self.v3_url(name : String) : self
+    v3(name, Namespace::URL)
+  end
+
+  def self.v3_oid(name : String) : self
+    v3(name, Namespace::OID)
+  end
+
+  def self.v3_x500(name : String) : self
+    v3(name, Namespace::X500)
+  end
+
+  def self.v5(name : String, namespace : UUID) : self
+    sha = Std::Digest::SHA1.new
+    sha.update(namespace.to_slice)
+    sha.update(name.to_slice)
+    digest = sha.final
+    new(digest[0, 16], version: Version::V5, variant: Variant::RFC4122)
+  end
+
+  def self.v5_dns(name : String) : self
+    v5(name, Namespace::DNS)
+  end
+
+  def self.v5_url(name : String) : self
+    v5(name, Namespace::URL)
+  end
+
+  def self.v5_oid(name : String) : self
+    v5(name, Namespace::OID)
+  end
+
+  def self.v5_x500(name : String) : self
+    v5(name, Namespace::X500)
+  end
+
+  def self.v6(*, clock_seq : UInt16? = nil, node_id : MAC? = nil) : self
+    t = Std::Time::Time.utc
+    now = (t.seconds.to_u64 * 10000000_u64) + (t.nanoseconds.to_u64 // 100_u64) + 122192928000000000_u64
+    seq = clock_seq ? clock_seq.to_u64 : ((t.nanoseconds.to_u64 // 1000000_u64) & 0x3fff_u64) | 0x8000_u64
+
+    b = uninitialized StaticArray(UInt8, 16)
+    b[0] = (now.unsafe_shr(52_u64) & 0xff_u64).to_u8
+    b[1] = (now.unsafe_shr(44_u64) & 0xff_u64).to_u8
+    b[2] = (now.unsafe_shr(36_u64) & 0xff_u64).to_u8
+    b[3] = (now.unsafe_shr(28_u64) & 0xff_u64).to_u8
+
+    b[4] = (now.unsafe_shr(20_u64) & 0xff_u64).to_u8
+    b[5] = (now.unsafe_shr(12_u64) & 0xff_u64).to_u8
+
+    b[6] = (0x60_u64 | (now.unsafe_shr(8_u64) & 0x0f_u64)).to_u8
+    b[7] = (now & 0xff_u64).to_u8
+
+    b[8] = (seq.unsafe_shr(8_u64) & 0xff_u64).to_u8
+    b[9] = (seq & 0xff_u64).to_u8
+    if n = node_id
+      i = 0
+      while i < 6
+        b[10 + i] = n[i]
+        i += 1
+      end
+    else
+      Random::Secure.random_bytes(Std::Slice::Slice(UInt8).new(b.to_unsafe + 10, 6, false))
+      b[10] = b[10] | 0x01_u8
+    end
+
+    new(b, version: Version::V6, variant: Variant::RFC4122)
+  end
+
+  def self.v7(random : Random = Random::Secure) : self
+    b = uninitialized StaticArray(UInt8, 16)
+    ms = Std::Time::Time.utc.to_unix_ms.to_u64
+
+    b[0] = (ms.unsafe_shr(40_u64) & 0xff_u64).to_u8
+    b[1] = (ms.unsafe_shr(32_u64) & 0xff_u64).to_u8
+    b[2] = (ms.unsafe_shr(24_u64) & 0xff_u64).to_u8
+    b[3] = (ms.unsafe_shr(16_u64) & 0xff_u64).to_u8
+    b[4] = (ms.unsafe_shr(8_u64) & 0xff_u64).to_u8
+    b[5] = (ms & 0xff_u64).to_u8
+
+    random.random_bytes(Std::Slice::Slice(UInt8).new(b.to_unsafe + 6, 10, false))
+
+    b[6] = (b[6] & 0x0f_u8) | 0x70_u8
+    b[8] = (b[8] & 0x3f_u8) | 0x80_u8
+
+    new(b, variant: Variant::RFC9562, version: Version::V7)
+  end
+
+  def self.v8(custom_bytes : StaticArray(UInt8, 16)) : self
+    new(custom_bytes, version: Version::V8, variant: Variant::RFC4122)
+  end
+
+  def self.v8(custom_bytes : Std::Slice::Slice(UInt8)) : self
+    new(custom_bytes, version: Version::V8, variant: Variant::RFC4122)
+  end
+
+  def variant : Variant
+    byte8 = @bytes[8]
+    if (byte8 & 0x80_u8) == 0_u8
+      Variant::NCS
+    elsif (byte8 & 0xc0_u8) == 0x80_u8
+      Variant::RFC4122
+    elsif (byte8 & 0xe0_u8) == 0xc0_u8
+      Variant::Microsoft
+    elsif (byte8 & 0xe0_u8) == 0xe0_u8
+      Variant::Future
+    else
+      Variant::Unknown
+    end
+  end
+
+  def version : Version
+    case @bytes[6].unsafe_shr(4_u8)
+    when 1 then Version::V1
+    when 2 then Version::V2
+    when 3 then Version::V3
+    when 4 then Version::V4
+    when 5 then Version::V5
+    when 6 then Version::V6
+    when 7 then Version::V7
+    when 8 then Version::V8
+    else        Version::Unknown
+    end
+  end
+
+  def bytes : StaticArray(UInt8, 16)
+    @bytes.dup
+  end
+
+  def to_slice : Std::Slice::Slice(UInt8)
+    @bytes.to_slice
+  end
+
+  def to_unsafe : Pointer(UInt8)
+    @bytes.to_unsafe
+  end
+
+  def to_s(io) : Nil
+    io.write(to_s)
+  end
+
+  def to_s : String
+    String.new(36) do |buf|
+      hex = "0123456789abcdef".to_unsafe
+      src = @bytes.to_unsafe
+      dst = 0
+      i = 0
+      while i < 16
+        if i == 4 || i == 6 || i == 8 || i == 10
+          buf[dst] = 45_u8 # '-'
+          dst += 1
+        end
+        val = src[i].to_i
+        buf[dst] = hex[(val >> 4) & 0x0f]
+        buf[dst + 1] = hex[val & 0x0f]
+        dst += 2
+        i += 1
+      end
+    end
+  end
+
+  def inspect(io) : Nil
+    io.write(inspect)
+  end
+
+  def inspect : String
+    "UUID(" + to_s + ")"
+  end
+
+  def hexstring : String
+    String.new(32) do |buf|
+      hex = "0123456789abcdef".to_unsafe
+      src = @bytes.to_unsafe
+      dst = 0
+      i = 0
+      while i < 16
+        val = src[i].to_i
+        buf[dst] = hex[(val >> 4) & 0x0f]
+        buf[dst + 1] = hex[val & 0x0f]
+        dst += 2
+        i += 1
+      end
+    end
+  end
+
+  def urn : String
+    "urn:uuid:" + to_s
+  end
+
+  def <=>(other : UUID) : Int32
+    i = 0
+    while i < 16
+      b1 = @bytes[i]
+      b2 = other.@bytes[i]
+      return -1 if b1 < b2
+      return 1 if b1 > b2
+      i += 1
+    end
+    0
+  end
+
+  def <(other : UUID) : Bool
+    (self <=> other) < 0
+  end
+
+  def <=(other : UUID) : Bool
+    (self <=> other) <= 0
+  end
+
+  def >(other : UUID) : Bool
+    (self <=> other) > 0
+  end
+
+  def >=(other : UUID) : Bool
+    (self <=> other) >= 0
+  end
+
+  def ==(other : UUID) : Bool
+    i = 0
+    while i < 16
+      return false unless @bytes[i] == other.@bytes[i]
+      i += 1
+    end
+    true
+  end
+
+  def ==(other) : Bool
+    false
+  end
+
+  def hash(hasher)
+    @bytes.hash(hasher)
+  end
+
+  {% for v in (1..8) %}
+    def v{{v.id}}? : Bool
+      variant == Variant::RFC4122 && version == Version::V{{v.id}}
+    end
+
+    # Note: Crystal spells this method v{{v.id}}!, which raises if the UUID is not version {{v.id}}.
+    # Because `!` is an operator in iyi (SPEC.md III.1.7a), that spelling is lexically impossible.
+    # We expose explicit checked names: validate_v{{v.id}}, check_v{{v.id}}, and ensure_v{{v.id}}.
+    def validate_v{{v.id}} : Bool
+      raise "Invalid UUID variant #{variant} version #{version}, expected RFC 4122 V{{v.id}}" unless v{{v.id}}?
+      true
+    end
+
+    def check_v{{v.id}} : Bool
+      validate_v{{v.id}}
+    end
+
+    def ensure_v{{v.id}} : Bool
+      validate_v{{v.id}}
+    end
+  {% end %}
+end
+
+pub alias UUID = ::UUID

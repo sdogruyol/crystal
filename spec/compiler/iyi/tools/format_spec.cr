@@ -57,7 +57,7 @@ describe Iyi::Command::FormatCommand do
     format_command.run
     format_command.status_code.should eq(1)
     stdout.to_s.should be_empty
-    stderr.to_s.should contain("file 'STDIN' is not a valid Crystal source file: Unexpected byte 0xfe at position 0, malformed UTF-8")
+    stderr.to_s.should contain("file 'STDIN' is not a valid iyi source file: Unexpected byte 0xfe at position 0, malformed UTF-8")
   end
 
   it "formats stdin (bug)" do
@@ -69,7 +69,7 @@ describe Iyi::Command::FormatCommand do
     format_command.run
     format_command.status_code.should eq(1)
     stdout.to_s.should be_empty
-    stderr.to_s.should contain("there's a bug formatting 'STDIN', to show more information, please run:\n\n  $ crystal tool format --show-backtrace -")
+    stderr.to_s.should contain("there's a bug formatting 'STDIN', to show more information, please run:\n\n  $ iyi tool format --show-backtrace -")
   end
 
   it "formats stdin (bug + show-backtrace)" do
@@ -82,7 +82,7 @@ describe Iyi::Command::FormatCommand do
     format_command.status_code.should eq(1)
     stdout.to_s.should be_empty
     stderr.to_s.should contain("format command test")
-    stderr.to_s.should contain("couldn't format 'STDIN', please report a bug including the contents of it: https://github.com/crystal-lang/crystal/issues")
+    stderr.to_s.should contain("couldn't format 'STDIN', please report a bug including the contents of it: https://github.com/sdogruyol/iyi/issues")
   end
 
   it "formats files" do
@@ -91,17 +91,20 @@ describe Iyi::Command::FormatCommand do
     stderr = IO::Memory.new
 
     with_tempdir do
-      File.write "format.cr", "if true\n1\nend"
-      File.write "not_format.cr", "if true\n  1\nend\n"
+      File.write "format.iyi", "if true\n1\nend"
+      File.write "not_format.iyi", "if true\n  1\nend\n"
+      File.write "compat.cr", "if true\n1\nend"
 
       format_command = Iyi::Command::FormatCommand.new([] of String, color: false, stdin: stdin, stdout: stdout, stderr: stderr)
       format_command.run
       format_command.status_code.should eq(0)
-      stdout.to_s.should contain("Format #{Path[".", "format.cr"]}")
-      stdout.to_s.should_not contain("Format #{Path[".", "not_format.cr"]}")
+      stdout.to_s.should contain("Format #{Path[".", "format.iyi"]}")
+      stdout.to_s.should_not contain("Format #{Path[".", "not_format.iyi"]}")
+      stdout.to_s.should_not contain("compat.cr")
       stderr.to_s.should be_empty
 
-      File.read("format.cr").should eq("if true\n  1\nend\n")
+      File.read("format.iyi").should eq("if true\n  1\nend\n")
+      File.read("compat.cr").should eq("if true\n1\nend")
     end
   end
 
@@ -112,16 +115,18 @@ describe Iyi::Command::FormatCommand do
 
     with_tempdir do
       Dir.mkdir "dir"
-      File.write "format.cr", "if true\n1\nend"
-      File.write "not_format.cr", "if true\n  1\nend\n"
-      File.write File.join("dir", "format.cr"), "if true\n1\nend"
-      File.write File.join("dir", "not_format.cr"), "if true\n  1\nend\n"
+      File.write "format.iyi", "if true\n1\nend"
+      File.write "not_format.iyi", "if true\n  1\nend\n"
+      File.write File.join("dir", "format.iyi"), "if true\n1\nend"
+      File.write File.join("dir", "not_format.iyi"), "if true\n  1\nend\n"
+      File.write File.join("dir", "compat.cr"), "if true\n1\nend"
 
       format_command = Iyi::Command::FormatCommand.new(["dir"], color: false, stdin: stdin, stdout: stdout, stderr: stderr)
       format_command.run
       format_command.status_code.should eq(0)
-      stdout.to_s.should contain("Format #{Path[".", "dir", "format.cr"]}")
-      stdout.to_s.should_not contain("Format #{Path[".", "dir", "not_format.cr"]}")
+      stdout.to_s.should contain("Format #{Path[".", "dir", "format.iyi"]}")
+      stdout.to_s.should_not contain("Format #{Path[".", "dir", "not_format.iyi"]}")
+      stdout.to_s.should_not contain("compat.cr")
       stderr.to_s.should be_empty
 
       {stdout, stderr}.each &.clear
@@ -129,14 +134,15 @@ describe Iyi::Command::FormatCommand do
       format_command = Iyi::Command::FormatCommand.new([] of String, color: false, stdin: stdin, stdout: stdout, stderr: stderr)
       format_command.run
       format_command.status_code.should eq(0)
-      stdout.to_s.should contain("Format #{Path[".", "format.cr"]}")
-      stdout.to_s.should_not contain("Format #{Path[".", "not_format.cr"]}")
-      stdout.to_s.should_not contain("Format #{Path[".", "dir", "format.cr"]}")
-      stdout.to_s.should_not contain("Format #{Path[".", "dir", "not_format.cr"]}")
+      stdout.to_s.should contain("Format #{Path[".", "format.iyi"]}")
+      stdout.to_s.should_not contain("Format #{Path[".", "not_format.iyi"]}")
+      stdout.to_s.should_not contain("Format #{Path[".", "dir", "format.iyi"]}")
+      stdout.to_s.should_not contain("Format #{Path[".", "dir", "not_format.iyi"]}")
       stderr.to_s.should be_empty
 
-      File.read("format.cr").should eq("if true\n  1\nend\n")
-      File.read(File.join("dir", "format.cr")).should eq("if true\n  1\nend\n")
+      File.read("format.iyi").should eq("if true\n  1\nend\n")
+      File.read(File.join("dir", "format.iyi")).should eq("if true\n  1\nend\n")
+      File.read(File.join("dir", "compat.cr")).should eq("if true\n1\nend")
     end
   end
 
@@ -146,18 +152,18 @@ describe Iyi::Command::FormatCommand do
     stderr = IO::Memory.new
 
     with_tempdir do
-      File.write "format.cr", "if true\n1\nend"
-      File.write "syntax_error.cr", "if"
-      File.write "invalid_byte_sequence_error.cr", "\xfe\xff"
+      File.write "format.iyi", "if true\n1\nend"
+      File.write "syntax_error.iyi", "if"
+      File.write "invalid_byte_sequence_error.iyi", "\xfe\xff"
 
       format_command = Iyi::Command::FormatCommand.new([] of String, color: false, stdin: stdin, stdout: stdout, stderr: stderr)
       format_command.run
       format_command.status_code.should eq(1)
-      stdout.to_s.should contain("Format #{Path[".", "format.cr"]}")
-      stderr.to_s.should contain("syntax error in '#{Path[".", "syntax_error.cr"]}:1:3': unexpected token: EOF")
-      stderr.to_s.should contain("file '#{Path[".", "invalid_byte_sequence_error.cr"]}' is not a valid Crystal source file: Unexpected byte 0xfe at position 0, malformed UTF-8")
+      stdout.to_s.should contain("Format #{Path[".", "format.iyi"]}")
+      stderr.to_s.should contain("syntax error in '#{Path[".", "syntax_error.iyi"]}:1:3': unexpected token: EOF")
+      stderr.to_s.should contain("file '#{Path[".", "invalid_byte_sequence_error.iyi"]}' is not a valid iyi source file: Unexpected byte 0xfe at position 0, malformed UTF-8")
 
-      File.read("format.cr").should eq("if true\n  1\nend\n")
+      File.read("format.iyi").should eq("if true\n  1\nend\n")
     end
   end
 
@@ -167,12 +173,12 @@ describe Iyi::Command::FormatCommand do
     stderr = IO::Memory.new
 
     with_tempdir do
-      File.write "empty.cr", ""
+      File.write "empty.iyi", ""
 
       format_command = BuggyFormatCommand.new([] of String, color: false, stdin: stdin, stdout: stdout, stderr: stderr)
       format_command.run
       format_command.status_code.should eq(1)
-      stderr.to_s.should contain("there's a bug formatting '#{Path[".", "empty.cr"]}', to show more information, please run:\n\n  $ crystal tool format --show-backtrace '#{Path[".", "empty.cr"]}'")
+      stderr.to_s.should contain("there's a bug formatting '#{Path[".", "empty.iyi"]}', to show more information, please run:\n\n  $ iyi tool format --show-backtrace '#{Path[".", "empty.iyi"]}'")
     end
   end
 
@@ -182,13 +188,13 @@ describe Iyi::Command::FormatCommand do
     stderr = IO::Memory.new
 
     with_tempdir do
-      File.write "empty.cr", ""
+      File.write "empty.iyi", ""
 
       format_command = BuggyFormatCommand.new([] of String, show_backtrace: true, color: false, stdin: stdin, stdout: stdout, stderr: stderr)
       format_command.run
       format_command.status_code.should eq(1)
       stderr.to_s.should contain("format command test")
-      stderr.to_s.should contain("couldn't format '#{Path[".", "empty.cr"]}', please report a bug including the contents of it: https://github.com/crystal-lang/crystal/issues")
+      stderr.to_s.should contain("couldn't format '#{Path[".", "empty.iyi"]}', please report a bug including the contents of it: https://github.com/sdogruyol/iyi/issues")
     end
   end
 
@@ -198,19 +204,19 @@ describe Iyi::Command::FormatCommand do
     stderr = IO::Memory.new
 
     with_tempdir do
-      File.write "format.cr", "if true\n1\nend"
-      File.write "not_format.cr", "if true\n  1\nend\n"
-      File.write "syntax_error.cr", "if"
-      File.write "invalid_byte_sequence_error.cr", "\xfe\xff"
+      File.write "format.iyi", "if true\n1\nend"
+      File.write "not_format.iyi", "if true\n  1\nend\n"
+      File.write "syntax_error.iyi", "if"
+      File.write "invalid_byte_sequence_error.iyi", "\xfe\xff"
 
       format_command = Iyi::Command::FormatCommand.new([] of String, check: true, color: false, stdin: stdin, stdout: stdout, stderr: stderr)
       format_command.run
       format_command.status_code.should eq(1)
       stdout.to_s.should be_empty
-      stderr.to_s.should_not contain("not_format.cr")
-      stderr.to_s.should contain("formatting '#{Path[".", "format.cr"]}' produced changes")
-      stderr.to_s.should contain("syntax error in '#{Path[".", "syntax_error.cr"]}:1:3': unexpected token: EOF")
-      stderr.to_s.should contain("file '#{Path[".", "invalid_byte_sequence_error.cr"]}' is not a valid Crystal source file: Unexpected byte 0xfe at position 0, malformed UTF-8")
+      stderr.to_s.should_not contain("not_format.iyi")
+      stderr.to_s.should contain("formatting '#{Path[".", "format.iyi"]}' produced changes")
+      stderr.to_s.should contain("syntax error in '#{Path[".", "syntax_error.iyi"]}:1:3': unexpected token: EOF")
+      stderr.to_s.should contain("file '#{Path[".", "invalid_byte_sequence_error.iyi"]}' is not a valid iyi source file: Unexpected byte 0xfe at position 0, malformed UTF-8")
     end
   end
 
@@ -220,8 +226,8 @@ describe Iyi::Command::FormatCommand do
     stderr = IO::Memory.new
 
     with_tempdir do
-      File.write "format1.cr", "if true\n  1\nend\n"
-      File.write "format2.cr", "if true\n  2\nend\n"
+      File.write "format1.iyi", "if true\n  1\nend\n"
+      File.write "format2.iyi", "if true\n  2\nend\n"
 
       format_command = Iyi::Command::FormatCommand.new([] of String, check: true, color: false, stdin: stdin, stdout: stdout, stderr: stderr)
       format_command.run
@@ -237,10 +243,10 @@ describe Iyi::Command::FormatCommand do
     stderr = IO::Memory.new
 
     with_tempdir do
-      File.write "format.cr", "if true\n1\nend"
-      File.write "not_format.cr", "if true\n  1\nend\n"
+      File.write "format.iyi", "if true\n1\nend"
+      File.write "not_format.iyi", "if true\n  1\nend\n"
 
-      format_command = Iyi::Command::FormatCommand.new([] of String, check: true, excludes: ["format.cr"], color: false, stdin: stdin, stdout: stdout, stderr: stderr)
+      format_command = Iyi::Command::FormatCommand.new([] of String, check: true, excludes: ["format.iyi"], color: false, stdin: stdin, stdout: stdout, stderr: stderr)
       format_command.run
       format_command.status_code.should eq(0)
       stdout.to_s.should be_empty
@@ -254,14 +260,14 @@ describe Iyi::Command::FormatCommand do
     stderr = IO::Memory.new
 
     with_tempdir do
-      File.write "format.cr", "if true\n1\nend"
-      File.write "not_format.cr", "if true\n  1\nend\n"
+      File.write "format.iyi", "if true\n1\nend"
+      File.write "not_format.iyi", "if true\n  1\nend\n"
 
-      format_command = Iyi::Command::FormatCommand.new([] of String, check: true, excludes: ["format.cr"], includes: ["format.cr"], color: false, stdin: stdin, stdout: stdout, stderr: stderr)
+      format_command = Iyi::Command::FormatCommand.new([] of String, check: true, excludes: ["format.iyi"], includes: ["format.iyi"], color: false, stdin: stdin, stdout: stdout, stderr: stderr)
       format_command.run
       format_command.status_code.should eq(1)
       stdout.to_s.should be_empty
-      stderr.to_s.should contain("formatting '#{Path[".", "format.cr"]}' produced changes")
+      stderr.to_s.should contain("formatting '#{Path[".", "format.iyi"]}' produced changes")
     end
   end
 end

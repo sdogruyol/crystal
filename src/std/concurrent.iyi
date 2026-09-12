@@ -1,0 +1,45 @@
+# Crystal-compatible concurrency top-level primitives: spawn and sleep.
+#
+# Bridges Crystal's concurrent API with iyi's structured fiber scheduler.
+
+module std/concurrent
+
+pub import std/fiber
+using std/fiber::{Fiber}
+pub alias Fiber = ::IyiFiber
+
+pub def spawn(*, name : String? = nil, same_thread : Bool = false, &block : ->) : Fiber
+  f = Fiber.new(name, &block)
+  f.enqueue
+  f
+end
+
+pub macro spawn(call, *, name = nil, same_thread = false, &block)
+  {% if block %}
+    {% raise "`spawn(call)` can't be invoked with a block, did you mean `spawn(name: ...) { ... }`?" %}
+  {% end %}
+
+  spawn(name: {{name}}) do
+    {{call}}
+  end
+end
+
+pub def sleep(seconds : Number) : Nil
+  if seconds < 0
+    raise "Sleep seconds must be non-negative"
+  end
+  IyiScheduler.sleep_current((seconds * 1000).to_i32)
+  nil
+end
+
+pub def sleep(seconds : Int32) : Nil
+  if seconds < 0
+    raise "Sleep seconds must be non-negative"
+  end
+  IyiScheduler.sleep_current(seconds * 1000)
+  nil
+end
+
+pub def sleep : Nil
+  Fiber.suspend
+end

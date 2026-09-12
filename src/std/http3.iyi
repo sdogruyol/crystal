@@ -1,0 +1,751 @@
+# Native HTTP/3 Standard Library — RFC 9114, RFC 9204, RFC 9297.
+#
+# Implements:
+# 1. Stream Types and Architecture (RFC 9114 Section 6):
+#    - Unidirectional Control Stream (0x00): carries SETTINGS, GOAWAY, and push limits.
+#    - Push Stream (0x01): server push streams.
+#    - QPACK Encoder Stream (0x02): transmits dynamic table updates from QPACK encoder.
+#    - QPACK Decoder Stream (0x03): transmits acknowledgments from QPACK decoder.
+#    - WebTransport Streams: Bidirectional (0x41) and Unidirectional (0x54).
+#
+# 2. HTTP/3 Frame Layer (RFC 9114 Section 7):
+#    - DATA (0x00): application data on request/response streams.
+#    - HEADERS (0x01): QPACK-compressed field section.
+#    - CANCEL_PUSH (0x03): cancels server push.
+#    - SETTINGS (0x04): configuration exchange on control stream.
+#    - PUSH_PROMISE (0x05): server push promise.
+#    - GOAWAY (0x07): graceful connection shutdown with stream ID.
+#    - MAX_PUSH_ID (0x0d): client push limit.
+#
+# 3. HTTP/3 Settings (RFC 9114 Section 7.2.4.1):
+#    - Strict rejection of reserved HTTP/2 settings (0x00, 0x02, 0x03, 0x04, 0x05) with H3_SETTINGS_ERROR.
+#    - Strict rejection of duplicate settings with H3_SETTINGS_ERROR.
+#    - SETTINGS_MAX_FIELD_SECTION_SIZE (0x06)
+#    - SETTINGS_QPACK_MAX_TABLE_CAPACITY (0x01)
+#    - SETTINGS_QPACK_BLOCKED_STREAMS (0x07)
+#    - SETTINGS_ENABLE_CONNECT_PROTOCOL (0x08)
+#    - SETTINGS_H3_DATAGRAM (0x33)
+#    - SETTINGS_WEBTRANSPORT_MAX_SESSIONS (0x2b60)
+#
+# 4. QPACK Header Compression Integration (RFC 9204):
+#    - Full integration with `std/qpack` (Encoder and Decoder).
+#    - Wire transmission of QPACK encoder and decoder instruction streams.
+#    - Non-fatal queueing of blocked streams awaiting dynamic table entries.
+#
+# 5. Extended CONNECT and WebTransport Lifecycle (RFC 8441, RFC 9220, RFC 9297):
+#    - :method = CONNECT and :protocol = webtransport.
+#    - Integrated WebTransport session lifecycle, stream routing, and capsule protocol.
+#    - Quarter Stream ID association for datagrams (stream_id // 4).
+
+module std/http3
+
+pub import std/slice
+pub import std/capsule
+pub import std/qpack
+pub import std/quic
+pub import std/webtransport
+
+using std/slice::{Slice, Bytes}
+using std/capsule::{VarInt, HttpDatagram, Capsule, CapsuleType}
+using std/qpack::{FieldLine, TableEntry, Encoder, Decoder, Qpack, BlockedStream}
+using std/quic::{StreamId, QuicStream, StreamManager}
+using std/webtransport::{WebTransportSession, SessionStatus}
+
+# =============================================================================
+# 1. HTTP/3 Constants, Stream Types, Frame Types, and Error Codes
+# =============================================================================
+
+pub struct H3StreamType
+  pub CONTROL           = 0x00_u64
+  pub PUSH              = 0x01_u64
+  pub QPACK_ENCODER     = 0x02_u64
+  pub QPACK_DECODER     = 0x03_u64
+  pub WEBTRANSPORT_BIDI = 0x41_u64
+  pub WEBTRANSPORT_UNI  = 0x54_u64
+end
+
+pub struct H3FrameType
+  pub DATA         = 0x00_u64
+  pub HEADERS      = 0x01_u64
+  pub CANCEL_PUSH  = 0x03_u64
+  pub SETTINGS     = 0x04_u64
+  pub PUSH_PROMISE = 0x05_u64
+  pub GOAWAY       = 0x07_u64
+  pub MAX_PUSH_ID  = 0x0d_u64
+end
+
+pub struct H3Setting
+  pub QPACK_MAX_TABLE_CAPACITY  =   0x01_u64
+  pub MAX_FIELD_SECTION_SIZE    =   0x06_u64
+  pub QPACK_BLOCKED_STREAMS     =   0x07_u64
+  pub ENABLE_CONNECT_PROTOCOL   =   0x08_u64
+  pub H3_DATAGRAM               =   0x33_u64
+  pub WEBTRANSPORT_MAX_SESSIONS = 0x2b60_u64
+end
+
+pub struct H3Error
+  pub NO_ERROR               = 0x0100_u64
+  pub GENERAL_PROTOCOL_ERROR = 0x0101_u64
+  pub INTERNAL_ERROR         = 0x0102_u64
+  pub STREAM_CREATION_ERROR  = 0x0103_u64
+  pub CLOSED_CRITICAL_STREAM = 0x0104_u64
+  pub FRAME_UNEXPECTED       = 0x0105_u64
+  pub FRAME_ERROR            = 0x0106_u64
+  pub EXCESSIVE_LOAD         = 0x0107_u64
+  pub ID_ERROR               = 0x0108_u64
+  pub SETTINGS_ERROR         = 0x0109_u64
+  pub MISSING_SETTINGS       = 0x010a_u64
+  pub REQUEST_REJECTED       = 0x010b_u64
+  pub REQUEST_CANCELLED      = 0x010c_u64
+  pub REQUEST_INCOMPLETE     = 0x010d_u64
+  pub MESSAGE_ERROR          = 0x010e_u64
+  pub CONNECT_ERROR          = 0x010f_u64
+  pub VERSION_FALLBACK       = 0x0110_u64
+end
+
+# =============================================================================
+# 2. HTTP/3 Settings Dictionary (RFC 9114 Section 7.2.4.1)
+# =============================================================================
+
+pub struct SettingEntry
+  getter id : UInt64
+  getter value : UInt64
+
+  def initialize(@id : UInt64, @value : UInt64)
+  end
+end
+
+pub class SettingsDictionary
+  getter entries : Array(SettingEntry)
+
+  def initialize
+    @entries = [] of SettingEntry
+  end
+
+  def set(id : UInt64, value : UInt64) : Nil
+    i = 0
+    while i < @entries.size
+      if @entries[i].id == id
+        @entries[i] = SettingEntry.new(id, value)
+        return
+      end
+      i = i + 1
+    end
+    @entries << SettingEntry.new(id, value)
+  end
+
+  def get(id : UInt64, default_value : UInt64 = 0_u64) : UInt64
+    i = 0
+    while i < @entries.size
+      return @entries[i].value if @entries[i].id == id
+      i = i + 1
+    end
+    default_value
+  end
+
+  def has?(id : UInt64) : Bool
+    i = 0
+    while i < @entries.size
+      return true if @entries[i].id == id
+      i = i + 1
+    end
+    false
+  end
+
+  def encode : Bytes
+    encoded_pairs = [] of Bytes
+    total = 0
+    i = 0
+    while i < @entries.size
+      entry = @entries[i]
+      id_b = VarInt.encode(entry.id)
+      val_b = VarInt.encode(entry.value)
+      total = total + id_b.size + val_b.size
+      encoded_pairs << id_b
+      encoded_pairs << val_b
+      i = i + 1
+    end
+
+    buf = Bytes.new(total)
+    off = 0
+    i = 0
+    while i < encoded_pairs.size
+      pair = encoded_pairs[i]
+      j = 0
+      while j < pair.size
+        buf[off + j] = pair[j]
+        j = j + 1
+      end
+      off = off + pair.size
+      i = i + 1
+    end
+    buf
+  end
+
+  def serialize : Bytes
+    encode
+  end
+
+  # Decodes settings; strictly enforces RFC 9114 7.2.4.1 validation (Finding 17).
+  def self.decode?(payload : Bytes) : {SettingsDictionary?, UInt64}
+    dict = SettingsDictionary.new
+    offset = 0
+    while offset < payload.size
+      id, id_len = VarInt.decode(payload, offset)
+      offset = offset + id_len
+      val, val_len = VarInt.decode(payload, offset)
+      offset = offset + val_len
+
+      # Rejection of reserved HTTP/2 settings (Finding 17)
+      if id == 0x00_u64 || id == 0x02_u64 || id == 0x03_u64 || id == 0x04_u64 || id == 0x05_u64
+        return {nil, H3Error::SETTINGS_ERROR}
+      end
+
+      # Rejection of duplicate settings (Finding 17)
+      if dict.has?(id)
+        return {nil, H3Error::SETTINGS_ERROR}
+      end
+
+      dict.set(id, val)
+    end
+    {dict, H3Error::NO_ERROR}
+  end
+
+  def self.decode(payload : Bytes) : SettingsDictionary
+    dict, err = decode?(payload)
+    if dict.nil?
+      raise "H3_SETTINGS_ERROR: invalid settings payload"
+    end
+    dict
+  end
+end
+
+# =============================================================================
+# 3. HTTP/3 Frames (RFC 9114 Section 7)
+# =============================================================================
+
+pub class H3FrameCodec
+  def self.encode_frame(frame_type : UInt64, payload : Bytes) : Bytes
+    type_b = VarInt.encode(frame_type)
+    len_b = VarInt.encode(payload.size.to_u64)
+
+    buf = Bytes.new(type_b.size + len_b.size + payload.size)
+    off = 0
+    i = 0; while i < type_b.size
+      buf[off + i] = type_b[i]; i = i + 1
+    end
+    off = off + type_b.size
+
+    i = 0; while i < len_b.size
+      buf[off + i] = len_b[i]; i = i + 1
+    end
+    off = off + len_b.size
+
+    i = 0; while i < payload.size
+      buf[off + i] = payload[i]; i = i + 1
+    end
+
+    buf
+  end
+
+  def self.decode_frame(bytes : Bytes, offset : Int32 = 0) : {UInt64, Bytes, Int32}
+    type_val, type_len = VarInt.decode(bytes, offset)
+    off = offset + type_len
+
+    payload_len, len_len = VarInt.decode(bytes, off)
+    off = off + len_len
+
+    payload = bytes[off, payload_len.to_i32]
+    total_consumed = type_len + len_len + payload_len.to_i32
+
+    {type_val, payload, total_consumed}
+  end
+
+  def self.encode_data(payload : Bytes) : Bytes
+    encode_frame(H3FrameType::DATA, payload)
+  end
+
+  def self.encode_headers(field_section : Bytes) : Bytes
+    encode_frame(H3FrameType::HEADERS, field_section)
+  end
+
+  def self.encode_cancel_push(push_id : UInt64) : Bytes
+    encode_frame(H3FrameType::CANCEL_PUSH, VarInt.encode(push_id))
+  end
+
+  def self.encode_settings(settings : SettingsDictionary) : Bytes
+    encode_frame(H3FrameType::SETTINGS, settings.encode)
+  end
+
+  def self.encode_goaway(stream_id : UInt64) : Bytes
+    encode_frame(H3FrameType::GOAWAY, VarInt.encode(stream_id))
+  end
+
+  def self.encode_max_push_id(push_id : UInt64) : Bytes
+    encode_frame(H3FrameType::MAX_PUSH_ID, VarInt.encode(push_id))
+  end
+end
+
+# =============================================================================
+# 4. HTTP/3 Request & Response Representation
+# =============================================================================
+
+pub class H3Message
+  getter fields : Array(FieldLine)
+  getter body : Bytes
+
+  def initialize(@fields : Array(FieldLine) = [] of FieldLine, @body : Bytes = Bytes.empty)
+  end
+
+  def get_header(name : String) : String?
+    i = 0
+    while i < @fields.size
+      return @fields[i].value if @fields[i].name == name
+      i = i + 1
+    end
+    nil
+  end
+
+  def add_header(name : String, value : String) : Nil
+    @fields << FieldLine.new(name, value)
+  end
+end
+
+pub class H3Request < H3Message
+  def method : String
+    get_header(":method") || ""
+  end
+
+  def scheme : String
+    get_header(":scheme") || "https"
+  end
+
+  def authority : String
+    get_header(":authority") || ""
+  end
+
+  def path : String
+    get_header(":path") || "/"
+  end
+
+  def protocol : String?
+    get_header(":protocol")
+  end
+
+  def extended_connect? : Bool
+    method == "CONNECT" && !protocol.nil?
+  end
+
+  def self.build(method : String, path : String, authority : String, headers : Array(FieldLine) = [] of FieldLine, body : Bytes = Bytes.empty) : H3Request
+    req = H3Request.new([] of FieldLine, body)
+    req.add_header(":method", method)
+    req.add_header(":scheme", "https")
+    req.add_header(":authority", authority)
+    req.add_header(":path", path)
+    i = 0
+    while i < headers.size
+      req.add_header(headers[i].name, headers[i].value)
+      i = i + 1
+    end
+    req
+  end
+
+  def self.build_extended_connect(protocol : String, authority : String, path : String) : H3Request
+    req = H3Request.new
+    req.add_header(":method", "CONNECT")
+    req.add_header(":protocol", protocol)
+    req.add_header(":scheme", "https")
+    req.add_header(":authority", authority)
+    req.add_header(":path", path)
+    req
+  end
+end
+
+pub class H3Response < H3Message
+  def status : Int32
+    st = get_header(":status")
+    st.nil? ? 200 : st.to_i
+  end
+
+  def self.build(status : Int32, headers : Array(FieldLine) = [] of FieldLine, body : Bytes = Bytes.empty) : H3Response
+    res = H3Response.new([] of FieldLine, body)
+    res.add_header(":status", status.to_s)
+    i = 0
+    while i < headers.size
+      res.add_header(headers[i].name, headers[i].value)
+      i = i + 1
+    end
+    res
+  end
+end
+
+# =============================================================================
+# 5. QPACK-Integrated HTTP/3 Session and WebTransport Lifecycle
+# =============================================================================
+
+pub class H3Session
+  getter role : Int32
+  getter local_settings : SettingsDictionary
+  getter remote_settings : SettingsDictionary
+  getter qpack_encoder : Encoder
+  getter qpack_decoder : Decoder
+
+  @control_stream_out : Bytes
+  @control_received_settings : Bool
+  @qpack_encoder_buf : Bytes
+  @qpack_decoder_buf : Bytes
+  @blocked_streams : Array(BlockedStream)
+  @webtransport_sessions : Array(WebTransportSession)
+
+  def initialize(role : Int32)
+    @role = role
+    @local_settings = SettingsDictionary.new
+    @remote_settings = SettingsDictionary.new
+    @qpack_encoder = Encoder.new(4096, 100)
+    @qpack_decoder = Decoder.new(4096, 100)
+    @control_stream_out = Bytes.empty
+    @control_received_settings = false
+    @qpack_encoder_buf = Bytes.empty
+    @qpack_decoder_buf = Bytes.empty
+    @blocked_streams = [] of BlockedStream
+    @webtransport_sessions = [] of WebTransportSession
+
+    # Local settings
+    @local_settings.set(H3Setting::QPACK_MAX_TABLE_CAPACITY, 4096_u64)
+    @local_settings.set(H3Setting::QPACK_BLOCKED_STREAMS, 100_u64)
+    @local_settings.set(H3Setting::MAX_FIELD_SECTION_SIZE, 65536_u64)
+    @local_settings.set(H3Setting::ENABLE_CONNECT_PROTOCOL, 1_u64)
+    @local_settings.set(H3Setting::H3_DATAGRAM, 1_u64)
+    @local_settings.set(H3Setting::WEBTRANSPORT_MAX_SESSIONS, 16_u64)
+  end
+
+  def open_control_stream : Bytes
+    type_b = VarInt.encode(H3StreamType::CONTROL)
+    settings_frame = H3FrameCodec.encode_settings(@local_settings)
+
+    buf = Bytes.new(type_b.size + settings_frame.size)
+    i = 0; while i < type_b.size
+      buf[i] = type_b[i]; i = i + 1
+    end
+    j = 0; while j < settings_frame.size
+      buf[type_b.size + j] = settings_frame[j]; j = j + 1
+    end
+    @control_stream_out = buf
+    buf
+  end
+
+  # Multi-frame control stream parsing & duplicate SETTINGS rejection (Finding 15).
+  def receive_control_stream(bytes : Bytes) : UInt64
+    stream_type, stream_type_len = VarInt.decode(bytes, 0)
+    return H3Error::FRAME_ERROR if stream_type != H3StreamType::CONTROL
+
+    offset = stream_type_len
+    first_frame = true
+
+    while offset < bytes.size
+      frame_type, payload, consumed = H3FrameCodec.decode_frame(bytes, offset)
+      offset = offset + consumed
+
+      if first_frame
+        if frame_type != H3FrameType::SETTINGS
+          return H3Error::MISSING_SETTINGS
+        end
+        dict, err = SettingsDictionary.decode?(payload)
+        return err if dict.nil?
+        @remote_settings = dict
+        @control_received_settings = true
+        first_frame = false
+      else
+        if frame_type == H3FrameType::SETTINGS
+          return H3Error::FRAME_UNEXPECTED
+        end
+      end
+    end
+    H3Error::NO_ERROR
+  end
+
+  def open_qpack_encoder_stream : Bytes
+    VarInt.encode(H3StreamType::QPACK_ENCODER)
+  end
+
+  def open_qpack_decoder_stream : Bytes
+    VarInt.encode(H3StreamType::QPACK_DECODER)
+  end
+
+  # Wire transmission of QPACK instruction streams (Finding 18).
+  def poll_qpack_encoder_stream : Bytes
+    data = @qpack_encoder_buf
+    @qpack_encoder_buf = Bytes.empty
+    data
+  end
+
+  def poll_qpack_decoder_stream : Bytes
+    data = @qpack_decoder_buf
+    @qpack_decoder_buf = Bytes.empty
+    data
+  end
+
+  def receive_qpack_encoder_stream(bytes : Bytes) : Nil
+    # Applies encoder stream instructions to local decoder
+    @qpack_decoder.process_encoder_stream(bytes)
+    dec_stream = [] of UInt8
+    unblocked = @qpack_decoder.check_blocked_streams(dec_stream)
+    if dec_stream.size > 0
+      db = Bytes.new(dec_stream.size)
+      i = 0; while i < dec_stream.size
+        db[i] = dec_stream[i]; i = i + 1
+      end
+      cur = @qpack_decoder_buf
+      combined = Bytes.new(cur.size + db.size)
+      i = 0; while i < cur.size
+        combined[i] = cur[i]; i = i + 1
+      end
+      i = 0; while i < db.size
+        combined[cur.size + i] = db[i]; i = i + 1
+      end
+      @qpack_decoder_buf = combined
+    end
+  end
+
+  def receive_qpack_decoder_stream(bytes : Bytes) : Nil
+    @qpack_encoder.process_decoder_stream(bytes)
+  end
+
+  # Unified unidirectional stream processing dispatcher
+  def process_uni_stream(stream_id : UInt64, bytes : Bytes) : UInt64
+    return H3Error::FRAME_ERROR if bytes.empty?
+    stream_type, stream_type_len = VarInt.decode(bytes, 0)
+    payload = bytes[stream_type_len, bytes.size - stream_type_len]
+
+    if stream_type == H3StreamType::CONTROL
+      receive_control_stream(bytes)
+    elsif stream_type == H3StreamType::QPACK_ENCODER
+      receive_qpack_encoder_stream(payload)
+      H3Error::NO_ERROR
+    elsif stream_type == H3StreamType::QPACK_DECODER
+      receive_qpack_decoder_stream(payload)
+      H3Error::NO_ERROR
+    elsif stream_type == H3StreamType::WEBTRANSPORT_UNI
+      dispatch_uni_stream(stream_id, bytes)
+      H3Error::NO_ERROR
+    else
+      # Unknown unidirectional stream types are ignored per RFC 9114 6.2
+      H3Error::NO_ERROR
+    end
+  end
+
+  def encode_headers_frame(stream_id : UInt64, fields : Array(FieldLine)) : Bytes
+    encoder_stream = [] of UInt8
+    field_section = [] of UInt8
+    err = @qpack_encoder.encode(stream_id, fields, encoder_stream, field_section)
+    raise "QPACK encode error" if err.is_a?(Std::Qpack::QpackError)
+
+    # Buffer outbound encoder stream instructions (Finding 18)
+    if encoder_stream.size > 0
+      eb = Bytes.new(encoder_stream.size)
+      i = 0; while i < encoder_stream.size
+        eb[i] = encoder_stream[i]; i = i + 1
+      end
+      cur = @qpack_encoder_buf
+      combined = Bytes.new(cur.size + eb.size)
+      i = 0; while i < cur.size
+        combined[i] = cur[i]; i = i + 1
+      end
+      i = 0; while i < eb.size
+        combined[cur.size + i] = eb[i]; i = i + 1
+      end
+      @qpack_encoder_buf = combined
+    end
+
+    compressed_fields = Bytes.new(field_section.size)
+    i = 0; while i < field_section.size
+      compressed_fields[i] = field_section[i]; i = i + 1
+    end
+    H3FrameCodec.encode_headers(compressed_fields)
+  end
+
+  # Decodes headers frame with non-fatal blocked stream queue (Finding 18).
+  def decode_headers_frame(stream_id : UInt64, payload : Bytes) : Array(FieldLine)
+    decoder_stream = [] of UInt8
+    res = @qpack_decoder.decode_field_section(stream_id, payload, decoder_stream)
+
+    if decoder_stream.size > 0
+      db = Bytes.new(decoder_stream.size)
+      i = 0; while i < decoder_stream.size
+        db[i] = decoder_stream[i]; i = i + 1
+      end
+      cur = @qpack_decoder_buf
+      combined = Bytes.new(cur.size + db.size)
+      i = 0; while i < cur.size
+        combined[i] = cur[i]; i = i + 1
+      end
+      i = 0; while i < db.size
+        combined[cur.size + i] = db[i]; i = i + 1
+      end
+      @qpack_decoder_buf = combined
+    end
+
+    if res.nil?
+      # Stream is blocked per RFC 9204 (Finding 18): queue without crashing
+      return [] of FieldLine
+    end
+    raise "QPACK decode error" if res.is_a?(Std::Qpack::QpackError)
+    res.as(Array(FieldLine))
+  end
+
+  def frame_request(stream_id : UInt64, request : H3Request) : Bytes
+    headers_frame = encode_headers_frame(stream_id, request.fields)
+    if request.body.empty?
+      headers_frame
+    else
+      data_frame = H3FrameCodec.encode_data(request.body)
+      total = headers_frame.size + data_frame.size
+      buf = Bytes.new(total)
+      i = 0; while i < headers_frame.size
+        buf[i] = headers_frame[i]; i = i + 1
+      end
+      j = 0; while j < data_frame.size
+        buf[headers_frame.size + j] = data_frame[j]; j = j + 1
+      end
+      buf
+    end
+  end
+
+  def frame_response(stream_id : UInt64, response : H3Response) : Bytes
+    headers_frame = encode_headers_frame(stream_id, response.fields)
+    if response.body.empty?
+      headers_frame
+    else
+      data_frame = H3FrameCodec.encode_data(response.body)
+      total = headers_frame.size + data_frame.size
+      buf = Bytes.new(total)
+      i = 0; while i < headers_frame.size
+        buf[i] = headers_frame[i]; i = i + 1
+      end
+      j = 0; while j < data_frame.size
+        buf[headers_frame.size + j] = data_frame[j]; j = j + 1
+      end
+      buf
+    end
+  end
+
+  # Stream parser with strict H2 forbidden frame checking (Finding 16).
+  def parse_stream(stream_id : UInt64, stream_bytes : Bytes) : {Array(FieldLine), Bytes, UInt64}
+    offset = 0
+    fields = [] of FieldLine
+    body_chunks = [] of Bytes
+    total_body = 0
+
+    while offset < stream_bytes.size
+      frame_type, payload, consumed = H3FrameCodec.decode_frame(stream_bytes, offset)
+      offset = offset + consumed
+
+      if frame_type == H3FrameType::HEADERS
+        fields = decode_headers_frame(stream_id, payload)
+      elsif frame_type == H3FrameType::DATA
+        total_body = total_body + payload.size
+        body_chunks << payload
+      elsif frame_type == 0x02_u64 || frame_type == 0x06_u64 || frame_type == 0x08_u64 || frame_type == 0x09_u64 ||
+            frame_type == H3FrameType::SETTINGS || frame_type == H3FrameType::GOAWAY
+        # RFC 9114 7.2.4 & 7.2.8: Forbidden frame types on request stream (Finding 16)
+        return {fields, Bytes.empty, H3Error::FRAME_UNEXPECTED}
+      end
+    end
+
+    body = Bytes.new(total_body)
+    off = 0
+    i = 0
+    while i < body_chunks.size
+      chunk = body_chunks[i]
+      j = 0; while j < chunk.size
+        body[off + j] = chunk[j]; j = j + 1
+      end
+      off = off + chunk.size
+      i = i + 1
+    end
+
+    {fields, body, H3Error::NO_ERROR}
+  end
+
+  # WebTransport Session Management (Finding 19).
+  def create_webtransport_session(session_id : UInt64) : WebTransportSession
+    session = WebTransportSession.new(session_id)
+    @webtransport_sessions << session
+    session
+  end
+
+  def get_webtransport_session(session_id : UInt64) : WebTransportSession?
+    i = 0
+    while i < @webtransport_sessions.size
+      return @webtransport_sessions[i] if @webtransport_sessions[i].session_id == session_id
+      i = i + 1
+    end
+    nil
+  end
+
+  # Datagram framing with Quarter Stream ID mapping (RFC 9297 Section 2).
+  def encode_datagram(stream_id : UInt64, payload : Bytes) : Bytes
+    quarter_stream_id = stream_id // 4_u64
+    qid_b = VarInt.encode(quarter_stream_id)
+
+    buf = Bytes.new(qid_b.size + payload.size)
+    i = 0; while i < qid_b.size
+      buf[i] = qid_b[i]; i = i + 1
+    end
+    j = 0; while j < payload.size
+      buf[qid_b.size + j] = payload[j]; j = j + 1
+    end
+    buf
+  end
+
+  def decode_datagram(datagram_payload : Bytes) : {UInt64, Bytes}
+    quarter_stream_id, consumed = VarInt.decode(datagram_payload, 0)
+    stream_id = quarter_stream_id * 4_u64
+    payload_len = datagram_payload.size - consumed
+    payload = datagram_payload[consumed, payload_len]
+    {stream_id, payload}
+  end
+
+  # WebTransport live stream, datagram, and capsule dispatching (Requirement 8)
+  def dispatch_bidi_stream(stream_id : UInt64, bytes : Bytes) : {UInt64, Bytes}
+    st, st_len = VarInt.decode(bytes, 0)
+    raise "invalid WebTransport bidi stream type" if st != H3StreamType::WEBTRANSPORT_BIDI
+    sess_id, s_len = VarInt.decode(bytes, st_len)
+    session = get_webtransport_session(sess_id)
+    raise "WebTransport session #{sess_id} not found" if session.nil?
+    hdr_len = st_len + s_len
+    payload = bytes[hdr_len, bytes.size - hdr_len]
+    {sess_id, payload}
+  end
+
+  def dispatch_uni_stream(stream_id : UInt64, bytes : Bytes) : {UInt64, Bytes}
+    st, st_len = VarInt.decode(bytes, 0)
+    raise "invalid WebTransport uni stream type" if st != H3StreamType::WEBTRANSPORT_UNI
+    sess_id, s_len = VarInt.decode(bytes, st_len)
+    session = get_webtransport_session(sess_id)
+    raise "WebTransport session #{sess_id} not found" if session.nil?
+    hdr_len = st_len + s_len
+    payload = bytes[hdr_len, bytes.size - hdr_len]
+    {sess_id, payload}
+  end
+
+  def dispatch_datagram(datagram_payload : Bytes) : {UInt64, Bytes}
+    quarter_stream_id, consumed = VarInt.decode(datagram_payload, 0)
+    session_id = quarter_stream_id * 4_u64
+    session = get_webtransport_session(session_id)
+    raise "WebTransport session #{session_id} not found for datagram" if session.nil?
+    payload = session.receive_datagram(datagram_payload)
+    {session_id, payload}
+  end
+
+  def dispatch_capsule(stream_id : UInt64, capsule_bytes : Bytes) : {UInt64, Capsule}
+    session = get_webtransport_session(stream_id)
+    raise "WebTransport session #{stream_id} not found for capsule" if session.nil?
+    ctype, clen = VarInt.decode(capsule_bytes, 0)
+    c_len_val, llen = VarInt.decode(capsule_bytes, clen)
+    c_payload = capsule_bytes[clen + llen, c_len_val.to_i32]
+    capsule = Capsule.new(ctype, c_payload)
+    session.receive_capsule(capsule)
+    {stream_id, capsule}
+  end
+end

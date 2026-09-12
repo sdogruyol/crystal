@@ -1,0 +1,354 @@
+# QPACK standard library exercise (RFC 9204).
+#
+#   ./bin/iyi run bench/std_qpack_exercise.iyi
+#
+# Exercises the complete QPACK (HTTP/3 Header Compression) implementation:
+# 1. 99-entry Static Table (Appendix A) with exact and name lookups
+# 2. Dynamic Table with FIFO size-based eviction, capacity updates, and duplicate
+# 3. All RFC 9204 Appendix B worked examples verified byte-for-byte with exact hex
+# 4. Out-of-order stream delivery: stream blocks on missing table state and resolves
+# 5. Blocked-stream limit enforcement (SETTINGS_QPACK_BLOCKED_STREAMS)
+# 6. Security and liveness:
+#    - Table capacity limit enforcement (SETTINGS_QPACK_MAX_TABLE_CAPACITY)
+#    - Unsatisfiable Required Insert Count immediate rejection (does not hang!)
+#    - Decompression bomb defense (max header list size limit)
+#    - Never-indexed (N-bit) field protection
+#
+# Every section prints a progress line and raises on mismatch.
+
+import std/slice
+import std/qpack
+import std/hpack
+
+using std/slice::{Slice, Bytes}
+using std/hpack::{Integer, Huffman, HpackError}
+using std/qpack::{Qpack, TableEntry, FieldLine, Encoder, Decoder, QpackError, QPACK_DECOMPRESSION_FAILED, QPACK_ENCODER_STREAM_ERROR, QPACK_DECODER_STREAM_ERROR}
+
+# ===========================================================================
+# 1. Static Table (Appendix A, 99 entries)
+# ===========================================================================
+
+raise "static: table size must be 99" unless Qpack::STATIC_TABLE.size == 99
+
+e0 = Qpack.get_static(0)
+raise "static: index 0 not found" unless e0
+raise "static: index 0 name" unless e0.name == ":authority"
+raise "static: index 0 value" unless e0.value == ""
+
+e1 = Qpack.get_static(1)
+raise "static: index 1 not found" unless e1
+raise "static: index 1 name" unless e1.name == ":path"
+raise "static: index 1 value" unless e1.value == "/"
+
+e17 = Qpack.get_static(17)
+raise "static: index 17 not found" unless e17
+raise "static: index 17 name" unless e17.name == ":method"
+raise "static: index 17 value" unless e17.value == "GET"
+
+e25 = Qpack.get_static(25)
+raise "static: index 25 not found" unless e25
+raise "static: index 25 name" unless e25.name == ":status"
+raise "static: index 25 value" unless e25.value == "200"
+
+e98 = Qpack.get_static(98)
+raise "static: index 98 not found" unless e98
+raise "static: index 98 name" unless e98.name == "x-frame-options"
+raise "static: index 98 value" unless e98.value == "sameorigin"
+
+raise "static: index -1 should be nil" unless Qpack.get_static(-1).nil?
+raise "static: index 99 should be nil" unless Qpack.get_static(99).nil?
+
+raise "static: find exact :method GET" unless Qpack.find_static(":method", "GET") == 17
+raise "static: find exact :status 200" unless Qpack.find_static(":status", "200") == 25
+raise "static: find exact missing" unless Qpack.find_static(":method", "PATCH").nil?
+
+raise "static: find name :path" unless Qpack.find_static_name(":path") == 1
+raise "static: find name :method" unless Qpack.find_static_name(":method") == 15
+raise "static: find name missing" unless Qpack.find_static_name("x-missing-header").nil?
+
+puts "    static table: 99 entries, exact lookup, and name indexing verified"
+
+# ===========================================================================
+# 2. Dynamic Table (Capacity, Insertion, FIFO Eviction, Duplicate)
+# ===========================================================================
+
+dt = Std::Qpack::DynamicTable.new(max_capacity: 150)
+raise "dynamic: initial capacity" unless dt.capacity == 0
+raise "dynamic: initial size" unless dt.size == 0
+raise "dynamic: initial insert_count" unless dt.insert_count == 0_i64
+raise "dynamic: max_entries" unless dt.max_entries == 4 # 150 // 32 = 4
+
+dt.set_capacity(120)
+raise "dynamic: set capacity" unless dt.capacity == 120
+
+# Insert entry 1: name="host", value="example.com" -> size = 4 + 11 + 32 = 47
+dt.insert("host", "example.com")
+raise "dynamic: insert 1 size" unless dt.size == 47
+raise "dynamic: insert 1 count" unless dt.insert_count == 1_i64
+raise "dynamic: insert 1 dropped" unless dt.dropped_count == 0_i64
+
+# Insert entry 2: name="user-agent", value="iyi" -> size = 10 + 3 + 32 = 45
+dt.insert("user-agent", "iyi")
+raise "dynamic: insert 2 size" unless dt.size == 47 + 45 # 92
+raise "dynamic: insert 2 count" unless dt.insert_count == 2_i64
+
+# Insert entry 3: name="cookie", value="session=123" -> size = 6 + 11 + 32 = 49
+# 92 + 49 = 141 > 120 -> evicts entry 1 (size 47) -> new size = 94 <= 120
+dt.insert("cookie", "session=123")
+raise "dynamic: eviction size" unless dt.size == 94
+raise "dynamic: eviction dropped_count" unless dt.dropped_count == 1_i64
+raise "dynamic: eviction insert_count" unless dt.insert_count == 3_i64
+raise "dynamic: evicted entry should be nil" unless dt.get_by_absolute(0_i64).nil?
+
+e1_live = dt.get_by_absolute(1_i64)
+raise "dynamic: live entry 1 not found" unless e1_live
+raise "dynamic: live entry 1 name" unless e1_live.name == "user-agent"
+
+# Duplicate entry at relative index 0 (the cookie entry, abs_index = 3 - 0 - 1 = 2)
+# Duplicating adds cookie (size 49). 94 + 49 = 143 > 120 -> evicts entry 1 (user-agent, 45) -> new size = 98
+dt.duplicate(0_i64)
+raise "dynamic: duplicate count" unless dt.insert_count == 4_i64
+raise "dynamic: duplicate dropped" unless dt.dropped_count == 2_i64
+raise "dynamic: duplicate size" unless dt.size == 98
+
+e3 = dt.get_by_absolute(3_i64)
+raise "dynamic: duplicate entry not found" unless e3
+raise "dynamic: duplicate entry name" unless e3.name == "cookie"
+
+puts "    dynamic table: capacity, insertion, FIFO eviction, and duplicate verified"
+
+# ===========================================================================
+# 3. RFC 9204 Appendix B: Worked Examples with Exact Hex
+# ===========================================================================
+
+# B.1. Literal Field Line with Name Reference
+encoder_b1 = Encoder.new(max_table_capacity: 0, max_blocked_streams: 0)
+decoder_b1 = Decoder.new(max_table_capacity: 0, max_blocked_streams: 0)
+
+fields_b1 = [FieldLine.new(":path", "/index.html")]
+enc_stream_b1 = [] of UInt8
+payload_b1 = [] of UInt8
+err_b1 = encoder_b1.encode(0_u64, fields_b1, enc_stream_b1, payload_b1)
+raise "b1: encode error" if err_b1
+
+b1_bytes = Bytes.new(payload_b1.size) { |i| payload_b1[i] }
+raise "b1: stream 0 hex mismatch (expected 0000510b2f696e6465782e68746d6c, got #{b1_bytes.hexstring})" unless b1_bytes.hexstring == "0000510b2f696e6465782e68746d6c"
+
+dec_stream_b1 = [] of UInt8
+decoded_b1 = decoder_b1.decode_field_section(0_u64, b1_bytes, dec_stream_b1)
+raise "b1: decode failed" unless decoded_b1.is_a?(Array(FieldLine))
+raise "b1: field count" unless decoded_b1.size == 1
+raise "b1: field line mismatch" unless decoded_b1[0].name == ":path" && decoded_b1[0].value == "/index.html"
+
+# B.2. Dynamic Table
+encoder_b2 = Encoder.new(max_table_capacity: 220, max_blocked_streams: 100)
+decoder_b2 = Decoder.new(max_table_capacity: 220, max_blocked_streams: 100)
+
+enc_stream_b2 = [] of UInt8
+encoder_b2.set_capacity(220, enc_stream_b2)
+encoder_b2.insert_with_name_ref(true, 0_u64, "www.example.com", enc_stream_b2)
+encoder_b2.insert_with_name_ref(true, 1_u64, "/sample/path", enc_stream_b2)
+
+b2_enc_bytes = Bytes.new(enc_stream_b2.size) { |i| enc_stream_b2[i] }
+raise "b2: encoder stream hex mismatch (got #{b2_enc_bytes.hexstring})" unless b2_enc_bytes.hexstring == "3fbd01c00f7777772e6578616d706c652e636f6dc10c2f73616d706c652f70617468"
+
+decoder_b2.process_encoder_stream(b2_enc_bytes)
+raise "b2: dynamic table size mismatch" unless decoder_b2.dynamic_table.size == 106
+
+fields_b2 = [
+  FieldLine.new(":authority", "www.example.com"),
+  FieldLine.new(":path", "/sample/path"),
+]
+dummy_enc_b2 = [] of UInt8
+payload_b2 = [] of UInt8
+encoder_b2.encode(4_u64, fields_b2, dummy_enc_b2, payload_b2, base: 0_i64)
+
+b2_stream4_bytes = Bytes.new(payload_b2.size) { |i| payload_b2[i] }
+raise "b2: stream 4 hex mismatch (expected 03811011, got #{b2_stream4_bytes.hexstring})" unless b2_stream4_bytes.hexstring == "03811011"
+
+dec_stream_b2 = [] of UInt8
+decoded_b2 = decoder_b2.decode_field_section(4_u64, b2_stream4_bytes, dec_stream_b2)
+raise "b2: decode failed" unless decoded_b2.is_a?(Array(FieldLine))
+raise "b2: stream 4 count" unless decoded_b2.size == 2
+raise "b2: :authority mismatch" unless decoded_b2[0].name == ":authority" && decoded_b2[0].value == "www.example.com"
+raise "b2: :path mismatch" unless decoded_b2[1].name == ":path" && decoded_b2[1].value == "/sample/path"
+
+b2_dec_bytes = Bytes.new(dec_stream_b2.size) { |i| dec_stream_b2[i] }
+raise "b2: section ack hex mismatch (expected 84, got #{b2_dec_bytes.hexstring})" unless b2_dec_bytes.hexstring == "84"
+encoder_b2.process_decoder_stream(b2_dec_bytes)
+
+# B.3. Speculative Insert
+enc_stream_b3 = [] of UInt8
+encoder_b2.insert_with_literal_name("custom-key", "custom-value", enc_stream_b3)
+b3_enc_bytes = Bytes.new(enc_stream_b3.size) { |i| enc_stream_b3[i] }
+raise "b3: encoder stream hex mismatch (expected 4a637573746f6d2d6b65790c637573746f6d2d76616c7565, got #{b3_enc_bytes.hexstring})" unless b3_enc_bytes.hexstring == "4a637573746f6d2d6b65790c637573746f6d2d76616c7565"
+
+decoder_b2.process_encoder_stream(b3_enc_bytes)
+raise "b3: dynamic table size mismatch" unless decoder_b2.dynamic_table.size == 160
+
+dec_stream_b3 = [] of UInt8
+Qpack.encode_insert_count_increment(1_u64, dec_stream_b3)
+b3_dec_bytes = Bytes.new(dec_stream_b3.size) { |i| dec_stream_b3[i] }
+raise "b3: decoder increment mismatch (expected 01, got #{b3_dec_bytes.hexstring})" unless b3_dec_bytes.hexstring == "01"
+encoder_b2.process_decoder_stream(b3_dec_bytes)
+
+# B.4. Duplicate Instruction & Stream Cancellation
+enc_stream_b4 = [] of UInt8
+encoder_b2.duplicate(2_u64, enc_stream_b4)
+b4_enc_bytes = Bytes.new(enc_stream_b4.size) { |i| enc_stream_b4[i] }
+raise "b4: encoder duplicate mismatch (expected 02, got #{b4_enc_bytes.hexstring})" unless b4_enc_bytes.hexstring == "02"
+
+fields_b4 = [
+  FieldLine.new(":authority", "www.example.com"),
+  FieldLine.new(":path", "/"),
+  FieldLine.new("custom-key", "custom-value"),
+]
+dummy_enc_b4 = [] of UInt8
+payload_b4 = [] of UInt8
+encoder_b2.encode(8_u64, fields_b4, dummy_enc_b4, payload_b4)
+b4_stream8_bytes = Bytes.new(payload_b4.size) { |i| payload_b4[i] }
+raise "b4: stream 8 hex mismatch (expected 050080c181, got #{b4_stream8_bytes.hexstring})" unless b4_stream8_bytes.hexstring == "050080c181"
+
+dec_stream_b4 = [] of UInt8
+decoder_b2.cancel_stream(8_u64, dec_stream_b4)
+b4_dec_bytes = Bytes.new(dec_stream_b4.size) { |i| dec_stream_b4[i] }
+raise "b4: stream cancellation mismatch (expected 48, got #{b4_dec_bytes.hexstring})" unless b4_dec_bytes.hexstring == "48"
+encoder_b2.process_decoder_stream(b4_dec_bytes)
+
+decoder_b2.process_encoder_stream(b4_enc_bytes)
+raise "b4: dynamic table size mismatch" unless decoder_b2.dynamic_table.size == 217
+
+# B.5. Dynamic Table Insert, Eviction
+enc_stream_b5 = [] of UInt8
+encoder_b2.insert_with_name_ref(false, 1_u64, "custom-value2", enc_stream_b5)
+b5_enc_bytes = Bytes.new(enc_stream_b5.size) { |i| enc_stream_b5[i] }
+raise "b5: encoder stream mismatch (expected 810d637573746f6d2d76616c756532, got #{b5_enc_bytes.hexstring})" unless b5_enc_bytes.hexstring == "810d637573746f6d2d76616c756532"
+
+decoder_b2.process_encoder_stream(b5_enc_bytes)
+raise "b5: dynamic table size after eviction mismatch" unless decoder_b2.dynamic_table.size == 215
+
+puts "    appendix b: all RFC 9204 worked examples matched byte-for-byte"
+
+# ===========================================================================
+# 4. Out-of-Order Stream Delivery and Resolution
+# ===========================================================================
+
+enc_ooo = Encoder.new(max_table_capacity: 220, max_blocked_streams: 10)
+dec_ooo = Decoder.new(max_table_capacity: 220, max_blocked_streams: 10)
+
+enc_stream_ooo = [] of UInt8
+enc_ooo.set_capacity(220, enc_stream_ooo)
+
+fields_ooo1 = [FieldLine.new("x-custom-session", "session-token-12345")]
+payload_ooo1 = [] of UInt8
+enc_ooo.encode(4_u64, fields_ooo1, enc_stream_ooo, payload_ooo1)
+
+fields_ooo2 = [FieldLine.new("x-custom-session", "session-token-12345")]
+payload_ooo2 = [] of UInt8
+enc_ooo.encode(8_u64, fields_ooo2, enc_stream_ooo, payload_ooo2)
+
+bytes_ooo1 = Bytes.new(payload_ooo1.size) { |i| payload_ooo1[i] }
+bytes_ooo2 = Bytes.new(payload_ooo2.size) { |i| payload_ooo2[i] }
+bytes_enc_ooo = Bytes.new(enc_stream_ooo.size) { |i| enc_stream_ooo[i] }
+
+dec_stream_ooo = [] of UInt8
+
+# Deliver Stream 8 FIRST in reverse order
+res_ooo2 = dec_ooo.decode_field_section(8_u64, bytes_ooo2, dec_stream_ooo)
+raise "ooo: stream 8 should block" unless res_ooo2.nil?
+raise "ooo: stream 8 not marked blocked" unless dec_ooo.is_stream_blocked?(8_u64)
+raise "ooo: blocked count should be 1" unless dec_ooo.blocked_streams_count == 1
+
+# Process encoder stream instructions
+dec_ooo.process_encoder_stream(bytes_enc_ooo)
+raise "ooo: table insert count not updated" unless dec_ooo.dynamic_table.insert_count >= 1_i64
+
+# Check and unblock streams
+unblocked_ooo = dec_ooo.check_blocked_streams(dec_stream_ooo)
+raise "ooo: unblocked error" unless unblocked_ooo.is_a?(Array(Tuple(UInt64, Array(FieldLine))))
+raise "ooo: unblocked count" unless unblocked_ooo.size == 1
+sid_ooo, lines_ooo = unblocked_ooo[0]
+raise "ooo: stream ID mismatch" unless sid_ooo == 8_u64
+raise "ooo: header count" unless lines_ooo.size == 1
+raise "ooo: header value" unless lines_ooo[0].name == "x-custom-session" && lines_ooo[0].value == "session-token-12345"
+raise "ooo: stream 8 should no longer be blocked" if dec_ooo.is_stream_blocked?(8_u64)
+raise "ooo: blocked count should be 0" unless dec_ooo.blocked_streams_count == 0
+
+# Stream 4 can now also decode
+res_ooo1 = dec_ooo.decode_field_section(4_u64, bytes_ooo1, dec_stream_ooo)
+raise "ooo: stream 4 decode failed" unless res_ooo1.is_a?(Array(FieldLine))
+raise "ooo: stream 4 header value" unless res_ooo1[0].name == "x-custom-session" && res_ooo1[0].value == "session-token-12345"
+
+puts "    out-of-order delivery: stream blocks on missing table state and resolves without hang"
+
+# ===========================================================================
+# 5. Blocked Stream Limit Enforcement (SETTINGS_QPACK_BLOCKED_STREAMS)
+# ===========================================================================
+
+dec_limit = Decoder.new(max_table_capacity: 220, max_blocked_streams: 1)
+dummy_dec_stream = [] of UInt8
+
+# Stream 8 arrives and blocks -> blocked count = 1
+res_lim1 = dec_limit.decode_field_section(8_u64, bytes_ooo2, dummy_dec_stream)
+raise "limit: stream 8 should block" unless res_lim1.nil?
+raise "limit: blocked count should be 1" unless dec_limit.blocked_streams_count == 1
+
+# Stream 12 arrives and also requires table state, exceeding limit of 1
+res_lim2 = dec_limit.decode_field_section(12_u64, bytes_ooo2, dummy_dec_stream)
+raise "limit: stream 12 should be rejected" unless res_lim2.is_a?(QpackError)
+raise "limit: error code should be QPACK_DECOMPRESSION_FAILED" unless res_lim2.code == QPACK_DECOMPRESSION_FAILED
+
+# With max_blocked_streams = 0, any blocked stream must be rejected
+dec_zero_limit = Decoder.new(max_table_capacity: 220, max_blocked_streams: 0)
+res_zero = dec_zero_limit.decode_field_section(8_u64, bytes_ooo2, dummy_dec_stream)
+raise "zero limit: should reject immediately" unless res_zero.is_a?(QpackError)
+raise "zero limit: error code" unless res_zero.code == QPACK_DECOMPRESSION_FAILED
+
+puts "    blocked stream limit: SETTINGS_QPACK_BLOCKED_STREAMS strictly enforced"
+
+# ===========================================================================
+# 6. Security and Liveness
+# ===========================================================================
+
+# 6a. Table capacity limit enforcement
+dec_cap_sec = Decoder.new(max_table_capacity: 100, max_blocked_streams: 0)
+cap_buf = [] of UInt8
+Integer.encode(250_u64, 5, 0x20_u8, cap_buf) # Try capacity 250 > 100
+cap_bytes = Bytes.new(cap_buf.size) { |i| cap_buf[i] }
+res_cap = dec_cap_sec.process_encoder_stream(cap_bytes)
+raise "sec: table capacity limit bypassed" unless res_cap.is_a?(QpackError)
+raise "sec: table capacity error code" unless res_cap.code == QPACK_ENCODER_STREAM_ERROR
+
+# 6b. Unsatisfiable Required Insert Count immediate rejection (does not hang!)
+bad_ric_buf = [] of UInt8
+Integer.encode(255_u64, 8, 0_u8, bad_ric_buf)
+Integer.encode(0_u64, 7, 0_u8, bad_ric_buf)
+bad_ric_bytes = Bytes.new(bad_ric_buf.size) { |i| bad_ric_buf[i] }
+
+dec_no_table = Decoder.new(max_table_capacity: 0, max_blocked_streams: 10)
+res_unsatisfiable = dec_no_table.decode_field_section(99_u64, bad_ric_bytes, dummy_dec_stream)
+raise "sec: unsatisfiable RIC must be rejected immediately" unless res_unsatisfiable.is_a?(QpackError)
+raise "sec: unsatisfiable RIC error code" unless res_unsatisfiable.code == QPACK_DECOMPRESSION_FAILED
+
+# 6c. Decompression bomb defense: bound decoded header size
+dec_bomb = Decoder.new(max_table_capacity: 0, max_blocked_streams: 0, max_header_list_size: 40)
+fields_bomb = [FieldLine.new("x-large", "v" * 100)]
+bomb_payload = [] of UInt8
+enc_bomb = Encoder.new(max_table_capacity: 0, max_blocked_streams: 0)
+enc_stream_bomb = [] of UInt8
+enc_bomb.encode(1_u64, fields_bomb, enc_stream_bomb, bomb_payload)
+bomb_bytes = Bytes.new(bomb_payload.size) { |i| bomb_payload[i] }
+
+res_bomb = dec_bomb.decode_field_section(1_u64, bomb_bytes, dummy_dec_stream)
+raise "sec: decompression bomb must be rejected" unless res_bomb.is_a?(QpackError)
+raise "sec: decompression bomb error code" unless res_bomb.code == QPACK_DECOMPRESSION_FAILED
+
+# 6d. Never-indexed (N-bit) field protection
+field_n = FieldLine.new("password", "secret123", never_index: true)
+raise "sec: never_index flag true" unless field_n.never_index
+field_normal = FieldLine.new("accept", "*/*", never_index: false)
+raise "sec: never_index flag false" if field_normal.never_index
+
+puts "    security and liveness: table capacity cap, unsatisfiable RIC rejection, and decompression bomb defense verified"
+
+puts "all std/qpack checks passed"

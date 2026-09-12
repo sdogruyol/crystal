@@ -51,6 +51,14 @@ ALLOWED_PATHS: list[tuple[str, str]] = [
     (r"^scripts/", "generators that emit Crystal's stdlib tables"),
     # Drives the compatibility binary by the name a user types.
     (r"^spec/compiler-cli/", "compatibility binary's CLI specs"),
+    # The self-hosting lexer's oracle. It proves the iyi-written lexer agrees
+    # token for token with the frontend iyi is still bootstrapped from, so the
+    # other language is the thing being compared against, by name.
+    (r"^bench/selfhost_lexer_exercise\.sh$", "the frontend the selfhost lexer is checked against"),
+    # The UUID exercise records a spelling iyi cannot have: `v1!`..`v8!` are
+    # the other language's names, and `!` is an iyi operator. Naming the
+    # language there is the whole point of the note.
+    (r"^bench/std_utility_types_exercise\.(iyi|sh)$", "a spelling only the other language has"),
     # `tool bind` runs under `crystal`, on Crystal source, against Crystal's
     # library: it is how a shard is bound for an iyi consumer to import. The
     # bench drives that binary and names it throughout.
@@ -191,6 +199,10 @@ ALLOWED_LINES: list[tuple[str, str]] = [
     (r"__crystal_|crystal_type_id|crystal_instance_type_id|LibCrystalMain", "Crystal's runtime ABI symbols"),
     (r"Crystal::(LLVM_VERSION|VERSION|DESCRIPTION|ABI)", "constants the bootstrap injects"),
     (r"Crystal\.format|module Crystal\b", "Crystal's own API, called or reopened"),
+    (
+        r"language = source\.filename",
+        "labels invalid .cr input as the compatibility language",
+    ),
     (r"```crystal", "a fenced code block's language tag"),
     (r"samples/crystal/", "programs that exist to use Crystal's library"),
     (r"src/crystal/", "a path inside Crystal's standard library"),

@@ -114,6 +114,14 @@ prove_fails() {
     cp -R "$WORK/foundation/std/." "$WORK/$dir/std/"
   fi
   sed -e "$sed_script" "$REPO/src/std/iterator.iyi" > "$WORK/$dir/std/iterator.iyi"
+  # A patch that matches nothing leaves the library intact, and an intact
+  # library passes, which reads as "this check cannot fail" when the truth is
+  # that nothing was broken to test it. Line-anchored patches drift.
+  if cmp -s "$REPO/src/std/iterator.iyi" "$WORK/$dir/std/iterator.iyi"; then
+    echo "  $label: the patch changed nothing, so this proves nothing"
+    status=1
+    return
+  fi
   if ! IYI_PATH="$WORK/$dir:$BASE_IYI_PATH" "$IYI" build \
        -o "$WORK/$dir/program" "$REPO/bench/std_iterator_exercise.iyi" \
        >"$WORK/$dir/build.log" 2>&1; then
@@ -145,11 +153,11 @@ prove_fails "take limit broken" broken_take "assertion failed for infinite take"
 
 # 2. Pipeline mapping broken (map iterator returns nil prematurely)
 prove_fails "map transform broken" broken_map "assertion failed for pipeline result" \
-  's/def next : U?/def next : U?; return nil/g'
+  's/def next : U[?]/def next : U?; return nil/g'
 
 # 3. Select filtering broken (fails to loop over elements)
 prove_fails "select predicate broken" broken_select "assertion failed for pipeline result" \
-  's/while !(item = @iter\.next)\.nil?/item = @iter.next; if !item.nil?/'
+  's/while !(item = @iter\.next)\.nil[?]/item = @iter.next; if !item.nil?/'
 # 4. Skip broken (fails to advance past requested count)
 prove_fails "skip count broken" broken_skip "assertion failed for skip" \
   's/while @skipped < @n/while @skipped < 0/'

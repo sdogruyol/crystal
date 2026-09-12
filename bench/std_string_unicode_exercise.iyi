@@ -1,0 +1,316 @@
+# Complete text primitives, string, unicode, scanner, pool, levenshtein, and pretty_print exercise.
+#
+# Covers:
+# 1. unicode: validation, case mapping, categories, UTF-16, normalization
+# 2. string_scanner: lexical scanning, patterns, offsets, lookahead/behind
+# 3. string_pool: deduplication, bytes/string lookups, rehashing
+# 4. levenshtein: edit distance, candidate search, tolerance
+# 5. pretty_print: indentation, groups, breakables, line width limits
+# 6. text: String::Builder, slices, range indexing, chops, hex, transformations
+# 7. format: sprintf, printf, string interpolation, flags and widths
+
+import std/slice
+using std/slice::{Slice, Bytes}
+import std/text
+import std/unicode
+import std/string_scanner
+import std/string_pool
+import std/levenshtein
+import std/pretty_print
+import std/format
+using std/format
+import std/regex
+using std/regex::{Regex}
+
+def assert(cond : Bool, message : String) : Nil
+  raise message unless cond
+end
+
+def assert_equal(expected, actual, message : String) : Nil
+  raise "#{message}: expected #{expected.inspect}, got #{actual.inspect}" unless expected == actual
+end
+
+# 1. Unicode operations
+puts "== unicode operations"
+
+# Validation
+assert(Unicode.valid?("hello world"), "unicode: valid ascii")
+assert(Unicode.valid?("héllo wörld"), "unicode: valid utf8")
+assert(Unicode.valid?("こんにちは"), "unicode: valid cjk")
+assert(Unicode.valid?(""), "unicode: valid empty")
+
+# Overlong rejection
+bad_bytes = Bytes.new(2)
+bad_bytes[0] = 0xC0_u8
+bad_bytes[1] = 0xAF_u8
+assert(!Unicode.valid?(bad_bytes), "unicode: reject overlong 2-byte")
+
+bad_e0 = Bytes.new(3)
+bad_e0[0] = 0xE0_u8
+bad_e0[1] = 0x80_u8
+bad_e0[2] = 0xAF_u8
+assert(!Unicode.valid?(bad_e0), "unicode: reject overlong 3-byte")
+
+# Clean UTF-8
+assert_equal("valid", Unicode.clean_utf8("valid"), "unicode: clean valid")
+assert_equal("\u{FFFD}\u{FFFD}", Unicode.clean_utf8(bad_bytes), "unicode: clean invalid")
+
+# Case conversions
+assert_equal('A', Unicode.upcase('a'), "unicode: upcase ascii")
+assert_equal('a', Unicode.downcase('A'), "unicode: downcase ascii")
+assert_equal('É', Unicode.upcase('é'), "unicode: upcase latin1")
+assert_equal('é', Unicode.downcase('É'), "unicode: downcase latin1")
+assert_equal('Ω', Unicode.upcase('ω'), "unicode: upcase greek")
+assert_equal('ω', Unicode.downcase('Ω'), "unicode: downcase greek")
+assert_equal('Я', Unicode.upcase('я'), "unicode: upcase cyrillic")
+assert_equal('я', Unicode.downcase('Я'), "unicode: downcase cyrillic")
+
+# Turkic options
+assert_equal('I', Unicode.upcase('ı', Unicode::CaseOptions::Turkic), "unicode: turkic upcase dotless i")
+assert_equal('\u{0130}', Unicode.upcase('i', Unicode::CaseOptions::Turkic), "unicode: turkic upcase dotted i")
+assert_equal('ı', Unicode.downcase('I', Unicode::CaseOptions::Turkic), "unicode: turkic downcase capital I")
+assert_equal('i', Unicode.downcase('\u{0130}', Unicode::CaseOptions::Turkic), "unicode: turkic downcase capital I with dot")
+
+# Foldcase
+assert_equal("ss", Unicode.foldcase("ß", Unicode::CaseOptions::Fold), "unicode: foldcase esszet")
+
+# Categories
+assert(Unicode.lowercase?('a') && Unicode.lowercase?('é') && Unicode.lowercase?('ω'), "unicode: lowercase")
+assert(Unicode.uppercase?('A') && Unicode.uppercase?('É') && Unicode.uppercase?('Ω'), "unicode: uppercase")
+assert(Unicode.letter?('x') && Unicode.letter?('日') && Unicode.letter?('가'), "unicode: letter")
+assert(Unicode.number?('5') && Unicode.number?('\u{0663}'), "unicode: number")
+assert(Unicode.whitespace?(' ') && Unicode.whitespace?('\t') && Unicode.whitespace?('\u{00A0}'), "unicode: whitespace")
+assert(Unicode.control?('\u{0007}') && Unicode.control?('\u{001B}'), "unicode: control")
+assert(Unicode.ascii?('Z') && !Unicode.ascii?('Ω'), "unicode: ascii")
+
+# UTF-16
+assert_equal(5, Unicode.utf16_size("hello"), "unicode: utf16 size ascii")
+assert_equal(2, Unicode.utf16_size("😀"), "unicode: utf16 size surrogate pair")
+u16_buf = Std::Slice::Slice(UInt16).new(4, 0_u16)
+units = Unicode.encode_utf16("A😀B", u16_buf)
+assert_equal(4, units, "unicode: utf16 encode count")
+assert_equal("A😀B", Unicode.decode_utf16(u16_buf), "unicode: utf16 decode roundtrip")
+
+# Normalization (Hangul decomposition & composition)
+hangul = "각"
+assert(Unicode.normalized?(hangul, Unicode::NormalizationForm::NFC), "unicode: hangul nfc")
+decomp = Unicode.normalize(hangul, Unicode::NormalizationForm::NFD)
+assert(decomp.size > 1, "unicode: hangul nfd decomposes")
+assert_equal(hangul, Unicode.normalize(decomp, Unicode::NormalizationForm::NFC), "unicode: hangul recomposes")
+
+puts "      unicode: validation, case mapping, categories, UTF-16, and normalization verified"
+
+# 2. StringScanner operations
+puts "== string_scanner operations"
+
+s = StringScanner.new("hello 12345 world")
+assert(!s.eos?, "scanner: initial not eos")
+assert_equal(0, s.offset, "scanner: initial offset")
+assert_equal(0, s.byte_offset, "scanner: initial byte_offset")
+
+# scan string
+assert_equal("hello", s.scan("hello"), "scanner: scan string match")
+assert_equal(nil, s.scan("hello"), "scanner: scan string non-match")
+assert_equal(5, s.offset, "scanner: offset after scan")
+
+# peek and peek_behind
+assert_equal(" 12", s.peek(3), "scanner: peek 3")
+assert_equal("llo", s.peek_behind(3), "scanner: peek_behind 3")
+
+# skip and skip_until
+assert_equal(1, s.skip(" "), "scanner: skip space")
+assert_equal("12345", s.scan(Regex.new("\\d+")), "scanner: scan regex")
+assert(s.matched?, "scanner: matched flag")
+assert_equal("12345", s[0], "scanner: group 0")
+
+assert_equal(6, s.skip_until("world"), "scanner: skip_until string")
+assert(s.eos?, "scanner: eos reached")
+assert_equal("", s.rest, "scanner: rest empty at eos")
+
+# rewind and reset
+s.rewind(5)
+assert_equal("world", s.rest, "scanner: rewind rest")
+s.reset
+assert_equal(0, s.offset, "scanner: reset to 0")
+assert_equal("h", s.current_char.to_s, "scanner: current_char")
+assert_equal('h'.ord.to_u8, s.current_byte, "scanner: current_byte")
+
+# check and check_until
+assert_equal("hello", s.check("hello"), "scanner: check anchored")
+assert_equal(0, s.offset, "scanner: check does not advance")
+assert_equal("hello 12345", s.check_until("12345"), "scanner: check_until")
+assert_equal(0, s.offset, "scanner: check_until does not advance")
+
+# terminate
+s.terminate
+assert(s.eos?, "scanner: terminate reaches eos")
+
+puts "      scanner: scanning, lookahead, regex, offsets, and boundaries verified"
+
+# 3. StringPool operations
+puts "== string_pool operations"
+
+pool = StringPool.new(8)
+assert(pool.empty?, "pool: initially empty")
+assert_equal(0, pool.size, "pool: initial size 0")
+
+s1 = pool.get("namespace")
+s2 = pool.get("namespace")
+assert_equal("namespace", s1, "pool: get value")
+assert(s1.same?(s2), "pool: deduplication reuses same instance")
+assert_equal(1, pool.size, "pool: size after single insert")
+
+# get?
+assert_equal("namespace", pool.get?("namespace"), "pool: get? existing")
+assert_equal(nil, pool.get?("ruby"), "pool: get? absent")
+
+# Bytes get
+b_slice = "language".to_slice
+s3 = pool.get(b_slice)
+assert_equal("language", s3, "pool: get from Bytes")
+assert_equal("language", pool.get?("language"), "pool: find language after Bytes insert")
+
+# Rehash under load
+i = 0
+while i < 100
+  key = "item_#{i}"
+  inserted = pool.get(key)
+  assert_equal(key, inserted, "pool: stress insert value")
+  i += 1
+end
+assert(pool.size >= 100, "pool: grown size")
+assert_equal("item_42", pool.get?("item_42"), "pool: lookup after rehash")
+
+puts "      string_pool: instance reuse, Bytes lookup, and rehashing verified"
+
+# 4. Levenshtein operations
+puts "== levenshtein operations"
+
+assert_equal(0, Levenshtein.distance("same", "same"), "levenshtein: identical strings distance 0")
+assert_equal(4, Levenshtein.distance("", "test"), "levenshtein: empty to test distance 4")
+assert_equal(4, Levenshtein.distance("test", ""), "levenshtein: test to empty distance 4")
+assert_equal(3, Levenshtein.distance("kitten", "sitting"), "levenshtein: kitten to sitting")
+assert_equal(1, Levenshtein.distance("héllo", "hallo"), "levenshtein: utf8 distance")
+
+# Finder
+finder = Levenshtein::Finder.new("hello", 2)
+finder.test("hullo")
+finder.test("hel")
+finder.test("hall")
+finder.test("completely_different")
+assert_equal("hullo", finder.best_match, "levenshtein: finder best match")
+
+best_match = Levenshtein.find("target", ["targe", "targ", "wrong"], 1)
+assert_equal("targe", best_match, "levenshtein: find with array")
+
+puts "      levenshtein: distance, unicode handling, and finder matching verified"
+
+# 5. PrettyPrint operations
+puts "== pretty_print operations"
+
+formatted = [1, 2, 3].pretty_inspect(20)
+assert_equal("[1, 2, 3]", formatted, "pretty_print: compact array")
+
+nested = PrettyPrint.format(String::Builder.new, 10) do |pp|
+  pp.group(2, "(", ")") do
+    pp.text "alpha"
+    pp.comma
+    pp.text "beta"
+    pp.comma
+    pp.text "gamma"
+  end
+end.to_s
+assert(nested.includes?("\n"), "pretty_print: line breaking on overflow")
+
+puts "      pretty_print: groups, nesting, breakables, and width limits verified"
+
+# 6. Text primitives and String extensions
+puts "== text primitives"
+
+str = "The Quick Brown Fox"
+assert_equal(19, str.size, "text: size")
+assert_equal(19, str.bytesize, "text: bytesize")
+assert(str.single_byte_optimizable?, "text: single_byte_optimizable")
+assert(str.ascii_only?, "text: ascii_only")
+assert(str.present?, "text: present")
+assert(!str.blank?, "text: not blank")
+
+# Comparisons
+assert_equal(0, str <=> "The Quick Brown Fox", "text: spaceship equal")
+assert_equal(-1, "abc" <=> "abd", "text: spaceship less")
+assert_equal(1, "abd" <=> "abc", "text: spaceship greater")
+assert_equal(0, "ABC".compare("abc", case_insensitive: true), "text: case_insensitive compare")
+
+# Character & byte access
+assert_equal('T', str.char_at(0), "text: char_at 0")
+assert_equal('x', str.char_at(-1), "text: char_at -1")
+assert_equal('T'.ord.to_u8, str.byte_at(0), "text: byte_at 0")
+assert_equal(84, str.codepoint_at(0), "text: codepoint_at 0")
+
+# Index conversion
+assert_equal(4, str.char_index_to_byte_index(4), "text: char to byte index")
+assert_equal(4, str.byte_index_to_char_index(4), "text: byte to char index")
+
+# Slicing and Ranges
+assert_equal("Quick", str.byte_slice(4, 5), "text: byte_slice offset/count")
+assert_equal("Quick", str.byte_slice(4..8), "text: byte_slice inclusive range")
+assert_equal("Quick", str.byte_slice(4...9), "text: byte_slice exclusive range")
+assert_equal("Quick", str[4..8], "text: slice operator inclusive range")
+assert_equal("Quick", str[4...9], "text: slice operator exclusive range")
+
+# Delete at & insert
+assert_equal("The  Brown Fox", str.delete_at(4, 5), "text: delete_at count")
+assert_equal("The Brown Fox", str.delete_at(4..9), "text: delete_at range")
+assert_equal("The Really Quick Brown Fox", str.insert(4, "Really "), "text: insert string")
+
+# Chops
+assert_equal("Quick", "Quick!".rchop("!"), "text: rchop string")
+assert_equal("Quick", "Quick!".rchop('!'), "text: rchop char")
+assert_equal("Quick", "!Quick".lchop("!"), "text: lchop string")
+assert_equal("Quick", "!Quick".lchop('!'), "text: lchop char")
+
+# Hex
+hex_str = "48656c6c6f"
+bytes = hex_str.hexbytes
+assert_equal(5, bytes.size, "text: hexbytes size")
+assert_equal("Hello", String.new(bytes.size) { |b| b.copy_from(bytes.to_unsafe, bytes.size) }, "text: hexbytes content")
+assert_equal("48656c6c6f", "Hello".to_hex, "text: to_hex")
+
+# Transformations
+assert_equal("the_quick_brown_fox", str.underscore, "text: underscore")
+assert_equal("theQuickBrownFox", "the_quick_brown_fox".camelcase(lower: true), "text: camelcase lower")
+assert_equal("TheQuickBrownFox", "the_quick_brown_fox".camelcase(lower: false), "text: camelcase upper")
+assert_equal("The Quick Brown Fox", "the_quick_brown_fox".titleize, "text: titleize")
+
+# Block variants
+cnt = "banana".count { |c| c == 'a' }
+assert_equal(3, cnt, "text: count with block")
+del = "banana".delete { |c| c == 'a' }
+assert_equal("bnn", del, "text: delete with block")
+sqz = "baaaanaaaana".squeeze { |c| c == 'a' }
+assert_equal("banana", sqz, "text: squeeze with block")
+
+# String::Builder
+built = String.build(32) do |b|
+  b << "iyi "
+  b << '0'
+  b.print(".3")
+  b.puts(".0")
+  b.chomp('\n'.ord.to_u8)
+end
+assert_equal("iyi 0.3.0", built, "text: String::Builder output")
+
+puts "      text: slices, ranges, index conversions, chops, hex, and builder verified"
+
+# 7. Format strings
+puts "== format strings"
+
+assert_equal("val: 42", sprintf("val: %d", 42), "format: sprintf decimal")
+assert_equal("hex: 0x2a", sprintf("hex: %#x", 42), "format: sprintf hex prefix")
+assert_equal("pi:   3.14", sprintf("pi: %6.2f", 3.14159), "format: sprintf float precision")
+assert_equal("padded:   test", sprintf("padded: %6s", "test"), "format: sprintf string width")
+assert_equal("number: 007", "number: %03d" % 7, "format: percent operator")
+
+puts "      format: decimal, hex, float, width, and percent operator verified"
+
+puts "all std/string_unicode checks passed"

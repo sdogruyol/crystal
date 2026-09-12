@@ -114,6 +114,7 @@ def measured() -> dict[str, int]:
         "prelude": wc(sorted((REPO / "src/iyi").glob("*.iyi"))),
         "prelude_library": prelude_library_lines(),
         "std": wc(sorted((REPO / "src/std").glob("*.iyi"))),
+        "std_modules": len(sorted((REPO / "src/std").glob("*.iyi"))),
         "compiler": wc(sorted((REPO / "src/compiler").rglob("*.cr"))),
         "samples": len(sorted((REPO / "samples/iyi").glob("*.iyi"))),
         # Bytes on disk, not lines: the docs quote the library's size as a
@@ -197,6 +198,13 @@ CLAIMS: list[tuple[str, str, str, int]] = [
     ("prelude", r"against iyi's own ([\d,]+)-line library", "CHANGELOG.md", 1),
     ("prelude", r"against iyi's own ([\d,]+)-line", "samples/iyi/calc.iyi", 1),
     ("std", r"own prelude \+ ([\d,]+) in std", "SPEC.md", 1),
+    # Two more sentences quote the same number in prose. They were written
+    # untracked, drifted the moment the library grew, and the table above went
+    # on passing beside them.
+    ("std", r"`src/std/` is \*\*([\d,]+) lines across", "SPEC.md", 1),
+    ("std", r"the standard library, ([\d,]+) lines of iyi", "README.md", 1),
+    ("std_modules", r"lines across ([\w-]+)\s+modules", "SPEC.md", 1),
+    ("std_modules", r"lines of iyi across ([\w-]+) modules", "README.md", 1),
     ("compiler", r"\| ([\d,]+) lines, Crystal, forked", "SPEC.md", 1),
     ("spec_iyi", r"\| ([\d,]+) for iyi \|", "SPEC.md", 1),
     ("prelude_kb", r"library is ([\d,]+) KB on disk", "README.md", 1),
@@ -224,15 +232,26 @@ CLAIMS: list[tuple[str, str, str, int]] = [
 # The prose spells small numbers as words and should keep doing so, so the
 # check reads words as well as digits rather than pushing digits into a
 # sentence to suit itself.
-WORDS = {
-    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
-    "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12,
-    "thirteen": 13, "fourteen": 14, "fifteen": 15, "sixteen": 16,
-    "seventeen": 17, "eighteen": 18, "nineteen": 19, "twenty": 20,
-    "twenty-one": 21, "twenty-two": 22, "twenty-three": 23,
-    "twenty-four": 24, "twenty-five": 25, "twenty-six": 26,
-    "twenty-seven": 27, "twenty-eight": 28, "twenty-nine": 29, "thirty": 30,
-}
+# Built rather than listed. The hand-written table ran out twice, once at
+# twenty and once at thirty, and each time the gate reported a spelled-out
+# number as unreadable rather than reporting the count that had actually
+# moved. Generating it to a hundred means the next sample does not stop the
+# check working.
+_UNITS = ["", "one", "two", "three", "four", "five", "six", "seven", "eight",
+          "nine", "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen",
+          "sixteen", "seventeen", "eighteen", "nineteen"]
+_TENS = ["", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy",
+         "eighty", "ninety"]
+
+
+def _spell(n: int) -> str:
+    if n < 20:
+        return _UNITS[n]
+    tens, unit = divmod(n, 10)
+    return _TENS[tens] if unit == 0 else f"{_TENS[tens]}-{_UNITS[unit]}"
+
+
+WORDS = {_spell(n): n for n in range(1, 100)}
 
 
 def as_number(raw: str) -> int | None:

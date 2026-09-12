@@ -1,0 +1,402 @@
+# Standard web library exercise for iyi.
+#
+# Exercises std/uri, std/mime, and std/html:
+# - RFC 3986 URI parsing, building, percent-encoding/decoding, query parameters,
+#   IPv6 literal hosts, dot-segment removal, normalization, and the complete
+#   RFC 3986 section 5.4 resolution test table.
+# - MIME media type parsing with parameters, quoted parameter values,
+#   file-extension-to-type table, filename lookups, custom registration,
+#   and database loading.
+# - HTML escaping of the five predefined entities, unescaping of 253 standard
+#   named entities, decimal and hex numeric references, and handling of
+#   bare ampersands, unterminated entities, and out-of-range codepoints.
+
+import std/uri
+using std/uri::{URI, Params}
+
+import std/mime
+using std/mime::{MediaType, MIME}
+
+import std/html
+using std/html::{HTML}
+
+puts "== percent-encoding and decoding"
+
+# 1. Round trips for percent-encoding including multi-byte characters
+utf8_str = "hello world / path & query ? foo=й & bar=日本語 & emoji=\u{1F600}"
+enc_utf8 = URI.encode(utf8_str)
+raise "percent: encode multi-byte missing %" unless enc_utf8.includes?("%")
+dec_utf8 = URI.decode(enc_utf8)
+raise "percent: utf8 roundtrip mismatch" unless dec_utf8 == utf8_str
+raise "percent: decode? nilable" unless URI.decode?(enc_utf8) == utf8_str
+
+# 2. Prevent double-encoding of already-encoded string
+already_enc = "user%20name%2Fpath%3Dvalue%26test%2B1"
+re_enc = URI.encode(already_enc)
+raise "percent: double-encoded already encoded string" unless re_enc == already_enc
+
+# 3. Raw percent character gets encoded as %25
+raw_pct = "100% pure juice"
+enc_raw = URI.encode(raw_pct)
+raise "percent: raw percent not encoded" unless enc_raw == "100%25%20pure%20juice"
+raise "percent: decode raw percent" unless URI.decode(enc_raw) == raw_pct
+
+# 4. Specific percent-encoding variants
+path_str = "dir/sub dir/file with space.txt"
+raise "percent: encode_path" unless URI.encode_path(path_str) == "dir/sub%20dir/file%20with%20space.txt"
+
+seg_str = "foo/bar"
+raise "percent: encode_path_segment" unless URI.encode_path_segment(seg_str) == "foo%2Fbar"
+
+form_str = "hello world & foo=bar"
+raise "percent: encode_www_form" unless URI.encode_www_form(form_str) == "hello+world+%26+foo%3Dbar"
+raise "percent: decode_www_form" unless URI.decode_www_form("hello+world+%26+foo%3Dbar") == form_str
+raise "percent: decode_www_form?" unless URI.decode_www_form?("hello+world") == "hello world"
+
+# 5. Character classification helpers
+raise "char class: unreserved a" unless URI.unreserved?('a'.ord.to_u8)
+raise "char class: unreserved 9" unless URI.unreserved?('9'.ord.to_u8)
+raise "char class: unreserved hyphen" unless URI.unreserved?('-'.ord.to_u8)
+raise "char class: unreserved dot" unless URI.unreserved?('.'.ord.to_u8)
+raise "char class: unreserved underscore" unless URI.unreserved?('_'.ord.to_u8)
+raise "char class: unreserved tilde" unless URI.unreserved?('~'.ord.to_u8)
+raise "char class: reserved slash" unless URI.reserved?('/'.ord.to_u8)
+raise "char class: gen_delim colon" unless URI.gen_delim?(':'.ord.to_u8)
+raise "char class: sub_delim ampersand" unless URI.sub_delim?('&'.ord.to_u8)
+
+# 6. Rejection of truncated and invalid percent escapes via decode?
+raise "trap: truncated % not rejected" unless URI.decode?("foo%2").nil?
+raise "trap: bare % not rejected" unless URI.decode?("foo%").nil?
+raise "trap: invalid hex not rejected" unless URI.decode?("foo%ZZ").nil?
+
+puts "    percent-encoding: utf8 roundtrip, no double-encoding, and invalid escape rejection verified"
+
+puts "== URI parsing, construction, and query parameters"
+
+# 1. Parsing complete URI
+uri1 = URI.parse("https://user:secret@example.com:8443/api/v1/resource?id=100&filter=active#section-2")
+raise "uri: scheme" unless uri1.scheme == "https"
+raise "uri: user" unless uri1.user == "user"
+raise "uri: password" unless uri1.password == "secret"
+raise "uri: userinfo" unless uri1.userinfo == "user:secret"
+raise "uri: host" unless uri1.host == "example.com"
+raise "uri: port" unless uri1.port == 8443
+raise "uri: path" unless uri1.path == "/api/v1/resource"
+raise "uri: query" unless uri1.query == "id=100&filter=active"
+raise "uri: fragment" unless uri1.fragment == "section-2"
+raise "uri: authority" unless uri1.authority == "user:secret@example.com:8443"
+raise "uri: absolute" unless uri1.absolute?
+raise "uri: relative" if uri1.relative?
+raise "uri: opaque" if uri1.opaque?
+raise "uri: to_s" unless uri1.to_s == "https://user:secret@example.com:8443/api/v1/resource?id=100&filter=active#section-2"
+
+# 2. Mutators and userinfo setter
+uri_mut = URI.new
+uri_mut.scheme = "http"
+uri_mut.userinfo = "alice:pass123"
+raise "uri: userinfo setter user" unless uri_mut.user == "alice"
+raise "uri: userinfo setter pass" unless uri_mut.password == "pass123"
+uri_mut.host = "test.local"
+uri_mut.port = 8080
+uri_mut.path = "/index.html"
+uri_mut.query = "page=1"
+uri_mut.fragment = "top"
+raise "uri: build to_s" unless uri_mut.to_s == "http://alice:pass123@test.local:8080/index.html?page=1#top"
+
+# 3. Equality and duplication
+uri_dup = uri1.dup
+raise "uri: dup equality" unless uri_dup == uri1
+
+# 4. IPv6 literal hosts in brackets
+uri_v6 = URI.parse("http://[2001:db8::1]:8080/status")
+raise "uri: ipv6 host" unless uri_v6.host == "[2001:db8::1]"
+raise "uri: ipv6 hostname" unless uri_v6.hostname == "2001:db8::1"
+raise "uri: ipv6 unwrap" unless URI.unwrap_ipv6("[::1]") == "::1"
+raise "uri: ipv6 unwrap plain" unless URI.unwrap_ipv6("example.com") == "example.com"
+raise "uri: ipv6 to_s" unless uri_v6.to_s == "http://[2001:db8::1]:8080/status"
+
+# Automatically wrap bare IPv6 host in host=
+uri_v6_bare = URI.new
+uri_v6_bare.host = "fe80::1"
+raise "uri: host= wraps ipv6" unless uri_v6_bare.host == "[fe80::1]"
+
+# 5. Query parameters handling (Params)
+params = Params.new
+params.add("tag", "web")
+params.add("tag", "iyi")
+params.add("sort", "desc")
+raise "params: size" unless params.size == 3
+raise "params: empty?" if params.empty?
+raise "params: has_key?" unless params.has_key?("tag")
+raise "params: []" unless params["tag"] == "web"
+raise "params: []?" unless params["sort"]? == "desc"
+raise "params: []? missing" unless params["missing"]?.nil?
+
+all_tags = params.fetch_all("tag")
+raise "params: fetch_all size" unless all_tags.size == 2
+raise "params: fetch_all[0]" unless all_tags[0] == "web"
+raise "params: fetch_all[1]" unless all_tags[1] == "iyi"
+
+params["sort"] = "asc"
+raise "params: []= update" unless params["sort"] == "asc"
+
+deleted_tags = params.delete("tag")
+raise "params: delete nil check" if deleted_tags.nil?
+raise "params: delete size" unless deleted_tags && deleted_tags.size == 2
+raise "params: has_key? after delete" if params.has_key?("tag")
+
+# Params iteration
+params.add("k1", "v1")
+count_iter = 0
+params.each do |k, v|
+  count_iter = count_iter + 1
+end
+raise "params: each count" unless count_iter == 2
+
+# Parsing query strings with repeated keys and + as space
+parsed_params = Params.parse("category=programming+language&item=iyi&item=cinnabar;author=jason")
+raise "params: parse category" unless parsed_params["category"] == "programming language"
+item_list = parsed_params.fetch_all("item")
+raise "params: parse repeated" unless item_list.size == 2 && item_list[0] == "iyi" && item_list[1] == "cinnabar"
+raise "params: parse author" unless parsed_params["author"] == "jason"
+raise "params: to_s" unless parsed_params.to_s.includes?("category=programming+language")
+
+# URI integration with query_params
+uri_qp = URI.parse("http://example.com/search?q=test")
+qp = uri_qp.query_params
+qp.add("page", "2")
+uri_qp.query_params = qp
+raise "uri: query_params=" unless uri_qp.to_s == "http://example.com/search?q=test&page=2"
+
+puts "    uri and params: components, ipv6, equality, and query param manipulation verified"
+
+puts "== dot-segment removal and normalisation"
+
+# 1. Dot segments (RFC 3986 section 5.2.4)
+raise "dots: /a/b/../c" unless URI.remove_dot_segments("/a/b/../c") == "/a/c"
+raise "dots: root escape /../" unless URI.remove_dot_segments("/../") == "/"
+raise "dots: root escape multiple /../../a" unless URI.remove_dot_segments("/../../a") == "/a"
+raise "dots: single dot /a/./b" unless URI.remove_dot_segments("/a/./b") == "/a/b"
+raise "dots: trailing dot /a/b/." unless URI.remove_dot_segments("/a/b/.") == "/a/b/"
+raise "dots: trailing double dot /a/b/.." unless URI.remove_dot_segments("/a/b/..") == "/a/"
+raise "dots: empty string" unless URI.remove_dot_segments("") == ""
+
+# 2. Normalisation
+norm = URI.parse("HTTP://EXAMPLE.COM:80/a/b/../c/./d?x=1").normalize
+raise "norm: scheme" unless norm.scheme == "http"
+raise "norm: host" unless norm.host == "example.com"
+raise "norm: port default removed" unless norm.port.nil?
+raise "norm: path" unless norm.path == "/a/c/d"
+
+# Default ports
+raise "port: http" unless URI.default_port("HTTP") == 80
+raise "port: https" unless URI.default_port("https") == 443
+raise "port: ftp" unless URI.default_port("ftp") == 21
+raise "port: ssh" unless URI.default_port("ssh") == 22
+raise "port: unknown" unless URI.default_port("custom").nil?
+
+# In-place normalization
+norm_ip = URI.parse("HTTPS://SECURE.ORG:443/./path")
+norm_ip.normalize_in_place
+raise "norm_in_place: scheme" unless norm_ip.scheme == "https"
+raise "norm_in_place: host" unless norm_ip.host == "secure.org"
+raise "norm_in_place: port" unless norm_ip.port.nil?
+raise "norm_in_place: path" unless norm_ip.path == "/path"
+
+puts "    dot segments and normalisation: root escapes, dot removal, and port elision verified"
+
+puts "== RFC 3986 section 5.4 resolution table"
+
+# Base URI from RFC 3986 section 5.4:
+base_uri = URI.parse("http://a/b/c/d;p?q")
+
+def test_resolve(base : URI, ref : String, expected : String) : Nil
+  actual = base.resolve(ref).to_s
+  if actual != expected
+    puts "  FAIL: ref='" + ref + "' got='" + actual + "' expected='" + expected + "'"
+    raise "RFC 3986 resolution failure for: " + ref
+  else
+    puts "    resolve: " + ref + " -> " + actual
+  end
+end
+
+# Section 5.4.1: Normal Examples
+test_resolve(base_uri, "g:h", "g:h")
+test_resolve(base_uri, "g", "http://a/b/c/g")
+test_resolve(base_uri, "./g", "http://a/b/c/g")
+test_resolve(base_uri, "g/", "http://a/b/c/g/")
+test_resolve(base_uri, "/g", "http://a/g")
+test_resolve(base_uri, "//g", "http://g")
+test_resolve(base_uri, "?y", "http://a/b/c/d;p?y")
+test_resolve(base_uri, "g?y", "http://a/b/c/g?y")
+test_resolve(base_uri, "#s", "http://a/b/c/d;p?q#s")
+test_resolve(base_uri, "g#s", "http://a/b/c/g#s")
+test_resolve(base_uri, "g?y#s", "http://a/b/c/g?y#s")
+test_resolve(base_uri, ";x", "http://a/b/c/;x")
+test_resolve(base_uri, "g;x", "http://a/b/c/g;x")
+test_resolve(base_uri, "g;x?y#s", "http://a/b/c/g;x?y#s")
+test_resolve(base_uri, "", "http://a/b/c/d;p?q")
+test_resolve(base_uri, ".", "http://a/b/c/")
+test_resolve(base_uri, "./", "http://a/b/c/")
+test_resolve(base_uri, "..", "http://a/b/")
+test_resolve(base_uri, "../", "http://a/b/")
+test_resolve(base_uri, "../g", "http://a/b/g")
+test_resolve(base_uri, "../..", "http://a/")
+test_resolve(base_uri, "../../", "http://a/")
+test_resolve(base_uri, "../../g", "http://a/g")
+
+# Section 5.4.2: Abnormal Examples
+test_resolve(base_uri, "../../../g", "http://a/g")
+test_resolve(base_uri, "../../../../g", "http://a/g")
+test_resolve(base_uri, "/./g", "http://a/g")
+test_resolve(base_uri, "/../g", "http://a/g")
+test_resolve(base_uri, "g.", "http://a/b/c/g.")
+test_resolve(base_uri, ".g", "http://a/b/c/.g")
+test_resolve(base_uri, "g..", "http://a/b/c/g..")
+test_resolve(base_uri, "..g", "http://a/b/c/..g")
+test_resolve(base_uri, "./../g", "http://a/b/g")
+test_resolve(base_uri, "./g/.", "http://a/b/c/g/")
+test_resolve(base_uri, "g/./h", "http://a/b/c/g/h")
+test_resolve(base_uri, "g/../h", "http://a/b/c/h")
+test_resolve(base_uri, "g;x=1/./y", "http://a/b/c/g;x=1/y")
+test_resolve(base_uri, "g;x=1/../y", "http://a/b/c/y")
+test_resolve(base_uri, "g?y/./x", "http://a/b/c/g?y/./x")
+test_resolve(base_uri, "g?y/../x", "http://a/b/c/g?y/../x")
+test_resolve(base_uri, "g#s/./x", "http://a/b/c/g#s/./x")
+test_resolve(base_uri, "g#s/../x", "http://a/b/c/g#s/../x")
+test_resolve(base_uri, "http:g", "http:g")
+
+puts "    RFC 3986 section 5.4: all 42 reference resolutions verified"
+
+puts "== MIME media types and registry"
+
+# 1. Parsing media types with parameters
+mt1 = MediaType.parse("text/html; charset=utf-8")
+raise "mime: parse media_type" unless mt1.media_type == "text/html"
+raise "mime: parse type" unless mt1.type == "text"
+raise "mime: parse sub_type" unless mt1.sub_type == "html"
+raise "mime: parse param" unless mt1["charset"] == "utf-8"
+raise "mime: parse param ?" unless mt1["charset"]? == "utf-8"
+raise "mime: has_key?" unless mt1.has_key?("CHARSET")
+raise "mime: fetch found" unless mt1.fetch("charset", "latin1") == "utf-8"
+raise "mime: fetch fallback" unless mt1.fetch("missing", "default") == "default"
+raise "mime: to_s" unless mt1.to_s == "text/html; charset=utf-8"
+
+# 2. Mutating parameters
+mt1["level"] = "1"
+raise "mime: []=" unless mt1["level"] == "1"
+
+# 3. Quoted parameter value with spaces and escaped quotes
+mt_quoted = MediaType.parse("multipart/form-data; boundary=\"----Boundary 123\"; note=\"hello \\\"escaped\\\"\"")
+raise "mime: quoted boundary" unless mt_quoted["boundary"] == "----Boundary 123"
+raise "mime: quoted escaped" unless mt_quoted["note"] == "hello \"escaped\""
+
+# 4. Token validation methods
+raise "mime: token_byte true" unless MediaType.token_byte?('a'.ord.to_u8)
+raise "mime: token_byte false space" if MediaType.token_byte?(' '.ord.to_u8)
+raise "mime: token_string true" unless MediaType.token_string?("utf-8")
+raise "mime: token_string false" if MediaType.token_string?("utf 8")
+
+# 5. Iterating parameters
+param_count = 0
+mt_quoted.each_parameter do |k, v|
+  param_count = param_count + 1
+end
+raise "mime: each_parameter count" unless param_count == 2
+
+# 6. Built-in extension lookups
+raise "mime: ext html" unless MIME.from_extension(".html") == "text/html; charset=utf-8"
+raise "mime: ext htm" unless MIME.from_extension("htm") == "text/html; charset=utf-8"
+raise "mime: ext css" unless MIME.from_extension(".css") == "text/css; charset=utf-8"
+raise "mime: ext js" unless MIME.from_extension(".js") == "text/javascript; charset=utf-8"
+raise "mime: ext json" unless MIME.from_extension(".json") == "application/json"
+raise "mime: ext png" unless MIME.from_extension(".png") == "image/png"
+raise "mime: ext jpeg" unless MIME.from_extension(".jpeg") == "image/jpeg"
+raise "mime: ext svg" unless MIME.from_extension(".svg") == "image/svg+xml"
+raise "mime: ext wasm" unless MIME.from_extension(".wasm") == "application/wasm"
+raise "mime: ext pdf" unless MIME.from_extension(".pdf") == "application/pdf"
+raise "mime: ext unknown nil" unless MIME.from_extension?(".unknown_xyz").nil?
+
+# 7. Filename lookups
+raise "mime: filename path" unless MIME.from_filename("assets/images/header.svg") == "image/svg+xml"
+raise "mime: filename plain" unless MIME.from_filename("index.html") == "text/html; charset=utf-8"
+raise "mime: filename nil" unless MIME.from_filename?("no_extension").nil?
+
+# 8. Reverse lookup: extensions for type
+html_exts = MIME.extensions("text/html")
+raise "mime: extensions contains .html" unless html_exts.includes?(".html")
+raise "mime: extensions contains .htm" unless html_exts.includes?(".htm")
+
+# 9. Dynamic registration
+MIME.register(".iyi", "text/x-iyi; charset=utf-8")
+raise "mime: custom reg" unless MIME.from_extension(".iyi") == "text/x-iyi; charset=utf-8"
+raise "mime: custom filename" unless MIME.from_filename("bench/test.iyi") == "text/x-iyi; charset=utf-8"
+
+# 10. Database loading
+custom_db = "# Custom mime types\ntext/x-source src\napplication/x-archive arc\n"
+MIME.load_mime_database(custom_db)
+raise "mime: db loaded src" unless MIME.from_extension(".src") == "text/x-source"
+raise "mime: db loaded arc" unless MIME.from_extension(".arc") == "application/x-archive"
+
+puts "    media types and mime registry: parsing, quoted parameters, extensions, and database loading verified"
+
+puts "== HTML escaping and unescaping"
+
+# 1. Escaping the five predefined entities
+escaped = HTML.escape("Tom & Jerry <friends> \"forever\" 'always'")
+expected_escaped = "Tom &amp; Jerry &lt;friends&gt; &quot;forever&quot; &#39;always&#39;"
+raise "html: escape mismatch" unless escaped == expected_escaped
+
+# Clean string returns identical string without allocation
+clean_text = "Clean string without any markup"
+raise "html: escape clean" unless HTML.escape(clean_text) == clean_text
+
+# 2. Unescaping named entities
+unescaped_named = HTML.unescape("&quot;Tom &amp; Jerry&quot; &lt;rocks&gt; &copy; 2026 &euro; 100 &reg; &trade; &apos;test&apos;")
+expected_named = "\"Tom & Jerry\" <rocks> © 2026 € 100 ® ™ 'test'"
+raise "html: unescape named mismatch" unless unescaped_named == expected_named
+
+# 3. Decimal numeric entities
+unescaped_dec = HTML.unescape("&#60;hello&#62; &#8364; &#169;")
+raise "html: unescape decimal" unless unescaped_dec == "<hello> € ©"
+
+# 4. Hexadecimal numeric entities (both lower x and upper X)
+unescaped_hex = HTML.unescape("&#x3c;hex&#x3E; &#x20AC; &#X1F600;")
+raise "html: unescape hex" unless unescaped_hex == "<hex> € \u{1F600}"
+
+# 5. Trap: bare ampersands that are not entities
+bare_amp = "AT&T and B&N with 5 & 10 and trailing &"
+raise "trap: bare ampersand altered" unless HTML.unescape(bare_amp) == bare_amp
+
+# 6. Trap: unterminated entities
+unterminated_numeric = "prefix &# suffix"
+raise "trap: unterminated &#" unless HTML.unescape(unterminated_numeric) == unterminated_numeric
+
+unterminated_hex = "prefix &#x suffix"
+raise "trap: unterminated &#x" unless HTML.unescape(unterminated_hex) == unterminated_hex
+
+unterminated_unknown = "prefix &unknown; and &unterminated suffix"
+raise "trap: unknown entity" unless HTML.unescape(unterminated_unknown) == unterminated_unknown
+
+# 7. Trap: numeric reference outside valid Unicode range
+out_of_range = HTML.unescape("&#9999999999;")
+raise "trap: out of range" unless out_of_range == "\u{FFFD}"
+
+surrogate_cp = HTML.unescape("&#xD800;")
+raise "trap: surrogate" unless surrogate_cp == "\u{FFFD}"
+
+zero_codepoint = HTML.unescape("&#0;")
+raise "trap: zero codepoint" unless zero_codepoint == "\u{FFFD}"
+
+# 8. Windows-1252 entity remapping
+win_euro = HTML.unescape("&#128;")
+raise "html: win1252 euro" unless win_euro == "€"
+
+# 9. Individual named entity codepoint lookup
+raise "html: named_entity_codepoint" unless HTML.named_entity_codepoint("amp") == 38
+raise "html: named_entity_codepoint copy" unless HTML.named_entity_codepoint("copy") == 169
+raise "html: named_entity_codepoint missing" unless HTML.named_entity_codepoint("nonexistent") == -1
+
+puts "    html escaping: predefined entities, named/numeric unescape, and trap cases verified"
+
+puts "all std/web checks passed"

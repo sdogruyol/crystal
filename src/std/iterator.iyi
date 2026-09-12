@@ -77,6 +77,22 @@ pub trait Iterator
     ArrayIterator(T).new(array)
   end
 
+  def self.of(range : Range(B, E)) : RangeIterator(B, E) forall B, E
+    RangeIterator(B, E).new(range)
+  end
+
+  def self.of_keys(hash : Hash(K, V)) : KeyIterator(K, V) forall K, V
+    KeyIterator(K, V).new(hash)
+  end
+
+  def self.of_values(hash : Hash(K, V)) : ValueIterator(K, V) forall K, V
+    ValueIterator(K, V).new(hash)
+  end
+
+  def self.of_entries(hash : Hash(K, V)) : EntryIterator(K, V) forall K, V
+    EntryIterator(K, V).new(hash)
+  end
+
   # ---- lazy adaptors -------------------------------------------------------
 
   def map(&func : Elem -> U) : MapIterator(self, Elem, U) forall U
@@ -309,6 +325,182 @@ impl Iterator for ArrayIterator(T) forall T
     else
       nil
     end
+  end
+end
+
+pub struct RangeIterator(B, E)
+  @range : Range(B, E)
+  @current : B
+  @done : Bool
+
+  def initialize(@range : Range(B, E))
+    @current = @range.begin
+    @done = false
+  end
+
+  def next : B?
+    return nil if @done
+    val = @current
+    if @range.exclusive?
+      if val >= @range.end
+        @done = true
+        return nil
+      end
+    else
+      if val > @range.end
+        @done = true
+        return nil
+      end
+    end
+    @current = @current + 1
+    val
+  end
+end
+
+impl Iterator for RangeIterator(B, E) forall B, E
+  type Elem = B
+
+  def next : B?
+    return nil if @done
+    val = @current
+    if @range.exclusive?
+      if val >= @range.end
+        @done = true
+        return nil
+      end
+    else
+      if val > @range.end
+        @done = true
+        return nil
+      end
+    end
+    @current = @current + 1
+    val
+  end
+end
+
+pub struct KeyIterator(K, V)
+  @hash : Hash(K, V)
+  @index : Int32
+
+  def initialize(@hash : Hash(K, V))
+    @index = 0
+  end
+
+  def next : K?
+    if @index < @hash.size
+      key = @hash.keys[@index]
+      @index = @index + 1
+      key
+    else
+      nil
+    end
+  end
+end
+
+impl Iterator for KeyIterator(K, V) forall K, V
+  type Elem = K
+
+  def next : K?
+    if @index < @hash.size
+      key = @hash.keys[@index]
+      @index = @index + 1
+      key
+    else
+      nil
+    end
+  end
+end
+
+pub struct ValueIterator(K, V)
+  @hash : Hash(K, V)
+  @index : Int32
+
+  def initialize(@hash : Hash(K, V))
+    @index = 0
+  end
+
+  def next : V?
+    if @index < @hash.size
+      val = @hash.values[@index]
+      @index = @index + 1
+      val
+    else
+      nil
+    end
+  end
+end
+
+impl Iterator for ValueIterator(K, V) forall K, V
+  type Elem = V
+
+  def next : V?
+    if @index < @hash.size
+      val = @hash.values[@index]
+      @index = @index + 1
+      val
+    else
+      nil
+    end
+  end
+end
+
+pub struct EntryIterator(K, V)
+  @hash : Hash(K, V)
+  @index : Int32
+
+  def initialize(@hash : Hash(K, V))
+    @index = 0
+  end
+
+  def next : ::Tuple(K, V)?
+    if @index < @hash.size
+      entry = {@hash.keys[@index], @hash.values[@index]}
+      @index = @index + 1
+      entry
+    else
+      nil
+    end
+  end
+end
+
+impl Iterator for EntryIterator(K, V) forall K, V
+  type Elem = ::Tuple(K, V)
+
+  def next : ::Tuple(K, V)?
+    if @index < @hash.size
+      entry = {@hash.keys[@index], @hash.values[@index]}
+      @index = @index + 1
+      entry
+    else
+      nil
+    end
+  end
+end
+
+class ::Array(T)
+  def each_iterator : Std::Iterator::ArrayIterator(T)
+    Std::Iterator::ArrayIterator(T).new(self)
+  end
+end
+
+struct ::Range(B, E)
+  def each_iterator : Std::Iterator::RangeIterator(B, E)
+    Std::Iterator::RangeIterator(B, E).new(self)
+  end
+end
+
+class ::Hash(K, V)
+  def each_key_iterator : Std::Iterator::KeyIterator(K, V)
+    Std::Iterator::KeyIterator(K, V).new(self)
+  end
+
+  def each_value_iterator : Std::Iterator::ValueIterator(K, V)
+    Std::Iterator::ValueIterator(K, V).new(self)
+  end
+
+  def each_iterator : Std::Iterator::EntryIterator(K, V)
+    Std::Iterator::EntryIterator(K, V).new(self)
   end
 end
 
@@ -547,7 +739,7 @@ pub struct ZipIterator(I1, T1, I2, T2)
   def initialize(@iter1 : I1, @iter2 : I2)
   end
 
-  def next : Tuple(T1, T2)?
+  def next : ::Tuple(T1, T2)?
     item1 = @iter1.next
     item2 = @iter2.next
     if item1.nil? || item2.nil?
@@ -559,9 +751,9 @@ pub struct ZipIterator(I1, T1, I2, T2)
 end
 
 impl Iterator for ZipIterator(I1, T1, I2, T2) forall I1, T1, I2, T2
-  type Elem = Tuple(T1, T2)
+  type Elem = ::Tuple(T1, T2)
 
-  def next : Tuple(T1, T2)?
+  def next : ::Tuple(T1, T2)?
     item1 = @iter1.next
     item2 = @iter2.next
     if item1.nil? || item2.nil?
@@ -748,7 +940,7 @@ pub struct WithIndexIterator(I, T)
     @index = @offset
   end
 
-  def next : Tuple(T, Int32)?
+  def next : ::Tuple(T, Int32)?
     item = @iter.next
     if item.nil?
       nil
@@ -761,9 +953,9 @@ pub struct WithIndexIterator(I, T)
 end
 
 impl Iterator for WithIndexIterator(I, T) forall I, T
-  type Elem = Tuple(T, Int32)
+  type Elem = ::Tuple(T, Int32)
 
-  def next : Tuple(T, Int32)?
+  def next : ::Tuple(T, Int32)?
     item = @iter.next
     if item.nil?
       nil

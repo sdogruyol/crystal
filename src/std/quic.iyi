@@ -1,0 +1,3289 @@
+# Native QUIC Transport Protocol — RFC 9000, RFC 9001, RFC 9002.
+#
+# Implements:
+# 1. Packet Protection (RFC 9001):
+#    - Initial, Handshake, and 1-RTT key derivation via HKDF-Expand-Label.
+#    - AES-128-GCM and ChaCha20-Poly1305 AEAD packet encryption and decryption.
+#    - AES-ECB and ChaCha20 header protection sample masking via Std::Crypto::HeaderProtection.
+#    - Retry packet integrity tag calculation and verification.
+#    - Verified byte-for-byte against RFC 9001 Appendix A test vectors.
+#
+# 2. Packet and Frame Layer (RFC 9000):
+#    - Three independent Packet Number Spaces: Initial (0), Handshake (1), Application Data (2).
+#    - Long headers: Initial (0x00), 0-RTT (0x01), Handshake (0x02), Retry (0x03), and Version Negotiation.
+#    - Short headers: 1-RTT with Spin Bit, Key Phase, and Packet Number.
+#    - Packet number encoding and reconstruction per RFC 9000 Appendix A.
+#    - Complete bidirectional frame encoders and decoders:
+#      PADDING, PING, ACK (with ranges and ECN), RESET_STREAM, STOP_SENDING, CRYPTO,
+#      NEW_TOKEN, STREAM (with OFF, LEN, FIN), MAX_DATA, MAX_STREAM_DATA, MAX_STREAMS,
+#      DATA_BLOCKED, STREAM_DATA_BLOCKED, STREAMS_BLOCKED, NEW_CONNECTION_ID,
+#      RETIRE_CONNECTION_ID, PATH_CHALLENGE, PATH_RESPONSE, CONNECTION_CLOSE (QUIC and App),
+#      HANDSHAKE_DONE, and DATAGRAM (RFC 9221).
+#
+# 3. Loss Detection and Congestion Control (RFC 9002):
+#    - RTT estimator: latest_rtt, smoothed_rtt, rttvar, min_rtt, and space-aware Probe Timeout (PTO).
+#    - Sent packet tracking across spaces.
+#    - Congestion control: NewReno with slow start, congestion avoidance, recovery freeze, and ACK feedback.
+#
+# 4. Stream Multiplexing and Flow Control (RFC 9000):
+#    - Bidirectional and unidirectional stream spaces (Client/Server bidi/uni).
+#    - Stream state machine with separate sending and receiving states.
+#    - Flow control at stream level (MAX_STREAM_DATA), connection level (MAX_DATA),
+#      and stream count limits (MAX_STREAMS) with STREAM_LIMIT_ERROR enforcement.
+#
+# 5. Transport Parameters (RFC 9000 Section 18) and Server Anti-Amplification (3x limit).
+# 6. Handshake Engine and Loopback UDP Socket Driver.
+
+module std/quic
+
+pub import std/slice
+pub import std/crypto
+pub import std/capsule
+pub import std/udp
+pub import std/digest
+pub import std/tls
+pub import std/big
+pub import std/time
+
+using std/slice::{Slice, Bytes}
+using std/capsule::{VarInt}
+using std/crypto::{HKDF, HMAC, AES128GCM, AES256GCM, ChaCha20Poly1305, constant_time_compare, HeaderProtection, random_bytes}
+using std/udp::{UdpSocket, Datagram}
+using std/digest::{SHA256, SHA384, SHA512}
+using std/tls::{Certificate, CertificateStore, ASN1Element}
+using std/big::{BigInt}
+using std/time::{Time}
+
+# =============================================================================
+# 1. Constants and Protocol Identifiers
+# =============================================================================
+
+pub struct QuicVersion
+  pub V1        = 0x00000001_u64
+  pub DRAFT_29  = 0xff00001d_u64
+  pub NEGOTIATE = 0x00000000_u64
+
+  def self.supported?(v : UInt64) : Bool
+    v == V1
+  end
+end
+
+pub struct PacketSpace
+  pub INITIAL   = 0
+  pub HANDSHAKE = 1
+  pub APP_DATA  = 2
+end
+
+pub struct PacketType
+  pub INITIAL             = 0x00_u8
+  pub ZERO_RTT            = 0x01_u8
+  pub HANDSHAKE           = 0x02_u8
+  pub RETRY               = 0x03_u8
+  pub ONE_RTT             = 0x04_u8
+  pub VERSION_NEGOTIATION = 0x05_u8
+end
+
+pub struct FrameType
+  pub PADDING               = 0x00_u64
+  pub PING                  = 0x01_u64
+  pub ACK                   = 0x02_u64
+  pub ACK_ECN               = 0x03_u64
+  pub RESET_STREAM          = 0x04_u64
+  pub STOP_SENDING          = 0x05_u64
+  pub CRYPTO                = 0x06_u64
+  pub NEW_TOKEN             = 0x07_u64
+  pub STREAM_BASE           = 0x08_u64
+  pub STREAM_MAX            = 0x0f_u64
+  pub MAX_DATA              = 0x10_u64
+  pub MAX_STREAM_DATA       = 0x11_u64
+  pub MAX_STREAMS_BIDI      = 0x12_u64
+  pub MAX_STREAMS_UNI       = 0x13_u64
+  pub DATA_BLOCKED          = 0x14_u64
+  pub STREAM_DATA_BLOCKED   = 0x15_u64
+  pub STREAMS_BLOCKED_BIDI  = 0x16_u64
+  pub STREAMS_BLOCKED_UNI   = 0x17_u64
+  pub NEW_CONNECTION_ID     = 0x18_u64
+  pub RETIRE_CONNECTION_ID  = 0x19_u64
+  pub PATH_CHALLENGE        = 0x1a_u64
+  pub PATH_RESPONSE         = 0x1b_u64
+  pub CONNECTION_CLOSE_QUIC = 0x1c_u64
+  pub CONNECTION_CLOSE_APP  = 0x1d_u64
+  pub HANDSHAKE_DONE        = 0x1e_u64
+  pub DATAGRAM              = 0x30_u64
+  pub DATAGRAM_WITH_LEN     = 0x31_u64
+end
+
+pub struct TransportError
+  pub NO_ERROR                  =   0x00_u64
+  pub INTERNAL_ERROR            =   0x01_u64
+  pub CONNECTION_REFUSED        =   0x02_u64
+  pub FLOW_CONTROL_ERROR        =   0x03_u64
+  pub STREAM_LIMIT_ERROR        =   0x04_u64
+  pub STREAM_STATE_ERROR        =   0x05_u64
+  pub FINAL_SIZE_ERROR          =   0x06_u64
+  pub FRAME_ENCODING_ERROR      =   0x07_u64
+  pub TRANSPORT_PARAMETER_ERROR =   0x08_u64
+  pub CONNECTION_ID_LIMIT_ERROR =   0x09_u64
+  pub PROTOCOL_VIOLATION        =   0x0a_u64
+  pub INVALID_TOKEN             =   0x0b_u64
+  pub APPLICATION_ERROR         =   0x0c_u64
+  pub CRYPTO_BUFFER_EXCEEDED    =   0x0d_u64
+  pub KEY_UPDATE_ERROR          =   0x0e_u64
+  pub AEAD_LIMIT_REACHED        =   0x0f_u64
+  pub NO_VIABLE_PATH            =   0x10_u64
+  pub CRYPTO_ERROR_BASE         = 0x0100_u64
+end
+
+# =============================================================================
+# 2. Cryptographic Key Bundles and Utilities (RFC 9001)
+# =============================================================================
+
+# Packet protection key bundle for a single encryption level and direction.
+pub struct KeyBundle
+  getter key : Bytes
+  getter iv : Bytes
+  getter hp : Bytes
+
+  def initialize(@key : Bytes, @iv : Bytes, @hp : Bytes)
+  end
+end
+
+pub class QuicCrypto
+  # Initial salt for QUIC Version 1 (RFC 9001 Section 5.2).
+  pub INITIAL_SALT_V1 = [
+    0x38_u8, 0x76_u8, 0x2c_u8, 0xf7_u8, 0xf5_u8, 0x59_u8, 0x34_u8, 0xb3_u8,
+    0x4d_u8, 0x17_u8, 0x9a_u8, 0xe6_u8, 0xa4_u8, 0xc8_u8, 0x0c_u8, 0xad_u8,
+    0xcc_u8, 0xbb_u8, 0x7f_u8, 0x0a_u8,
+  ]
+
+  # Retry integrity key and nonce (RFC 9001 Section 5.8).
+  pub RETRY_KEY_V1 = [
+    0xbe_u8, 0x0c_u8, 0x69_u8, 0x0b_u8, 0x9f_u8, 0x66_u8, 0x57_u8, 0x5a_u8,
+    0x1d_u8, 0x76_u8, 0x6b_u8, 0x54_u8, 0xe3_u8, 0x68_u8, 0xc8_u8, 0x4e_u8,
+  ]
+  pub RETRY_NONCE_V1 = [
+    0x46_u8, 0x15_u8, 0x99_u8, 0xd3_u8, 0x5d_u8, 0x63_u8, 0x2b_u8, 0xf2_u8,
+    0x23_u8, 0x98_u8, 0x25_u8, 0xbb_u8,
+  ]
+
+  # HKDF-Expand-Label (RFC 8446 7.1 / RFC 9001 5.1).
+  def self.hkdf_expand_label(secret : Bytes, label : String, length : Int32, hash_type : Symbol = :sha256) : Bytes
+    prefix = "tls13 "
+    full_label_len = prefix.bytesize + label.bytesize
+    info_size = 2 + 1 + full_label_len + 1
+    info = Bytes.new(info_size)
+    info[0] = ((length >> 8) & 0xff).to_u8
+    info[1] = (length & 0xff).to_u8
+    info[2] = full_label_len.to_u8
+
+    idx = 3
+    i = 0
+    while i < prefix.bytesize
+      info[idx] = prefix.to_unsafe[i]
+      idx = idx + 1
+      i = i + 1
+    end
+    i = 0
+    while i < label.bytesize
+      info[idx] = label.to_unsafe[i]
+      idx = idx + 1
+      i = i + 1
+    end
+    info[idx] = 0_u8
+
+    HKDF.expand(hash_type, secret, info, length)
+  end
+
+  # Derives client and server initial secrets from client Destination Connection ID.
+  def self.derive_initial_secrets(cid : Bytes) : {Bytes, Bytes}
+    salt = Bytes.new(INITIAL_SALT_V1.size)
+    i = 0
+    while i < INITIAL_SALT_V1.size
+      salt[i] = INITIAL_SALT_V1[i]
+      i = i + 1
+    end
+
+    initial_secret = HKDF.extract(:sha256, cid, salt)
+    client_secret = hkdf_expand_label(initial_secret, "client in", 32)
+    server_secret = hkdf_expand_label(initial_secret, "server in", 32)
+
+    {client_secret, server_secret}
+  end
+
+  # Derives key, iv, and hp keys from a traffic secret (RFC 9001 Section 5.1).
+  def self.derive_packet_keys(secret : Bytes, is_chacha : Bool = false) : KeyBundle
+    key_len = is_chacha ? 32 : 16
+    hp_len = is_chacha ? 32 : 16
+
+    key = hkdf_expand_label(secret, "quic key", key_len)
+    iv = hkdf_expand_label(secret, "quic iv", 12)
+    hp = hkdf_expand_label(secret, "quic hp", hp_len)
+
+    KeyBundle.new(key, iv, hp)
+  end
+
+  def self.derive_keys(secret : Bytes, is_chacha : Bool = false) : KeyBundle
+    derive_packet_keys(secret, is_chacha)
+  end
+
+  # Computes the 12-byte AEAD nonce: iv XOR (64-bit packet number left-padded).
+  def self.compute_nonce(iv : Bytes, packet_number : UInt64) : Bytes
+    nonce = Bytes.new(12)
+    i = 0
+    while i < 12
+      nonce[i] = iv[i]
+      i = i + 1
+    end
+
+    k = 0
+    while k < 8
+      shift = (7 - k) * 8
+      byte_val = ((packet_number.unsafe_shr(shift.to_u64)) & 0xff_u64).to_u8
+      nonce[4 + k] = nonce[4 + k] ^ byte_val
+      k = k + 1
+    end
+
+    nonce
+  end
+
+  # Generates the 5-byte header protection mask via central HeaderProtection API.
+  def self.generate_mask(hp_key : Bytes, sample : Bytes, is_chacha : Bool = false) : Bytes
+    if is_chacha
+      HeaderProtection.chacha_mask(hp_key, sample)
+    else
+      HeaderProtection.aes_mask(hp_key, sample)
+    end
+  end
+
+  # Applies header protection to packet header bytes in place (RFC 9001 Section 5.4.1).
+  def self.apply_header_protection(header : Bytes, pn_offset : Int32, pn_len : Int32, mask : Bytes, is_long_header : Bool) : Nil
+    first_byte_mask = is_long_header ? 0x0f_u8 : 0x1f_u8
+    header[0] = header[0] ^ (mask[0] & first_byte_mask)
+
+    i = 0
+    while i < pn_len
+      header[pn_offset + i] = header[pn_offset + i] ^ mask[1 + i]
+      i = i + 1
+    end
+  end
+
+  # Removes header protection from packet header bytes (RFC 9001 Section 5.4.1).
+  def self.remove_header_protection(header : Bytes, pn_offset : Int32, mask : Bytes, is_long_header : Bool) : Int32
+    first_byte_mask = is_long_header ? 0x0f_u8 : 0x1f_u8
+    header[0] = header[0] ^ (mask[0] & first_byte_mask)
+
+    pn_len = (header[0] & 0x03_u8).to_i32 + 1
+    i = 0
+    while i < pn_len
+      header[pn_offset + i] = header[pn_offset + i] ^ mask[1 + i]
+      i = i + 1
+    end
+    pn_len
+  end
+
+  # Encrypts and protects an outgoing packet with sampling bounds padding (Finding 4).
+  def self.protect_packet(
+    keys : KeyBundle,
+    header : Bytes,
+    pn_offset : Int32,
+    pn_len : Int32,
+    packet_number : UInt64,
+    plaintext : Bytes,
+    is_long_header : Bool,
+    is_chacha : Bool = false,
+  ) : Bytes
+    nonce = compute_nonce(keys.iv, packet_number)
+
+    ciphertext_and_tag = if is_chacha
+                           ChaCha20Poly1305.encrypt(keys.key, nonce, plaintext, header)
+                         else
+                           AES128GCM.encrypt(keys.key, nonce, plaintext, header)
+                         end
+
+    sample_offset = pn_offset + 4 - header.size
+    sample = ciphertext_and_tag[sample_offset, 16]
+
+    mask = generate_mask(keys.hp, sample, is_chacha: is_chacha)
+    protected_hdr = Bytes.new(header.size)
+    i = 0
+    while i < header.size
+      protected_hdr[i] = header[i]
+      i = i + 1
+    end
+    apply_header_protection(protected_hdr, pn_offset, pn_len, mask, is_long_header)
+
+    out = Bytes.new(protected_hdr.size + ciphertext_and_tag.size)
+    i = 0
+    while i < protected_hdr.size
+      out[i] = protected_hdr[i]
+      i = i + 1
+    end
+    i = 0
+    while i < ciphertext_and_tag.size
+      out[protected_hdr.size + i] = ciphertext_and_tag[i]
+      i = i + 1
+    end
+    out
+  end
+
+  # Calculates Retry Integrity Tag (RFC 9001 Section 5.8).
+  def self.calculate_retry_integrity_tag(odcid : Bytes, retry_packet_without_tag : Bytes) : Bytes
+    key = Bytes.new(RETRY_KEY_V1.size)
+    i = 0; while i < RETRY_KEY_V1.size
+      key[i] = RETRY_KEY_V1[i]; i = i + 1
+    end
+
+    nonce = Bytes.new(RETRY_NONCE_V1.size)
+    i = 0; while i < RETRY_NONCE_V1.size
+      nonce[i] = RETRY_NONCE_V1[i]; i = i + 1
+    end
+
+    pseudo = Bytes.new(1 + odcid.size + retry_packet_without_tag.size)
+    pseudo[0] = odcid.size.to_u8
+    i = 0; while i < odcid.size
+      pseudo[1 + i] = odcid[i]; i = i + 1
+    end
+    i = 0; while i < retry_packet_without_tag.size
+      pseudo[1 + odcid.size + i] = retry_packet_without_tag[i]; i = i + 1
+    end
+
+    ct, tag = AES128GCM.encrypt_detached(key, nonce, Bytes.empty, pseudo)
+    tag
+  end
+
+  def self.verify_retry_integrity_tag(odcid : Bytes, retry_packet : Bytes) : Bool
+    return false if retry_packet.size < 16
+    body_len = retry_packet.size - 16
+    body = retry_packet[0, body_len]
+    expected_tag = retry_packet[body_len, 16]
+    computed_tag = calculate_retry_integrity_tag(odcid, body)
+    constant_time_compare(expected_tag, computed_tag)
+  end
+end
+
+# =============================================================================
+# 3. Packet Number Encoding and Decoding (RFC 9000 Section 17.1 & Appendix A)
+# =============================================================================
+
+pub struct PacketNumber
+  def self.encode_length(full_pn : UInt64, largest_acked : UInt64) : Int32
+    num_unacked = if full_pn > largest_acked
+                    full_pn - largest_acked
+                  else
+                    1_u64
+                  end
+    if num_unacked < 128_u64
+      1
+    elsif num_unacked < 32768_u64
+      2
+    elsif num_unacked < 8388608_u64
+      3
+    else
+      4
+    end
+  end
+
+  def self.encode(full_pn : UInt64, num_bytes : Int32) : Bytes
+    buf = Bytes.new(num_bytes)
+    i = 0
+    while i < num_bytes
+      shift = (num_bytes - 1 - i) * 8
+      buf[i] = ((full_pn.unsafe_shr(shift.to_u64)) & 0xff_u64).to_u8
+      i = i + 1
+    end
+    buf
+  end
+
+  # Reconstructs full 62-bit packet number from truncated representation (RFC 9000 Appendix A.3).
+  def self.decode(largest_pn : UInt64, truncated_pn : UInt64, pn_nbits : Int32) : UInt64
+    expected_pn = largest_pn + 1_u64
+    pn_win = 1_u64.unsafe_shl(pn_nbits.to_u64)
+    pn_hwin = pn_win // 2_u64
+    pn_mask = pn_win - 1_u64
+
+    candidate_pn = (expected_pn & (4611686018427387903_u64 ^ pn_mask)) | truncated_pn
+    if expected_pn > pn_hwin && candidate_pn <= (expected_pn - pn_hwin) &&
+       candidate_pn + pn_win <= 4611686018427387903_u64
+      candidate_pn + pn_win
+    elsif candidate_pn > expected_pn + pn_hwin && candidate_pn >= pn_win
+      candidate_pn - pn_win
+    else
+      candidate_pn
+    end
+  end
+end
+
+# =============================================================================
+# 4. QUIC Packet Headers (RFC 9000 Section 17)
+# =============================================================================
+
+pub struct LongHeader
+  getter packet_type : UInt8
+  getter version : UInt64
+  getter dcid : Bytes
+  getter scid : Bytes
+  getter token : Bytes
+  getter length : UInt64
+  getter packet_number : UInt64
+  getter pn_len : Int32
+
+  def initialize(
+    @packet_type : UInt8,
+    @version : UInt64,
+    @dcid : Bytes,
+    @scid : Bytes,
+    @token : Bytes,
+    @length : UInt64,
+    @packet_number : UInt64,
+    @pn_len : Int32,
+  )
+  end
+
+  def encode_unprotected : Bytes
+    first_byte = 0xc0_u8 | (@packet_type.unsafe_shl(4_u8)) | ((@pn_len - 1).to_u8 & 0x03_u8)
+
+    len_varint = VarInt.encode(@length)
+    token_len_varint = (@packet_type == PacketType::INITIAL) ? VarInt.encode(@token.size.to_u64) : Bytes.empty
+
+    total_size = 1 + 4 + 1 + @dcid.size + 1 + @scid.size + token_len_varint.size + @token.size + len_varint.size + @pn_len
+    buf = Bytes.new(total_size)
+
+    buf[0] = first_byte
+    buf[1] = ((@version.unsafe_shr(24_u64)) & 0xff_u64).to_u8
+    buf[2] = ((@version.unsafe_shr(16_u64)) & 0xff_u64).to_u8
+    buf[3] = ((@version.unsafe_shr(8_u64)) & 0xff_u64).to_u8
+    buf[4] = (@version & 0xff_u64).to_u8
+
+    buf[5] = @dcid.size.to_u8
+    offset = 6
+    i = 0; while i < @dcid.size
+      buf[offset + i] = @dcid[i]; i = i + 1
+    end
+    offset = offset + @dcid.size
+
+    buf[offset] = @scid.size.to_u8
+    offset = offset + 1
+    i = 0; while i < @scid.size
+      buf[offset + i] = @scid[i]; i = i + 1
+    end
+    offset = offset + @scid.size
+
+    if @packet_type == PacketType::INITIAL
+      i = 0; while i < token_len_varint.size
+        buf[offset + i] = token_len_varint[i]; i = i + 1
+      end
+      offset = offset + token_len_varint.size
+      i = 0; while i < @token.size
+        buf[offset + i] = @token[i]; i = i + 1
+      end
+      offset = offset + @token.size
+    end
+
+    i = 0; while i < len_varint.size
+      buf[offset + i] = len_varint[i]; i = i + 1
+    end
+    offset = offset + len_varint.size
+
+    pn_bytes = PacketNumber.encode(@packet_number, @pn_len)
+    i = 0; while i < @pn_len
+      buf[offset + i] = pn_bytes[i]; i = i + 1
+    end
+
+    buf
+  end
+end
+
+pub struct ShortHeader
+  getter spin_bit : Bool
+  getter key_phase : Bool
+  getter dcid : Bytes
+  getter packet_number : UInt64
+  getter pn_len : Int32
+
+  def initialize(
+    @spin_bit : Bool,
+    @key_phase : Bool,
+    @dcid : Bytes,
+    @packet_number : UInt64,
+    @pn_len : Int32,
+  )
+  end
+
+  def encode_unprotected : Bytes
+    first_byte = 0x40_u8
+    first_byte = first_byte | 0x20_u8 if @spin_bit
+    first_byte = first_byte | 0x04_u8 if @key_phase
+    first_byte = first_byte | ((@pn_len - 1).to_u8 & 0x03_u8)
+
+    buf = Bytes.new(1 + @dcid.size + @pn_len)
+    buf[0] = first_byte
+
+    i = 0; while i < @dcid.size
+      buf[1 + i] = @dcid[i]; i = i + 1
+    end
+
+    pn_bytes = PacketNumber.encode(@packet_number, @pn_len)
+    i = 0; while i < @pn_len
+      buf[1 + @dcid.size + i] = pn_bytes[i]; i = i + 1
+    end
+
+    buf
+  end
+end
+
+pub struct VersionNegotiationPacket
+  getter dcid : Bytes
+  getter scid : Bytes
+  getter supported_versions : Array(UInt64)
+
+  def initialize(@dcid : Bytes, @scid : Bytes, @supported_versions : Array(UInt64))
+  end
+
+  def encode : Bytes
+    size = 1 + 4 + 1 + @dcid.size + 1 + @scid.size + (@supported_versions.size * 4)
+    buf = Bytes.new(size)
+    buf[0] = 0xc0_u8
+    buf[1] = 0_u8; buf[2] = 0_u8; buf[3] = 0_u8; buf[4] = 0_u8
+    buf[5] = @dcid.size.to_u8
+    offset = 6
+    i = 0; while i < @dcid.size
+      buf[offset + i] = @dcid[i]; i = i + 1
+    end
+    offset = offset + @dcid.size
+
+    buf[offset] = @scid.size.to_u8
+    offset = offset + 1
+    i = 0; while i < @scid.size
+      buf[offset + i] = @scid[i]; i = i + 1
+    end
+    offset = offset + @scid.size
+
+    v_idx = 0
+    while v_idx < @supported_versions.size
+      v = @supported_versions[v_idx]
+      buf[offset] = ((v.unsafe_shr(24_u64)) & 0xff_u64).to_u8
+      buf[offset + 1] = ((v.unsafe_shr(16_u64)) & 0xff_u64).to_u8
+      buf[offset + 2] = ((v.unsafe_shr(8_u64)) & 0xff_u64).to_u8
+      buf[offset + 3] = (v & 0xff_u64).to_u8
+      offset = offset + 4
+      v_idx = v_idx + 1
+    end
+    buf
+  end
+end
+
+# =============================================================================
+# 5. QUIC Frames: Encoders and Decoders (RFC 9000 Section 19)
+# =============================================================================
+
+pub struct AckRange
+  getter gap : UInt64
+  getter length : UInt64
+
+  def initialize(@gap : UInt64, @length : UInt64)
+  end
+end
+
+pub struct AckSegment
+  getter start_pn : UInt64
+  getter end_pn : UInt64
+
+  def initialize(@start_pn : UInt64, @end_pn : UInt64)
+  end
+
+  def contains?(pn : UInt64) : Bool
+    pn >= @start_pn && pn <= @end_pn
+  end
+end
+
+# Decoded frame representation
+pub struct DecodedFrame
+  getter frame_type : UInt64
+  getter stream_id : UInt64
+  getter offset : UInt64
+  getter data : Bytes
+  getter fin : Bool
+  getter largest_ack : UInt64
+  getter ack_delay : UInt64
+  getter error_code : UInt64
+  getter reason : String
+  getter ack_ranges : Array(AckSegment)
+  getter token : Bytes
+  getter seq_num : UInt64
+  getter retire_prior_to : UInt64
+  getter connection_id : Bytes
+  getter reset_token : Bytes
+
+  def initialize(
+    @frame_type : UInt64,
+    @stream_id : UInt64 = 0_u64,
+    @offset : UInt64 = 0_u64,
+    @data : Bytes = Bytes.empty,
+    @fin : Bool = false,
+    @largest_ack : UInt64 = 0_u64,
+    @ack_delay : UInt64 = 0_u64,
+    @error_code : UInt64 = 0_u64,
+    @reason : String = "",
+    @ack_ranges : Array(AckSegment) = [] of AckSegment,
+    @token : Bytes = Bytes.empty,
+    @seq_num : UInt64 = 0_u64,
+    @retire_prior_to : UInt64 = 0_u64,
+    @connection_id : Bytes = Bytes.empty,
+    @reset_token : Bytes = Bytes.empty,
+  )
+  end
+end
+
+pub class FrameCodec
+  def self.encode_padding(length : Int32) : Bytes
+    Bytes.new(length, 0x00_u8)
+  end
+
+  def self.encode_ping : Bytes
+    buf = Bytes.new(1)
+    buf[0] = 0x01_u8
+    buf
+  end
+
+  def self.encode_ack(
+    largest_acked : UInt64,
+    ack_delay : UInt64,
+    first_ack_range : UInt64,
+    ranges : Array(AckRange) = [] of AckRange,
+  ) : Bytes
+    type_b = VarInt.encode(FrameType::ACK)
+    largest_b = VarInt.encode(largest_acked)
+    delay_b = VarInt.encode(ack_delay)
+    count_b = VarInt.encode(ranges.size.to_u64)
+    first_b = VarInt.encode(first_ack_range)
+
+    total = type_b.size + largest_b.size + delay_b.size + count_b.size + first_b.size
+    range_bytes = [] of Bytes
+    i = 0
+    while i < ranges.size
+      gb = VarInt.encode(ranges[i].gap)
+      lb = VarInt.encode(ranges[i].length)
+      total = total + gb.size + lb.size
+      range_bytes << gb
+      range_bytes << lb
+      i = i + 1
+    end
+
+    buf = Bytes.new(total)
+    off = 0
+    copy_slice(buf, off, type_b); off = off + type_b.size
+    copy_slice(buf, off, largest_b); off = off + largest_b.size
+    copy_slice(buf, off, delay_b); off = off + delay_b.size
+    copy_slice(buf, off, count_b); off = off + count_b.size
+    copy_slice(buf, off, first_b); off = off + first_b.size
+
+    i = 0
+    while i < range_bytes.size
+      copy_slice(buf, off, range_bytes[i])
+      off = off + range_bytes[i].size
+      i = i + 1
+    end
+    buf
+  end
+
+  def self.encode_crypto(offset : UInt64, data : Bytes) : Bytes
+    type_b = VarInt.encode(FrameType::CRYPTO)
+    off_b = VarInt.encode(offset)
+    len_b = VarInt.encode(data.size.to_u64)
+
+    total = type_b.size + off_b.size + len_b.size + data.size
+    buf = Bytes.new(total)
+    off = 0
+    copy_slice(buf, off, type_b); off = off + type_b.size
+    copy_slice(buf, off, off_b); off = off + off_b.size
+    copy_slice(buf, off, len_b); off = off + len_b.size
+    copy_slice(buf, off, data)
+    buf
+  end
+
+  def self.encode_stream(stream_id : UInt64, offset : UInt64, data : Bytes, fin : Bool = false) : Bytes
+    type_val = FrameType::STREAM_BASE
+    type_val = type_val | 0x04_u64 if offset > 0_u64
+    type_val = type_val | 0x02_u64 # Length present
+    type_val = type_val | 0x01_u64 if fin
+
+    type_b = VarInt.encode(type_val)
+    sid_b = VarInt.encode(stream_id)
+    off_b = offset > 0_u64 ? VarInt.encode(offset) : Bytes.empty
+    len_b = VarInt.encode(data.size.to_u64)
+
+    total = type_b.size + sid_b.size + off_b.size + len_b.size + data.size
+    buf = Bytes.new(total)
+    pos = 0
+    copy_slice(buf, pos, type_b); pos = pos + type_b.size
+    copy_slice(buf, pos, sid_b); pos = pos + sid_b.size
+    if off_b.size > 0
+      copy_slice(buf, pos, off_b); pos = pos + off_b.size
+    end
+    copy_slice(buf, pos, len_b); pos = pos + len_b.size
+    copy_slice(buf, pos, data)
+    buf
+  end
+
+  def self.encode_max_data(max_data : UInt64) : Bytes
+    type_b = VarInt.encode(FrameType::MAX_DATA)
+    val_b = VarInt.encode(max_data)
+    buf = Bytes.new(type_b.size + val_b.size)
+    copy_slice(buf, 0, type_b)
+    copy_slice(buf, type_b.size, val_b)
+    buf
+  end
+
+  def self.encode_max_stream_data(stream_id : UInt64, max_data : UInt64) : Bytes
+    type_b = VarInt.encode(FrameType::MAX_STREAM_DATA)
+    sid_b = VarInt.encode(stream_id)
+    val_b = VarInt.encode(max_data)
+    buf = Bytes.new(type_b.size + sid_b.size + val_b.size)
+    off = 0
+    copy_slice(buf, off, type_b); off = off + type_b.size
+    copy_slice(buf, off, sid_b); off = off + sid_b.size
+    copy_slice(buf, off, val_b)
+    buf
+  end
+
+  def self.encode_max_streams(max_streams : UInt64, bidi : Bool) : Bytes
+    type_b = VarInt.encode(bidi ? FrameType::MAX_STREAMS_BIDI : FrameType::MAX_STREAMS_UNI)
+    val_b = VarInt.encode(max_streams)
+    buf = Bytes.new(type_b.size + val_b.size)
+    copy_slice(buf, 0, type_b)
+    copy_slice(buf, type_b.size, val_b)
+    buf
+  end
+
+  def self.encode_path_challenge(data : Bytes, is_response : Bool = false) : Bytes
+    raise "path challenge data must be 8 bytes" if data.size != 8
+    buf = Bytes.new(9)
+    buf[0] = is_response ? 0x1b_u8 : 0x1a_u8
+    i = 0; while i < 8
+      buf[1 + i] = data[i]; i = i + 1
+    end
+    buf
+  end
+
+  def self.encode_connection_close(error_code : UInt64, reason : String, is_app : Bool = false, frame_type : UInt64 = 0_u64) : Bytes
+    type_b = VarInt.encode(is_app ? FrameType::CONNECTION_CLOSE_APP : FrameType::CONNECTION_CLOSE_QUIC)
+    code_b = VarInt.encode(error_code)
+    ft_b = is_app ? Bytes.empty : VarInt.encode(frame_type)
+    reason_bytes = Bytes.new(reason.to_unsafe, reason.bytesize)
+    rlen_b = VarInt.encode(reason_bytes.size.to_u64)
+
+    total = type_b.size + code_b.size + ft_b.size + rlen_b.size + reason_bytes.size
+    buf = Bytes.new(total)
+    off = 0
+    copy_slice(buf, off, type_b); off = off + type_b.size
+    copy_slice(buf, off, code_b); off = off + code_b.size
+    if ft_b.size > 0
+      copy_slice(buf, off, ft_b); off = off + ft_b.size
+    end
+    copy_slice(buf, off, rlen_b); off = off + rlen_b.size
+    copy_slice(buf, off, reason_bytes)
+    buf
+  end
+
+  def self.encode_handshake_done : Bytes
+    buf = Bytes.new(1)
+    buf[0] = 0x1e_u8
+    buf
+  end
+
+  def self.encode_reset_stream(stream_id : UInt64, error_code : UInt64, final_size : UInt64) : Bytes
+    type_b = VarInt.encode(FrameType::RESET_STREAM)
+    sid_b = VarInt.encode(stream_id)
+    err_b = VarInt.encode(error_code)
+    sz_b = VarInt.encode(final_size)
+    buf = Bytes.new(type_b.size + sid_b.size + err_b.size + sz_b.size)
+    off = 0
+    copy_slice(buf, off, type_b); off = off + type_b.size
+    copy_slice(buf, off, sid_b); off = off + sid_b.size
+    copy_slice(buf, off, err_b); off = off + err_b.size
+    copy_slice(buf, off, sz_b)
+    buf
+  end
+
+  def self.encode_stop_sending(stream_id : UInt64, error_code : UInt64) : Bytes
+    type_b = VarInt.encode(FrameType::STOP_SENDING)
+    sid_b = VarInt.encode(stream_id)
+    err_b = VarInt.encode(error_code)
+    buf = Bytes.new(type_b.size + sid_b.size + err_b.size)
+    off = 0
+    copy_slice(buf, off, type_b); off = off + type_b.size
+    copy_slice(buf, off, sid_b); off = off + sid_b.size
+    copy_slice(buf, off, err_b)
+    buf
+    buf
+  end
+
+  def self.encode_new_token(token : Bytes) : Bytes
+    type_b = VarInt.encode(FrameType::NEW_TOKEN)
+    len_b = VarInt.encode(token.size.to_u64)
+    buf = Bytes.new(type_b.size + len_b.size + token.size)
+    off = 0
+    copy_slice(buf, off, type_b); off = off + type_b.size
+    copy_slice(buf, off, len_b); off = off + len_b.size
+    copy_slice(buf, off, token)
+    buf
+  end
+
+  def self.encode_data_blocked(max_data : UInt64) : Bytes
+    type_b = VarInt.encode(FrameType::DATA_BLOCKED)
+    val_b = VarInt.encode(max_data)
+    buf = Bytes.new(type_b.size + val_b.size)
+    off = 0
+    copy_slice(buf, off, type_b); off = off + type_b.size
+    copy_slice(buf, off, val_b)
+    buf
+  end
+
+  def self.encode_stream_data_blocked(stream_id : UInt64, max_stream_data : UInt64) : Bytes
+    type_b = VarInt.encode(FrameType::STREAM_DATA_BLOCKED)
+    sid_b = VarInt.encode(stream_id)
+    msd_b = VarInt.encode(max_stream_data)
+    buf = Bytes.new(type_b.size + sid_b.size + msd_b.size)
+    off = 0
+    copy_slice(buf, off, type_b); off = off + type_b.size
+    copy_slice(buf, off, sid_b); off = off + sid_b.size
+    copy_slice(buf, off, msd_b)
+    buf
+  end
+
+  def self.encode_streams_blocked(max_streams : UInt64, bidi : Bool) : Bytes
+    type_b = VarInt.encode(bidi ? FrameType::STREAMS_BLOCKED_BIDI : FrameType::STREAMS_BLOCKED_UNI)
+    ms_b = VarInt.encode(max_streams)
+    buf = Bytes.new(type_b.size + ms_b.size)
+    off = 0
+    copy_slice(buf, off, type_b); off = off + type_b.size
+    copy_slice(buf, off, ms_b)
+    buf
+  end
+
+  def self.encode_new_connection_id(seq_num : UInt64, retire_prior_to : UInt64, cid : Bytes, reset_token : Bytes) : Bytes
+    raise "reset token must be 16 bytes" if reset_token.size != 16
+    raise "connection id must be <= 20 bytes" if cid.size > 20
+    type_b = VarInt.encode(FrameType::NEW_CONNECTION_ID)
+    seq_b = VarInt.encode(seq_num)
+    rpt_b = VarInt.encode(retire_prior_to)
+    buf = Bytes.new(type_b.size + seq_b.size + rpt_b.size + 1 + cid.size + 16)
+    off = 0
+    copy_slice(buf, off, type_b); off = off + type_b.size
+    copy_slice(buf, off, seq_b); off = off + seq_b.size
+    copy_slice(buf, off, rpt_b); off = off + rpt_b.size
+    buf[off] = cid.size.to_u8; off = off + 1
+    copy_slice(buf, off, cid); off = off + cid.size
+    copy_slice(buf, off, reset_token)
+    buf
+  end
+
+  def self.encode_retire_connection_id(seq_num : UInt64) : Bytes
+    type_b = VarInt.encode(FrameType::RETIRE_CONNECTION_ID)
+    seq_b = VarInt.encode(seq_num)
+    buf = Bytes.new(type_b.size + seq_b.size)
+    off = 0
+    copy_slice(buf, off, type_b); off = off + type_b.size
+    copy_slice(buf, off, seq_b)
+    buf
+  end
+
+  def self.encode_datagram(data : Bytes, with_len : Bool = false) : Bytes
+    type_b = VarInt.encode(with_len ? FrameType::DATAGRAM_WITH_LEN : FrameType::DATAGRAM)
+    len_b = with_len ? VarInt.encode(data.size.to_u64) : Bytes.empty
+    buf = Bytes.new(type_b.size + len_b.size + data.size)
+    off = 0
+    copy_slice(buf, off, type_b); off = off + type_b.size
+    if with_len
+      copy_slice(buf, off, len_b); off = off + len_b.size
+    end
+    copy_slice(buf, off, data)
+    buf
+  end
+
+  # Complete frame decoder for incoming decrypted payload (Finding 6).
+  def self.decode_frames(payload : Bytes) : Array(DecodedFrame)
+    frames = [] of DecodedFrame
+    offset = 0
+
+    while offset < payload.size
+      ft, ft_len = VarInt.decode(payload, offset)
+      offset = offset + ft_len
+
+      if ft == FrameType::PADDING
+        while offset < payload.size && payload[offset] == 0x00_u8
+          offset = offset + 1
+        end
+        frames << DecodedFrame.new(FrameType::PADDING)
+      elsif ft == FrameType::PING
+        frames << DecodedFrame.new(FrameType::PING)
+      elsif ft == FrameType::ACK || ft == FrameType::ACK_ECN
+        largest_ack, l_len = VarInt.decode(payload, offset); offset = offset + l_len
+        ack_delay, d_len = VarInt.decode(payload, offset); offset = offset + d_len
+        range_count, rc_len = VarInt.decode(payload, offset); offset = offset + rc_len
+        first_range, fr_len = VarInt.decode(payload, offset); offset = offset + fr_len
+
+        ack_ranges = [] of AckSegment
+        start_first = (largest_ack >= first_range) ? largest_ack - first_range : 0_u64
+        ack_ranges << AckSegment.new(start_first, largest_ack)
+        smallest = start_first
+
+        r_idx = 0_u64
+        while r_idx < range_count
+          gap, g_len = VarInt.decode(payload, offset); offset = offset + g_len
+          rlen, rl_len = VarInt.decode(payload, offset); offset = offset + rl_len
+          if smallest >= (gap + 2_u64)
+            r_end = smallest - gap - 2_u64
+            r_start = (r_end >= rlen) ? r_end - rlen : 0_u64
+            ack_ranges << AckSegment.new(r_start, r_end)
+            smallest = r_start
+          end
+          r_idx = r_idx + 1_u64
+        end
+
+        if ft == FrameType::ACK_ECN
+          _, e1 = VarInt.decode(payload, offset); offset = offset + e1
+          _, e2 = VarInt.decode(payload, offset); offset = offset + e2
+          _, e3 = VarInt.decode(payload, offset); offset = offset + e3
+        end
+
+        frames << DecodedFrame.new(FrameType::ACK, largest_ack: largest_ack, ack_delay: ack_delay, ack_ranges: ack_ranges)
+      elsif ft == FrameType::RESET_STREAM
+        sid, s_len = VarInt.decode(payload, offset); offset = offset + s_len
+        err, e_len = VarInt.decode(payload, offset); offset = offset + e_len
+        fsz, f_len = VarInt.decode(payload, offset); offset = offset + f_len
+        frames << DecodedFrame.new(FrameType::RESET_STREAM, stream_id: sid, error_code: err, offset: fsz)
+      elsif ft == FrameType::STOP_SENDING
+        sid, s_len = VarInt.decode(payload, offset); offset = offset + s_len
+        err, e_len = VarInt.decode(payload, offset); offset = offset + e_len
+        frames << DecodedFrame.new(FrameType::STOP_SENDING, stream_id: sid, error_code: err)
+      elsif ft == FrameType::CRYPTO
+        c_off, co_len = VarInt.decode(payload, offset); offset = offset + co_len
+        c_len, cl_len = VarInt.decode(payload, offset); offset = offset + cl_len
+        raise "CRYPTO frame truncated" if offset + c_len.to_i32 > payload.size
+        data = payload[offset, c_len.to_i32]
+        offset = offset + c_len.to_i32
+        frames << DecodedFrame.new(FrameType::CRYPTO, offset: c_off, data: data)
+      elsif ft == FrameType::NEW_TOKEN
+        tok_len, tl_len = VarInt.decode(payload, offset); offset = offset + tl_len
+        raise "NEW_TOKEN frame truncated" if offset + tok_len.to_i32 > payload.size
+        tok = payload[offset, tok_len.to_i32]
+        offset = offset + tok_len.to_i32
+        frames << DecodedFrame.new(FrameType::NEW_TOKEN, token: tok)
+      elsif ft >= FrameType::STREAM_BASE && ft <= FrameType::STREAM_MAX
+        has_off = (ft & 0x04_u64) != 0_u64
+        has_len = (ft & 0x02_u64) != 0_u64
+        fin = (ft & 0x01_u64) != 0_u64
+
+        sid, sid_len = VarInt.decode(payload, offset); offset = offset + sid_len
+        s_off = 0_u64
+        if has_off
+          s_off, so_len = VarInt.decode(payload, offset); offset = offset + so_len
+        end
+
+        data_len = 0_i32
+        if has_len
+          d_len, dl_len = VarInt.decode(payload, offset); offset = offset + dl_len
+          data_len = d_len.to_i32
+        else
+          data_len = payload.size - offset
+        end
+        raise "STREAM frame truncated" if offset + data_len > payload.size
+
+        s_data = payload[offset, data_len]
+        offset = offset + data_len
+        frames << DecodedFrame.new(FrameType::STREAM_BASE, stream_id: sid, offset: s_off, data: s_data, fin: fin)
+      elsif ft == FrameType::MAX_DATA
+        md, md_len = VarInt.decode(payload, offset); offset = offset + md_len
+        frames << DecodedFrame.new(FrameType::MAX_DATA, offset: md)
+      elsif ft == FrameType::MAX_STREAM_DATA
+        sid, sid_len = VarInt.decode(payload, offset); offset = offset + sid_len
+        msd, msd_len = VarInt.decode(payload, offset); offset = offset + msd_len
+        frames << DecodedFrame.new(FrameType::MAX_STREAM_DATA, stream_id: sid, offset: msd)
+      elsif ft == FrameType::MAX_STREAMS_BIDI || ft == FrameType::MAX_STREAMS_UNI
+        ms, ms_len = VarInt.decode(payload, offset); offset = offset + ms_len
+        frames << DecodedFrame.new(ft, offset: ms)
+      elsif ft == FrameType::DATA_BLOCKED
+        md, md_len = VarInt.decode(payload, offset); offset = offset + md_len
+        frames << DecodedFrame.new(FrameType::DATA_BLOCKED, offset: md)
+      elsif ft == FrameType::STREAM_DATA_BLOCKED
+        sid, sid_len = VarInt.decode(payload, offset); offset = offset + sid_len
+        msd, msd_len = VarInt.decode(payload, offset); offset = offset + msd_len
+        frames << DecodedFrame.new(FrameType::STREAM_DATA_BLOCKED, stream_id: sid, offset: msd)
+      elsif ft == FrameType::STREAMS_BLOCKED_BIDI || ft == FrameType::STREAMS_BLOCKED_UNI
+        ms, ms_len = VarInt.decode(payload, offset); offset = offset + ms_len
+        frames << DecodedFrame.new(ft, offset: ms)
+      elsif ft == FrameType::NEW_CONNECTION_ID
+        seq, s_len = VarInt.decode(payload, offset); offset = offset + s_len
+        rpt, r_len = VarInt.decode(payload, offset); offset = offset + r_len
+        raise "NEW_CONNECTION_ID truncated cid_len" if offset >= payload.size
+        cid_len = payload[offset].to_i32; offset = offset + 1
+        raise "NEW_CONNECTION_ID invalid cid_len #{cid_len}" if cid_len < 1 || cid_len > 20
+        raise "NEW_CONNECTION_ID truncated cid" if offset + cid_len + 16 > payload.size
+        cid = payload[offset, cid_len]; offset = offset + cid_len
+        rst = payload[offset, 16]; offset = offset + 16
+        frames << DecodedFrame.new(FrameType::NEW_CONNECTION_ID, seq_num: seq, retire_prior_to: rpt, connection_id: cid, reset_token: rst)
+      elsif ft == FrameType::RETIRE_CONNECTION_ID
+        seq, s_len = VarInt.decode(payload, offset); offset = offset + s_len
+        frames << DecodedFrame.new(FrameType::RETIRE_CONNECTION_ID, seq_num: seq)
+      elsif ft == FrameType::PATH_CHALLENGE || ft == FrameType::PATH_RESPONSE
+        raise "PATH_CHALLENGE/RESPONSE truncated" if offset + 8 > payload.size
+        pdata = payload[offset, 8]
+        offset = offset + 8
+        frames << DecodedFrame.new(ft, data: pdata)
+      elsif ft == FrameType::CONNECTION_CLOSE_QUIC || ft == FrameType::CONNECTION_CLOSE_APP
+        err, e_len = VarInt.decode(payload, offset); offset = offset + e_len
+        if ft == FrameType::CONNECTION_CLOSE_QUIC
+          _, ft_len_b = VarInt.decode(payload, offset); offset = offset + ft_len_b
+        end
+        rlen, rl_len = VarInt.decode(payload, offset); offset = offset + rl_len
+        reason_str = ""
+        if rlen > 0_u64
+          raise "CONNECTION_CLOSE truncated reason" if offset + rlen.to_i32 > payload.size
+          r_bytes = payload[offset, rlen.to_i32]
+          reason_str = String.new(r_bytes.size) do |target_ptr|
+            target_ptr.copy_from(r_bytes.to_unsafe, r_bytes.size)
+          end
+          offset = offset + rlen.to_i32
+        end
+        frames << DecodedFrame.new(ft, error_code: err, reason: reason_str)
+      elsif ft == FrameType::HANDSHAKE_DONE
+        frames << DecodedFrame.new(FrameType::HANDSHAKE_DONE)
+      elsif ft == FrameType::DATAGRAM
+        d_len = payload.size - offset
+        d_data = payload[offset, d_len]
+        offset = offset + d_len
+        frames << DecodedFrame.new(FrameType::DATAGRAM, data: d_data)
+      elsif ft == FrameType::DATAGRAM_WITH_LEN
+        dl, dl_len = VarInt.decode(payload, offset); offset = offset + dl_len
+        raise "DATAGRAM_WITH_LEN truncated" if offset + dl.to_i32 > payload.size
+        d_data = payload[offset, dl.to_i32]
+        offset = offset + dl.to_i32
+        frames << DecodedFrame.new(FrameType::DATAGRAM_WITH_LEN, data: d_data)
+      else
+        raise "UNKNOWN_FRAME_TYPE: unknown frame type 0x#{ft.to_s(16)}"
+      end
+    end
+
+    frames
+  end
+
+  def self.copy_slice(dst : Bytes, offset : Int32, src : Bytes) : Nil
+    i = 0; while i < src.size
+      dst[offset + i] = src[i]; i = i + 1
+    end
+  end
+end
+
+# =============================================================================
+# 6. Transport Parameters (RFC 9000 Section 18)
+# =============================================================================
+pub class TransportParameters
+  getter original_destination_connection_id : Bytes
+  getter max_idle_timeout : UInt64
+  getter stateless_reset_token : Bytes
+  getter max_udp_payload_size : UInt64
+  getter initial_max_data : UInt64
+  getter initial_max_stream_data_bidi_local : UInt64
+  getter initial_max_stream_data_bidi_remote : UInt64
+  getter initial_max_stream_data_uni : UInt64
+  getter initial_max_streams_bidi : UInt64
+  getter initial_max_streams_uni : UInt64
+  getter ack_delay_exponent : UInt64
+  getter max_ack_delay : UInt64
+  getter disable_active_migration : Bool
+  getter active_connection_id_limit : UInt64
+  getter initial_source_connection_id : Bytes
+  getter retry_source_connection_id : Bytes
+
+  def initialize(
+    @initial_max_data : UInt64 = 1048576_u64,
+    @initial_max_stream_data_bidi_local : UInt64 = 65536_u64,
+    @initial_max_stream_data_bidi_remote : UInt64 = 65536_u64,
+    @initial_max_stream_data_uni : UInt64 = 65536_u64,
+    @initial_max_streams_bidi : UInt64 = 100_u64,
+    @initial_max_streams_uni : UInt64 = 100_u64,
+    @max_idle_timeout : UInt64 = 30000_u64,
+    @max_udp_payload_size : UInt64 = 65527_u64,
+    @ack_delay_exponent : UInt64 = 3_u64,
+    @max_ack_delay : UInt64 = 25_u64,
+    @disable_active_migration : Bool = false,
+    @active_connection_id_limit : UInt64 = 2_u64,
+    @initial_source_connection_id : Bytes = Bytes.empty,
+    @original_destination_connection_id : Bytes = Bytes.empty,
+    @stateless_reset_token : Bytes = Bytes.empty,
+    @retry_source_connection_id : Bytes = Bytes.empty,
+  )
+  end
+
+  def encode : Bytes
+    parts = [] of Bytes
+    total = 0
+
+    if @original_destination_connection_id.size > 0
+      p_id = VarInt.encode(0x00_u64)
+      p_len = VarInt.encode(@original_destination_connection_id.size.to_u64)
+      parts << p_id; parts << p_len; parts << @original_destination_connection_id
+      total = total + p_id.size + p_len.size + @original_destination_connection_id.size
+    end
+
+    if @max_idle_timeout > 0_u64
+      p_id = VarInt.encode(0x01_u64)
+      p_val = VarInt.encode(@max_idle_timeout)
+      p_len = VarInt.encode(p_val.size.to_u64)
+      parts << p_id; parts << p_len; parts << p_val
+      total = total + p_id.size + p_len.size + p_val.size
+    end
+
+    if @stateless_reset_token.size == 16
+      p_id = VarInt.encode(0x02_u64)
+      p_len = VarInt.encode(16_u64)
+      parts << p_id; parts << p_len; parts << @stateless_reset_token
+      total = total + p_id.size + p_len.size + 16
+    end
+
+    if @max_udp_payload_size != 65527_u64
+      p_id = VarInt.encode(0x03_u64)
+      p_val = VarInt.encode(@max_udp_payload_size)
+      p_len = VarInt.encode(p_val.size.to_u64)
+      parts << p_id; parts << p_len; parts << p_val
+      total = total + p_id.size + p_len.size + p_val.size
+    end
+
+    p_id = VarInt.encode(0x04_u64)
+    p_val = VarInt.encode(@initial_max_data)
+    p_len = VarInt.encode(p_val.size.to_u64)
+    parts << p_id; parts << p_len; parts << p_val
+    total = total + p_id.size + p_len.size + p_val.size
+
+    if @initial_max_stream_data_bidi_local > 0_u64
+      p_id = VarInt.encode(0x05_u64)
+      p_val = VarInt.encode(@initial_max_stream_data_bidi_local)
+      p_len = VarInt.encode(p_val.size.to_u64)
+      parts << p_id; parts << p_len; parts << p_val
+      total = total + p_id.size + p_len.size + p_val.size
+    end
+
+    if @initial_max_stream_data_bidi_remote > 0_u64
+      p_id = VarInt.encode(0x06_u64)
+      p_val = VarInt.encode(@initial_max_stream_data_bidi_remote)
+      p_len = VarInt.encode(p_val.size.to_u64)
+      parts << p_id; parts << p_len; parts << p_val
+      total = total + p_id.size + p_len.size + p_val.size
+    end
+
+    if @initial_max_stream_data_uni > 0_u64
+      p_id = VarInt.encode(0x07_u64)
+      p_val = VarInt.encode(@initial_max_stream_data_uni)
+      p_len = VarInt.encode(p_val.size.to_u64)
+      parts << p_id; parts << p_len; parts << p_val
+      total = total + p_id.size + p_len.size + p_val.size
+    end
+
+    p_id = VarInt.encode(0x08_u64)
+    p_val = VarInt.encode(@initial_max_streams_bidi)
+    p_len = VarInt.encode(p_val.size.to_u64)
+    parts << p_id; parts << p_len; parts << p_val
+    total = total + p_id.size + p_len.size + p_val.size
+
+    if @initial_max_streams_uni > 0_u64
+      p_id = VarInt.encode(0x09_u64)
+      p_val = VarInt.encode(@initial_max_streams_uni)
+      p_len = VarInt.encode(p_val.size.to_u64)
+      parts << p_id; parts << p_len; parts << p_val
+      total = total + p_id.size + p_len.size + p_val.size
+    end
+
+    if @ack_delay_exponent != 3_u64
+      p_id = VarInt.encode(0x0a_u64)
+      p_val = VarInt.encode(@ack_delay_exponent)
+      p_len = VarInt.encode(p_val.size.to_u64)
+      parts << p_id; parts << p_len; parts << p_val
+      total = total + p_id.size + p_len.size + p_val.size
+    end
+
+    if @max_ack_delay != 25_u64
+      p_id = VarInt.encode(0x0b_u64)
+      p_val = VarInt.encode(@max_ack_delay)
+      p_len = VarInt.encode(p_val.size.to_u64)
+      parts << p_id; parts << p_len; parts << p_val
+      total = total + p_id.size + p_len.size + p_val.size
+    end
+
+    if @disable_active_migration
+      p_id = VarInt.encode(0x0c_u64)
+      p_len = VarInt.encode(0_u64)
+      parts << p_id; parts << p_len
+      total = total + p_id.size + p_len.size
+    end
+
+    if @active_connection_id_limit != 2_u64
+      p_id = VarInt.encode(0x0e_u64)
+      p_val = VarInt.encode(@active_connection_id_limit)
+      p_len = VarInt.encode(p_val.size.to_u64)
+      parts << p_id; parts << p_len; parts << p_val
+      total = total + p_id.size + p_len.size + p_val.size
+    end
+
+    if @initial_source_connection_id.size > 0
+      p_id = VarInt.encode(0x0f_u64)
+      p_len = VarInt.encode(@initial_source_connection_id.size.to_u64)
+      parts << p_id; parts << p_len; parts << @initial_source_connection_id
+      total = total + p_id.size + p_len.size + @initial_source_connection_id.size
+    end
+
+    buf = Bytes.new(total)
+    off = 0
+    i = 0
+    while i < parts.size
+      part = parts[i]
+      j = 0; while j < part.size
+        buf[off + j] = part[j]; j = j + 1
+      end
+      off = off + part.size
+      i = i + 1
+    end
+    buf
+  end
+
+  def self.decode?(bytes : Bytes, role : Int32 = -1) : {TransportParameters?, UInt64}
+    offset = 0
+    seen_ids = [] of UInt64
+
+    orig_dcid = Bytes.empty
+    max_idle_timeout = 30000_u64
+    stateless_reset_token = Bytes.empty
+    max_udp_payload_size = 65527_u64
+    max_data = 1048576_u64
+    max_stream_data_bidi_local = 65536_u64
+    max_stream_data_bidi_remote = 65536_u64
+    max_stream_data_uni = 65536_u64
+    max_streams_bidi = 100_u64
+    max_streams_uni = 100_u64
+    ack_delay_exponent = 3_u64
+    max_ack_delay = 25_u64
+    disable_active_migration = false
+    active_connection_id_limit = 2_u64
+    src_cid = Bytes.empty
+    retry_scid = Bytes.empty
+
+    while offset < bytes.size
+      param_id, id_len = VarInt.decode(bytes, offset); offset = offset + id_len
+      param_len, len_len = VarInt.decode(bytes, offset); offset = offset + len_len
+
+      return {nil.as(TransportParameters?), TransportError::TRANSPORT_PARAMETER_ERROR} if seen_ids.includes?(param_id)
+      seen_ids << param_id
+
+      return {nil.as(TransportParameters?), TransportError::TRANSPORT_PARAMETER_ERROR} if offset + param_len.to_i32 > bytes.size
+
+      if role == ConnectionRole::SERVER
+        if param_id == 0x00_u64 || param_id == 0x02_u64 || param_id == 0x10_u64
+          return {nil.as(TransportParameters?), TransportError::TRANSPORT_PARAMETER_ERROR}
+        end
+      end
+
+      if param_id == 0x00_u64
+        orig_dcid = bytes[offset, param_len.to_i32]
+      elsif param_id == 0x01_u64
+        v, vl = VarInt.decode(bytes, offset)
+        return {nil.as(TransportParameters?), TransportError::TRANSPORT_PARAMETER_ERROR} if vl.to_u64 != param_len
+        max_idle_timeout = v
+      elsif param_id == 0x02_u64
+        return {nil.as(TransportParameters?), TransportError::TRANSPORT_PARAMETER_ERROR} if param_len != 16_u64
+        stateless_reset_token = bytes[offset, 16]
+      elsif param_id == 0x03_u64
+        v, vl = VarInt.decode(bytes, offset)
+        return {nil.as(TransportParameters?), TransportError::TRANSPORT_PARAMETER_ERROR} if vl.to_u64 != param_len || v < 1200_u64
+        max_udp_payload_size = v
+      elsif param_id == 0x04_u64
+        v, vl = VarInt.decode(bytes, offset)
+        return {nil.as(TransportParameters?), TransportError::TRANSPORT_PARAMETER_ERROR} if vl.to_u64 != param_len
+        max_data = v
+      elsif param_id == 0x05_u64
+        v, vl = VarInt.decode(bytes, offset)
+        return {nil.as(TransportParameters?), TransportError::TRANSPORT_PARAMETER_ERROR} if vl.to_u64 != param_len
+        max_stream_data_bidi_local = v
+      elsif param_id == 0x06_u64
+        v, vl = VarInt.decode(bytes, offset)
+        return {nil.as(TransportParameters?), TransportError::TRANSPORT_PARAMETER_ERROR} if vl.to_u64 != param_len
+        max_stream_data_bidi_remote = v
+      elsif param_id == 0x07_u64
+        v, vl = VarInt.decode(bytes, offset)
+        return {nil.as(TransportParameters?), TransportError::TRANSPORT_PARAMETER_ERROR} if vl.to_u64 != param_len
+        max_stream_data_uni = v
+      elsif param_id == 0x08_u64
+        v, vl = VarInt.decode(bytes, offset)
+        return {nil.as(TransportParameters?), TransportError::TRANSPORT_PARAMETER_ERROR} if vl.to_u64 != param_len
+        max_streams_bidi = v
+      elsif param_id == 0x09_u64
+        v, vl = VarInt.decode(bytes, offset)
+        return {nil.as(TransportParameters?), TransportError::TRANSPORT_PARAMETER_ERROR} if vl.to_u64 != param_len
+        max_streams_uni = v
+      elsif param_id == 0x0a_u64
+        v, vl = VarInt.decode(bytes, offset)
+        return {nil.as(TransportParameters?), TransportError::TRANSPORT_PARAMETER_ERROR} if vl.to_u64 != param_len || v > 20_u64
+        ack_delay_exponent = v
+      elsif param_id == 0x0b_u64
+        v, vl = VarInt.decode(bytes, offset)
+        return {nil.as(TransportParameters?), TransportError::TRANSPORT_PARAMETER_ERROR} if vl.to_u64 != param_len
+        max_ack_delay = v
+      elsif param_id == 0x0c_u64
+        return {nil.as(TransportParameters?), TransportError::TRANSPORT_PARAMETER_ERROR} if param_len != 0_u64
+        disable_active_migration = true
+      elsif param_id == 0x0e_u64
+        v, vl = VarInt.decode(bytes, offset)
+        return {nil.as(TransportParameters?), TransportError::TRANSPORT_PARAMETER_ERROR} if vl.to_u64 != param_len || v < 2_u64
+        active_connection_id_limit = v
+      elsif param_id == 0x0f_u64
+        src_cid = bytes[offset, param_len.to_i32]
+      elsif param_id == 0x10_u64
+        retry_scid = bytes[offset, param_len.to_i32]
+      end
+      offset = offset + param_len.to_i32
+    end
+
+    res = TransportParameters.new(
+      initial_max_data: max_data,
+      initial_max_stream_data_bidi_local: max_stream_data_bidi_local,
+      initial_max_stream_data_bidi_remote: max_stream_data_bidi_remote,
+      initial_max_stream_data_uni: max_stream_data_uni,
+      initial_max_streams_bidi: max_streams_bidi,
+      initial_max_streams_uni: max_streams_uni,
+      max_idle_timeout: max_idle_timeout,
+      max_udp_payload_size: max_udp_payload_size,
+      ack_delay_exponent: ack_delay_exponent,
+      max_ack_delay: max_ack_delay,
+      disable_active_migration: disable_active_migration,
+      active_connection_id_limit: active_connection_id_limit,
+      initial_source_connection_id: src_cid,
+      original_destination_connection_id: orig_dcid,
+      stateless_reset_token: stateless_reset_token,
+      retry_source_connection_id: retry_scid
+    )
+    {res, TransportError::NO_ERROR}
+  end
+
+  def self.decode(bytes : Bytes, role : Int32 = -1) : TransportParameters
+    tp, err = decode?(bytes, role)
+    if tp.nil?
+      raise "TRANSPORT_PARAMETER_ERROR: invalid transport parameters (code #{err})"
+    end
+    tp
+  end
+end
+
+# =============================================================================
+# 7. Loss Detection and Congestion Control (RFC 9002)
+# =============================================================================
+
+pub class RttEstimator
+  getter latest_rtt : Int64
+  getter smoothed_rtt : Int64
+  getter rttvar : Int64
+  getter min_rtt : Int64
+  @has_sample : Bool
+
+  def initialize(initial_rtt : Int64 = 333_i64)
+    @latest_rtt = 0_i64
+    @smoothed_rtt = initial_rtt
+    @rttvar = initial_rtt // 2_i64
+    @min_rtt = 0_i64
+    @has_sample = false
+  end
+
+  def update_rtt(latest : Int64, ack_delay : Int64 = 0_i64, handshake_confirmed : Bool = false) : Nil
+    @latest_rtt = latest
+    if @min_rtt == 0_i64 || latest < @min_rtt
+      @min_rtt = latest
+    end
+
+    # First RTT sample (Finding 8: explicit flag instead of hardcoded value)
+    unless @has_sample
+      @has_sample = true
+      @smoothed_rtt = latest
+      @rttvar = latest // 2_i64
+      @min_rtt = latest
+      return
+    end
+
+    adjusted_rtt = latest
+    if handshake_confirmed && latest > @min_rtt + ack_delay
+      adjusted_rtt = latest - ack_delay
+    end
+
+    diff = (@smoothed_rtt - adjusted_rtt).abs
+    @rttvar = (@rttvar * 3_i64 + diff) // 4_i64
+    @smoothed_rtt = (@smoothed_rtt * 7_i64 + adjusted_rtt) // 8_i64
+  end
+
+  def update(latest : Int64, ack_delay : Int64 = 0_i64, handshake_confirmed : Bool = false) : Nil
+    update_rtt(latest, ack_delay, handshake_confirmed)
+  end
+
+  # Space-aware PTO calculation with overflow protection (Finding 9).
+  def pto(space : Int32 = PacketSpace::APP_DATA, pto_count : Int32 = 0) : Int64
+    granularity = 1_i64
+    var_term = @rttvar * 4_i64
+    var_term = granularity if var_term < granularity
+    base_pto = @smoothed_rtt + var_term
+
+    # max_ack_delay is ONLY added in Application Data space (RFC 9002 5.2)
+    if space == PacketSpace::APP_DATA
+      base_pto = base_pto + 25_i64
+    end
+
+    safe_count = pto_count > 30 ? 30 : pto_count
+    multiplier = 1_i64.unsafe_shl(safe_count.to_u64)
+    base_pto * multiplier
+  end
+end
+
+pub struct SentPacket
+  getter packet_space : Int32
+  getter packet_number : UInt64
+  getter time_sent : Int64
+  getter ack_eliciting : Bool
+  getter in_flight : Bool
+  getter size : Int32
+  getter retransmittable_frames : Array(Bytes)
+
+  def initialize(
+    @packet_space : Int32,
+    @packet_number : UInt64,
+    @time_sent : Int64,
+    @ack_eliciting : Bool,
+    @in_flight : Bool,
+    @size : Int32,
+    @retransmittable_frames : Array(Bytes) = [] of Bytes,
+  )
+  end
+end
+
+pub class NewRenoCongestionController
+  pub MAX_DATAGRAM_SIZE = 1200_i64
+
+  getter bytes_in_flight : Int64
+  getter congestion_window : Int64
+  getter ssthresh : Int64
+  getter recovery_start_time : Int64
+
+  def initialize
+    @bytes_in_flight = 0_i64
+    @congestion_window = 14720_i64
+    @ssthresh = 9223372036854775807_i64
+    @recovery_start_time = 0_i64
+  end
+
+  def can_send? : Bool
+    @bytes_in_flight < @congestion_window
+  end
+
+  def on_packet_sent(bytes : Int32) : Nil
+    @bytes_in_flight = @bytes_in_flight + bytes.to_i64
+  end
+
+  # Recovery-checked packet ACK handling (Finding 10).
+  def on_packet_acked(bytes : Int32, sent_time : Int64 = 0_i64) : Nil
+    @bytes_in_flight = @bytes_in_flight - bytes.to_i64
+    @bytes_in_flight = 0_i64 if @bytes_in_flight < 0_i64
+
+    # While in recovery, the congestion window MUST NOT be increased (RFC 9002 7.3.2)
+    if sent_time > @recovery_start_time
+      if @congestion_window < @ssthresh
+        @congestion_window = @congestion_window + bytes.to_i64
+      else
+        inc = (MAX_DATAGRAM_SIZE * bytes.to_i64) // @congestion_window
+        inc = 1_i64 if inc < 1_i64
+        @congestion_window = @congestion_window + inc
+      end
+    end
+  end
+
+  def on_congestion_event(sent_time : Int64) : Nil
+    return if sent_time <= @recovery_start_time
+    @recovery_start_time = sent_time
+    @congestion_window = (@congestion_window // 2_i64)
+    min_window = 2_i64 * MAX_DATAGRAM_SIZE
+    @congestion_window = min_window if @congestion_window < min_window
+    @ssthresh = @congestion_window
+  end
+end
+
+# =============================================================================
+# 8. Stream State Machine and Multiplexing (RFC 9000 Section 2, 3, 4)
+# =============================================================================
+
+pub struct StreamId
+  getter id : UInt64
+
+  def initialize(@id : UInt64)
+  end
+
+  def client_initiated? : Bool
+    (@id & 0x01_u64) == 0_u64
+  end
+
+  def server_initiated? : Bool
+    (@id & 0x01_u64) == 1_u64
+  end
+
+  def bidirectional? : Bool
+    (@id & 0x02_u64) == 0_u64
+  end
+
+  def unidirectional? : Bool
+    (@id & 0x02_u64) == 2_u64
+  end
+end
+
+pub struct StreamStatus
+  pub READY      = 0
+  pub SENDING    = 1
+  pub DATA_SENT  = 2
+  pub RESET_SENT = 3
+  pub RECV       = 4 # Finding 11: dedicated receive state
+  pub DATA_RECVD = 5
+  pub DATA_READ  = 6
+end
+
+pub class QuicStream
+  getter id : StreamId
+  getter send_status : Int32
+  getter recv_status : Int32
+  getter bytes_sent : UInt64
+  getter bytes_received : UInt64
+  getter max_stream_data_in : UInt64
+  getter max_stream_data_out : UInt64
+
+  @recv_buffer : Bytes
+  @send_buffer : Bytes
+
+  def initialize(@id : StreamId, initial_max_stream_data : UInt64 = 65536_u64)
+    @send_status = StreamStatus::READY
+    @recv_status = StreamStatus::READY
+    @bytes_sent = 0_u64
+    @bytes_received = 0_u64
+    @max_stream_data_in = initial_max_stream_data
+    @max_stream_data_out = initial_max_stream_data
+    @recv_buffer = Bytes.empty
+    @send_buffer = Bytes.empty
+  end
+
+  def can_send?(bytes_count : UInt64) : Bool
+    (@bytes_sent + bytes_count) <= @max_stream_data_out
+  end
+
+  def append_send(data : Bytes) : Nil
+    return if data.empty?
+    new_buf = Bytes.new(@send_buffer.size + data.size)
+    i = 0; while i < @send_buffer.size
+      new_buf[i] = @send_buffer[i]; i = i + 1
+    end
+    j = 0; while j < data.size
+      new_buf[@send_buffer.size + j] = data[j]; j = j + 1
+    end
+    @send_buffer = new_buf
+    @send_status = StreamStatus::SENDING
+  end
+
+  def append_recv(offset : UInt64, data : Bytes, fin : Bool = false) : Nil
+    return if data.empty? && !fin
+    if offset < @bytes_received
+      if (offset + data.size.to_u64) <= @bytes_received
+        @recv_status = fin ? StreamStatus::DATA_RECVD : StreamStatus::RECV
+        return
+      end
+      overlap = (@bytes_received - offset).to_i32
+      data = data[overlap, data.size - overlap]
+    end
+    new_buf = Bytes.new(@recv_buffer.size + data.size)
+    i = 0; while i < @recv_buffer.size
+      new_buf[i] = @recv_buffer[i]; i = i + 1
+    end
+    j = 0; while j < data.size
+      new_buf[@recv_buffer.size + j] = data[j]; j = j + 1
+    end
+    @recv_buffer = new_buf
+    @bytes_received = @bytes_received + data.size.to_u64
+    @recv_status = fin ? StreamStatus::DATA_RECVD : StreamStatus::RECV
+  end
+
+  def append_recv(data : Bytes, fin : Bool = false) : Nil
+    append_recv(@bytes_received, data, fin)
+  end
+
+  def read_available : Bytes
+    data = @recv_buffer
+    @recv_buffer = Bytes.empty
+    @recv_status = StreamStatus::DATA_READ if @recv_status == StreamStatus::DATA_RECVD
+    data
+  end
+end
+
+pub class StreamManager
+  getter max_data_local : UInt64
+  getter max_data_remote : UInt64
+  getter max_streams_bidi_remote : UInt64
+  getter max_streams_uni_remote : UInt64
+  getter total_sent : UInt64
+  getter total_received : UInt64
+
+  @streams : Array(QuicStream)
+
+  def initialize(
+    initial_max_data : UInt64 = 1048576_u64,
+    initial_max_streams_bidi : UInt64 = 100_u64,
+    initial_max_streams_uni : UInt64 = 100_u64,
+  )
+    @max_data_local = initial_max_data
+    @max_data_remote = initial_max_data
+    @max_streams_bidi_remote = initial_max_streams_bidi
+    @max_streams_uni_remote = initial_max_streams_uni
+    @total_sent = 0_u64
+    @total_received = 0_u64
+    @streams = [] of QuicStream
+  end
+
+  # Enforces stream limits per RFC 9000 Section 4.6 (Finding 12).
+  def can_create_stream?(id_val : UInt64) : Bool
+    stream_idx = id_val.unsafe_shr(2_u64)
+    is_uni = (id_val & 0x02_u64) != 0_u64
+    limit = is_uni ? @max_streams_uni_remote : @max_streams_bidi_remote
+    stream_idx < limit
+  end
+
+  def get_or_create_stream?(id_val : UInt64) : QuicStream?
+    i = 0
+    while i < @streams.size
+      return @streams[i] if @streams[i].id.id == id_val
+      i = i + 1
+    end
+
+    return nil unless can_create_stream?(id_val)
+
+    stream = QuicStream.new(StreamId.new(id_val))
+    @streams << stream
+    stream
+  end
+
+  def get_or_create_stream(id_val : UInt64) : QuicStream
+    st = get_or_create_stream?(id_val)
+    if st.nil?
+      stream_idx = id_val.unsafe_shr(2_u64)
+      raise "STREAM_LIMIT_ERROR: stream index #{stream_idx} exceeds maximum allowed"
+    end
+    st
+  end
+
+  def can_send_connection?(len : UInt64) : Bool
+    (@total_sent + len) <= @max_data_remote
+  end
+
+  def record_sent(len : UInt64) : Nil
+    @total_sent = @total_sent + len
+  end
+
+  def record_received(len : UInt64) : Nil
+    @total_received = @total_received + len
+  end
+end
+
+# =============================================================================
+# 9. High-Level QUIC Connection State Machine and UDP Network Endpoint
+# =============================================================================
+
+pub struct ConnectionRole
+  pub CLIENT = 0
+  pub SERVER = 1
+end
+
+pub struct ConnectionState
+  pub INITIAL   = 0
+  pub HANDSHAKE = 1
+  pub ACTIVE    = 2
+  pub DRAINING  = 3
+  pub CLOSED    = 4
+end
+
+# A QUIC server cannot manufacture or inherit an identity. Credentials belong
+# to the application, and tests pass fixtures explicitly through this type.
+pub class QuicServerCredentials
+  getter certificate_chain : Array(Bytes)
+  getter private_n : BigInt
+  getter private_d : BigInt
+
+  def initialize(@certificate_chain : Array(Bytes), @private_n : BigInt, @private_d : BigInt)
+    raise "QUIC TLS server certificate chain cannot be empty" if @certificate_chain.empty?
+    raise "QUIC TLS server RSA key cannot be zero" if @private_n.zero? || @private_d.zero?
+  end
+end
+
+pub class QuicConnection
+  getter role : Int32
+  getter state : Int32
+  getter dcid : Bytes
+  getter scid : Bytes
+  getter stream_manager : StreamManager
+  getter rtt_estimator : RttEstimator
+  getter congestion_ctrl : NewRenoCongestionController
+  getter local_transport_params : TransportParameters
+  getter peer_transport_params : TransportParameters?
+  getter tls : QuicTlsContext
+  getter remote_host : String
+  getter remote_port : Int32
+  getter paused_by_anti_amplification : Bool
+
+  # Three independent Packet Number Spaces (Finding 1)
+  @next_pn : Array(UInt64)
+  @largest_received_pn : Array(UInt64)
+  @largest_acked : Array(UInt64)
+  @sent_packets : Array(SentPacket)
+  @retransmit_queue : Array(Array(Bytes))
+  @last_ack_eliciting_send_time : Array(Int64)
+  @pto_count : Int32
+
+  # Key bundles per encryption level
+  @initial_keys_in : KeyBundle?
+  @initial_keys_out : KeyBundle?
+  @handshake_keys_in : KeyBundle?
+  @handshake_keys_out : KeyBundle?
+  @app_keys_in : KeyBundle?
+  @app_keys_out : KeyBundle?
+
+  # Crypto stream buffers per space (Finding 7)
+  @crypto_send_buf : Array(Bytes)
+  @crypto_recv_buf : Array(Bytes)
+  @crypto_send_offset : Array(UInt64)
+
+  # Anti-amplification tracking (Finding 14)
+  @bytes_received_unvalidated : UInt64
+  @bytes_sent_unvalidated : UInt64
+  @address_validated : Bool
+  @anti_amp_queue : Array(Bytes)
+
+  # Datagram queue
+  @datagram_recv_queue : Array(Bytes)
+
+  def initialize(
+    @role : Int32,
+    @dcid : Bytes,
+    @scid : Bytes,
+    initial_dcid : Bytes = Bytes.empty,
+    hostname : String = "",
+    ca_store : CertificateStore? = nil,
+    server_credentials : QuicServerCredentials? = nil,
+    verification_time : Int64? = nil,
+  )
+    @state = ConnectionState::INITIAL
+    @stream_manager = StreamManager.new
+    @rtt_estimator = RttEstimator.new
+    @congestion_ctrl = NewRenoCongestionController.new
+    @local_transport_params = TransportParameters.new(initial_source_connection_id: @scid)
+    @peer_transport_params = nil
+    @tls = QuicTlsContext.new(
+      @role, @local_transport_params, hostname: hostname, ca_store: ca_store,
+      server_credentials: server_credentials, verification_time: verification_time,
+    )
+    @remote_host = "127.0.0.1"
+    @remote_port = 0
+    @paused_by_anti_amplification = false
+
+    # Three independent spaces: Initial (0), Handshake (1), AppData (2)
+    @next_pn = [0_u64, 0_u64, 0_u64]
+    @largest_received_pn = [0_u64, 0_u64, 0_u64]
+    @largest_acked = [0_u64, 0_u64, 0_u64]
+    @sent_packets = [] of SentPacket
+    @retransmit_queue = [[] of Bytes, [] of Bytes, [] of Bytes]
+    @last_ack_eliciting_send_time = [0_i64, 0_i64, 0_i64]
+    @pto_count = 0
+
+    @crypto_send_buf = [Bytes.empty, Bytes.empty, Bytes.empty]
+    @crypto_recv_buf = [Bytes.empty, Bytes.empty, Bytes.empty]
+    @crypto_send_offset = [0_u64, 0_u64, 0_u64]
+
+    @bytes_received_unvalidated = 0_u64
+    @bytes_sent_unvalidated = 0_u64
+    @address_validated = (@role == ConnectionRole::CLIENT)
+    @anti_amp_queue = [] of Bytes
+    @datagram_recv_queue = [] of Bytes
+
+    # Initial Keys (RFC 9001 Section 5.2)
+    init_cid = initial_dcid.empty? ? @dcid : initial_dcid
+    client_sec, server_sec = QuicCrypto.derive_initial_secrets(init_cid)
+    if @role == ConnectionRole::CLIENT
+      @initial_keys_out = QuicCrypto.derive_packet_keys(client_sec)
+      @initial_keys_in = QuicCrypto.derive_packet_keys(server_sec)
+    else
+      @initial_keys_out = QuicCrypto.derive_packet_keys(server_sec)
+      @initial_keys_in = QuicCrypto.derive_packet_keys(client_sec)
+    end
+  end
+
+  def bytes_in_flight : Int64
+    @congestion_ctrl.bytes_in_flight
+  end
+
+  def set_remote(host : String, port : Int32) : Nil
+    @remote_host = host
+    @remote_port = port
+  end
+
+  def apply_peer_transport_parameters(tp : TransportParameters) : Nil
+    @peer_transport_params = tp
+    @stream_manager = StreamManager.new(
+      initial_max_data: tp.initial_max_data,
+      initial_max_streams_bidi: tp.initial_max_streams_bidi,
+      initial_max_streams_uni: tp.initial_max_streams_uni
+    )
+  end
+
+  # Installs Handshake traffic keys.
+  def install_handshake_keys(client_secret : Bytes, server_secret : Bytes) : Nil
+    if @role == ConnectionRole::CLIENT
+      @handshake_keys_out = QuicCrypto.derive_packet_keys(client_secret)
+      @handshake_keys_in = QuicCrypto.derive_packet_keys(server_secret)
+    else
+      @handshake_keys_out = QuicCrypto.derive_packet_keys(server_secret)
+      @handshake_keys_in = QuicCrypto.derive_packet_keys(client_secret)
+    end
+    @state = ConnectionState::HANDSHAKE
+  end
+
+  # Installs 1-RTT Application traffic keys.
+  def install_application_keys(client_secret : Bytes, server_secret : Bytes) : Nil
+    if @role == ConnectionRole::CLIENT
+      @app_keys_out = QuicCrypto.derive_packet_keys(client_secret)
+      @app_keys_in = QuicCrypto.derive_packet_keys(server_secret)
+    else
+      @app_keys_out = QuicCrypto.derive_packet_keys(server_secret)
+      @app_keys_in = QuicCrypto.derive_packet_keys(client_secret)
+    end
+    @state = ConnectionState::ACTIVE
+    @address_validated = true
+  end
+
+  # Buffers TLS 1.3 handshake data to be sent on the CRYPTO stream (Finding 7).
+  def feed_crypto_data(space : Int32, data : Bytes) : Nil
+    return if data.empty?
+    cur = @crypto_send_buf[space]
+    new_b = Bytes.new(cur.size + data.size)
+    i = 0; while i < cur.size
+      new_b[i] = cur[i]; i = i + 1
+    end
+    j = 0; while j < data.size
+      new_b[cur.size + j] = data[j]; j = j + 1
+    end
+    @crypto_send_buf[space] = new_b
+  end
+
+  # Reads received TLS 1.3 handshake data from peer's CRYPTO stream (Finding 7).
+  def poll_crypto_received(space : Int32) : Bytes
+    b = @crypto_recv_buf[space]
+    @crypto_recv_buf[space] = Bytes.empty
+    b
+  end
+
+  def poll_datagram_received : Bytes?
+    return nil if @datagram_recv_queue.empty?
+    d = @datagram_recv_queue[0]
+    new_q = [] of Bytes
+    i = 1; while i < @datagram_recv_queue.size
+      new_q << @datagram_recv_queue[i]; i = i + 1
+    end
+    @datagram_recv_queue = new_q
+    d
+  end
+
+  # Checks if sending bytes is permitted under server 3x anti-amplification rule (Finding 14)
+  def can_send_unvalidated?(packet_size : Int32) : Bool
+    return true if @role == ConnectionRole::CLIENT || @address_validated
+    limit = @bytes_received_unvalidated * 3_u64
+    (@bytes_sent_unvalidated + packet_size.to_u64) <= limit
+  end
+
+  # Flushes packets paused by anti-amplification limit once allowance increases
+  def flush_pending_packets : Array(Bytes)
+    return [] of Bytes if @anti_amp_queue.empty?
+    flushed = [] of Bytes
+    remaining = [] of Bytes
+    limit = @address_validated ? 9223372036854775807_u64 : (@bytes_received_unvalidated * 3_u64)
+    i = 0
+    while i < @anti_amp_queue.size
+      pkt = @anti_amp_queue[i]
+      if (@bytes_sent_unvalidated + pkt.size.to_u64) <= limit
+        @bytes_sent_unvalidated = @bytes_sent_unvalidated + pkt.size.to_u64
+        flushed << pkt
+      else
+        remaining << pkt
+      end
+      i = i + 1
+    end
+    @anti_amp_queue = remaining
+    @paused_by_anti_amplification = !remaining.empty?
+    flushed
+  end
+
+  # Initiates real TLS 1.3 client handshake carrying transport parameters
+  def start_client_handshake : Bytes
+    ch_msg = @tls.start_client_handshake
+    feed_crypto_data(PacketSpace::INITIAL, ch_msg)
+    ch_msg
+  end
+
+  # Advances TLS 1.3 handshake state machine when CRYPTO frames arrive
+  def process_handshake_crypto : Nil
+    if @role == ConnectionRole::SERVER
+      if @state == ConnectionState::INITIAL && @crypto_recv_buf[PacketSpace::INITIAL].size > 0
+        ch_bytes = poll_crypto_received(PacketSpace::INITIAL)
+        sh_bytes, flight, client_tp = @tls.handle_client_hello(ch_bytes)
+        apply_peer_transport_parameters(client_tp)
+        install_handshake_keys(@tls.c_hs_traffic, @tls.s_hs_traffic)
+        feed_crypto_data(PacketSpace::INITIAL, sh_bytes)
+        feed_crypto_data(PacketSpace::HANDSHAKE, flight)
+        install_application_keys(@tls.c_ap_traffic, @tls.s_ap_traffic)
+      elsif @crypto_recv_buf[PacketSpace::HANDSHAKE].size > 0
+        fin_bytes = poll_crypto_received(PacketSpace::HANDSHAKE)
+        if !@tls.handshake_done
+          @tls.handle_client_finished(fin_bytes)
+          @state = ConnectionState::ACTIVE
+          @address_validated = true
+        end
+      end
+    else
+      if @state == ConnectionState::INITIAL && @crypto_recv_buf[PacketSpace::INITIAL].size > 0
+        sh_bytes = poll_crypto_received(PacketSpace::INITIAL)
+        @tls.handle_server_hello(sh_bytes)
+        install_handshake_keys(@tls.c_hs_traffic, @tls.s_hs_traffic)
+      end
+      if @crypto_recv_buf[PacketSpace::HANDSHAKE].size > 0
+        flight = poll_crypto_received(PacketSpace::HANDSHAKE)
+        if !@tls.handshake_done
+          c_fin, server_tp = @tls.handle_server_handshake_flight(flight)
+          apply_peer_transport_parameters(server_tp)
+          feed_crypto_data(PacketSpace::HANDSHAKE, c_fin)
+          install_application_keys(@tls.c_ap_traffic, @tls.s_ap_traffic)
+        end
+      end
+    end
+  end
+
+  # Packages and protects an Initial packet.
+  def send_initial_packet(extra_frames : Bytes = Bytes.empty, token : Bytes = Bytes.empty, current_time : Int64 = 1000_i64) : Bytes
+    keys = @initial_keys_out
+    raise "initial keys missing" if keys.nil?
+
+    space = PacketSpace::INITIAL
+    pn = @next_pn[space]
+    @next_pn[space] = pn + 1_u64
+    pn_len = PacketNumber.encode_length(pn, 0_u64)
+
+    payload_parts = [] of Bytes
+    total_payload = 0
+    retrans_frames = [] of Bytes
+
+    if @crypto_send_buf[space].size > 0
+      cf = FrameCodec.encode_crypto(@crypto_send_offset[space], @crypto_send_buf[space])
+      @crypto_send_offset[space] = @crypto_send_offset[space] + @crypto_send_buf[space].size.to_u64
+      @crypto_send_buf[space] = Bytes.empty
+      payload_parts << cf
+      retrans_frames << cf
+      total_payload = total_payload + cf.size
+    end
+    if extra_frames.size > 0
+      payload_parts << extra_frames
+      retrans_frames << extra_frames
+      total_payload = total_payload + extra_frames.size
+    end
+
+    raw_payload = Bytes.new(total_payload)
+    off = 0
+    i = 0
+    while i < payload_parts.size
+      p = payload_parts[i]
+      j = 0; while j < p.size
+        raw_payload[off + j] = p[j]; j = j + 1
+      end
+      off = off + p.size
+      i = i + 1
+    end
+
+    # Enforce minimum 1200 byte Client Initial UDP datagram (Finding 4)
+    payload = raw_payload
+    header_unprot_len = 1 + 4 + 1 + @dcid.size + 1 + @scid.size + (token.size > 0 ? 2 + token.size : 1) + 2 + pn_len
+    min_payload = 1200 - header_unprot_len - 16
+    if @role == ConnectionRole::CLIENT && payload.size < min_payload
+      padded = Bytes.new(min_payload, 0_u8)
+      i = 0; while i < payload.size
+        padded[i] = payload[i]; i = i + 1
+      end
+      payload = padded
+    end
+
+    total_len = payload.size.to_u64 + pn_len.to_u64 + 16_u64
+    hdr = LongHeader.new(PacketType::INITIAL, QuicVersion::V1, @dcid, @scid, token, total_len, pn, pn_len)
+    unprot_hdr = hdr.encode_unprotected
+    pn_offset = unprot_hdr.size - pn_len
+
+    packet = QuicCrypto.protect_packet(keys, unprot_hdr, pn_offset, pn_len, pn, payload, is_long_header: true)
+
+    # Server Anti-Amplification Limit: pause rather than raise (Finding 14)
+    if @role == ConnectionRole::SERVER && !@address_validated
+      limit = @bytes_received_unvalidated * 3_u64
+      if (@bytes_sent_unvalidated + packet.size.to_u64) > limit
+        @paused_by_anti_amplification = true
+        @anti_amp_queue << packet
+        return Bytes.empty
+      end
+      @bytes_sent_unvalidated = @bytes_sent_unvalidated + packet.size.to_u64
+    end
+
+    ack_eliciting = retrans_frames.size > 0
+    @sent_packets << SentPacket.new(space, pn, current_time, ack_eliciting, true, packet.size, retrans_frames)
+    @last_ack_eliciting_send_time[space] = current_time if ack_eliciting
+    @congestion_ctrl.on_packet_sent(packet.size)
+    packet
+  end
+
+  # Packages and protects a Handshake packet (Finding 3, 7).
+  def send_handshake_packet(extra_frames : Bytes = Bytes.empty, current_time : Int64 = 1000_i64) : Bytes
+    keys = @handshake_keys_out
+    raise "handshake keys missing" if keys.nil?
+
+    space = PacketSpace::HANDSHAKE
+    pn = @next_pn[space]
+    @next_pn[space] = pn + 1_u64
+    pn_len = PacketNumber.encode_length(pn, 0_u64)
+
+    payload_parts = [] of Bytes
+    total_payload = 0
+    retrans_frames = [] of Bytes
+
+    if @crypto_send_buf[space].size > 0
+      cf = FrameCodec.encode_crypto(@crypto_send_offset[space], @crypto_send_buf[space])
+      @crypto_send_offset[space] = @crypto_send_offset[space] + @crypto_send_buf[space].size.to_u64
+      @crypto_send_buf[space] = Bytes.empty
+      payload_parts << cf
+      retrans_frames << cf
+      total_payload = total_payload + cf.size
+    end
+    if extra_frames.size > 0
+      payload_parts << extra_frames
+      retrans_frames << extra_frames
+      total_payload = total_payload + extra_frames.size
+    end
+
+    payload = Bytes.new(total_payload)
+    off = 0
+    i = 0
+    while i < payload_parts.size
+      p = payload_parts[i]
+      j = 0; while j < p.size
+        payload[off + j] = p[j]; j = j + 1
+      end
+      off = off + p.size
+      i = i + 1
+    end
+
+    min_pt_len = 4 - pn_len
+    if payload.size < min_pt_len
+      pad_size = min_pt_len - payload.size
+      padded = Bytes.new(payload.size + pad_size, 0_u8)
+      i = 0; while i < payload.size
+        padded[i] = payload[i]; i = i + 1
+      end
+      payload = padded
+    end
+    total_len = payload.size.to_u64 + pn_len.to_u64 + 16_u64
+    hdr = LongHeader.new(PacketType::HANDSHAKE, QuicVersion::V1, @dcid, @scid, Bytes.empty, total_len, pn, pn_len)
+    unprot_hdr = hdr.encode_unprotected
+    pn_offset = unprot_hdr.size - pn_len
+
+    packet = QuicCrypto.protect_packet(keys, unprot_hdr, pn_offset, pn_len, pn, payload, is_long_header: true)
+
+    # Server Anti-Amplification Limit: pause rather than raise
+    if @role == ConnectionRole::SERVER && !@address_validated
+      limit = @bytes_received_unvalidated * 3_u64
+      if (@bytes_sent_unvalidated + packet.size.to_u64) > limit
+        @paused_by_anti_amplification = true
+        @anti_amp_queue << packet
+        return Bytes.empty
+      end
+      @bytes_sent_unvalidated = @bytes_sent_unvalidated + packet.size.to_u64
+    end
+
+    ack_eliciting = retrans_frames.size > 0
+    @sent_packets << SentPacket.new(space, pn, current_time, ack_eliciting, true, packet.size, retrans_frames)
+    @last_ack_eliciting_send_time[space] = current_time if ack_eliciting
+    @congestion_ctrl.on_packet_sent(packet.size)
+    packet
+  end
+
+  # Packages and protects a 1-RTT Short Header packet (Finding 2).
+  def send_1rtt_packet(payload : Bytes, spin_bit : Bool = false, current_time : Int64 = 1000_i64) : Bytes
+    keys = @app_keys_out
+    raise "1-RTT application keys missing" if keys.nil?
+
+    space = PacketSpace::APP_DATA
+    pn = @next_pn[space]
+    @next_pn[space] = pn + 1_u64
+    pn_len = PacketNumber.encode_length(pn, 0_u64)
+    min_pt_len = 4 - pn_len
+    actual_payload = payload
+    if actual_payload.size < min_pt_len
+      pad_size = min_pt_len - actual_payload.size
+      padded = Bytes.new(actual_payload.size + pad_size, 0_u8)
+      i = 0; while i < actual_payload.size
+        padded[i] = actual_payload[i]; i = i + 1
+      end
+      actual_payload = padded
+    end
+
+    hdr = ShortHeader.new(spin_bit, false, @dcid, pn, pn_len)
+    unprot_hdr = hdr.encode_unprotected
+    pn_offset = unprot_hdr.size - pn_len
+
+    packet = QuicCrypto.protect_packet(keys, unprot_hdr, pn_offset, pn_len, pn, actual_payload, is_long_header: false)
+
+    rf = [actual_payload]
+    @sent_packets << SentPacket.new(space, pn, current_time, true, true, packet.size, rf)
+    @last_ack_eliciting_send_time[space] = current_time
+    @congestion_ctrl.on_packet_sent(packet.size)
+    packet
+  end
+
+  # Calculates earliest PTO deadline across all active packet spaces
+  def next_pto_deadline : Int64?
+    earliest = nil.as(Int64?)
+    s = 0
+    while s < 3
+      has_in_flight = false
+      j = 0
+      while j < @sent_packets.size
+        p = @sent_packets[j]
+        if p.packet_space == s && p.ack_eliciting
+          has_in_flight = true
+          break
+        end
+        j = j + 1
+      end
+      if has_in_flight
+        d = @last_ack_eliciting_send_time[s] + @rtt_estimator.pto(s, @pto_count)
+        if earliest.nil? || d < earliest
+          earliest = d
+        end
+      end
+      s = s + 1
+    end
+    earliest
+  end
+
+  # Wakes and retransmits unacknowledged frames or probes on PTO expiration
+  def check_and_handle_pto(current_time : Int64) : Array(Bytes)
+    pkts = [] of Bytes
+    deadline = next_pto_deadline
+    return pkts if deadline.nil? || current_time < deadline
+
+    @pto_count = @pto_count + 1
+    s = 0
+    while s < 3
+      unacked_frames = [] of Bytes
+      if @retransmit_queue[s].size > 0
+        unacked_frames = @retransmit_queue[s]
+        @retransmit_queue[s] = [] of Bytes
+      else
+        j = 0
+        while j < @sent_packets.size
+          p = @sent_packets[j]
+          if p.packet_space == s && p.ack_eliciting && p.retransmittable_frames.size > 0
+            k = 0
+            while k < p.retransmittable_frames.size
+              unacked_frames << p.retransmittable_frames[k]
+              k = k + 1
+            end
+          end
+          j = j + 1
+        end
+      end
+
+      if unacked_frames.size > 0
+        combined_frames = [] of UInt8
+        f_i = 0
+        while f_i < unacked_frames.size
+          rf = unacked_frames[f_i]
+          k = 0; while k < rf.size
+            combined_frames << rf[k]; k = k + 1
+          end
+          f_i = f_i + 1
+        end
+        cf_bytes = Bytes.new(combined_frames.size)
+        k = 0; while k < combined_frames.size
+          cf_bytes[k] = combined_frames[k]; k = k + 1
+        end
+        if s == PacketSpace::INITIAL && !@initial_keys_out.nil?
+          p = send_initial_packet(cf_bytes, current_time: current_time)
+          pkts << p if p.size > 0
+        elsif s == PacketSpace::HANDSHAKE && !@handshake_keys_out.nil?
+          p = send_handshake_packet(cf_bytes, current_time: current_time)
+          pkts << p if p.size > 0
+        elsif s == PacketSpace::APP_DATA && !@app_keys_out.nil?
+          p = send_1rtt_packet(cf_bytes, current_time: current_time)
+          pkts << p if p.size > 0
+        end
+      end
+      s = s + 1
+    end
+
+    if pkts.empty?
+      ping_frame = FrameCodec.encode_ping
+      if @state == ConnectionState::ACTIVE && !@app_keys_out.nil?
+        p = send_1rtt_packet(ping_frame, current_time: current_time)
+        pkts << p if p.size > 0
+      elsif @state == ConnectionState::HANDSHAKE && !@handshake_keys_out.nil?
+        p = send_handshake_packet(ping_frame, current_time: current_time)
+        pkts << p if p.size > 0
+      elsif !@initial_keys_out.nil?
+        p = send_initial_packet(ping_frame, current_time: current_time)
+        pkts << p if p.size > 0
+      end
+    end
+
+    pkts
+  end
+
+  # Receives, unpacks, and processes an incoming datagram (Findings 1, 2, 3, 4, 5, 6).
+  def receive_packet(datagram : Bytes, current_time : Int64 = 1050_i64) : {Bytes, Array(DecodedFrame)}
+    raise "datagram too short" if datagram.size < 21
+    @bytes_received_unvalidated = @bytes_received_unvalidated + datagram.size.to_u64
+
+    first_byte = datagram[0]
+    is_long = (first_byte & 0x80_u8) != 0_u8
+
+    if is_long
+      pkt_type = (first_byte & 0x30_u8).unsafe_shr(4_u8)
+      dcid_len = datagram[5].to_i32
+      raise "datagram truncated for dcid" if datagram.size < 6 + dcid_len
+
+      scid_offset = 6 + dcid_len
+      scid_len = datagram[scid_offset].to_i32
+      raise "datagram truncated for scid" if datagram.size < scid_offset + 1 + scid_len
+
+      token_offset = scid_offset + 1 + scid_len
+      token_len = 0_u64
+      token_len_bytes = 0
+      len_offset = 0
+
+      if pkt_type == PacketType::INITIAL
+        t_len, tl_bytes = VarInt.decode(datagram, token_offset)
+        token_len = t_len
+        token_len_bytes = tl_bytes
+        len_offset = token_offset + token_len_bytes + token_len.to_i32
+      else
+        len_offset = scid_offset + 1 + scid_len
+      end
+
+      pkt_len, pkt_len_bytes = VarInt.decode(datagram, len_offset)
+      pn_offset = len_offset + pkt_len_bytes
+      sample_offset = pn_offset + 4
+      raise "packet truncated for sampling" if datagram.size < sample_offset + 16
+
+      keys = (pkt_type == PacketType::HANDSHAKE) ? @handshake_keys_in : @initial_keys_in
+      raise "read keys missing for long packet" if keys.nil?
+      space = (pkt_type == PacketType::HANDSHAKE) ? PacketSpace::HANDSHAKE : PacketSpace::INITIAL
+
+      sample = datagram[sample_offset, 16]
+      mask = QuicCrypto.generate_mask(keys.hp, sample)
+
+      hdr_buf = Bytes.new(pn_offset + 4)
+      i = 0; while i < hdr_buf.size
+        hdr_buf[i] = datagram[i]; i = i + 1
+      end
+
+      pn_len = QuicCrypto.remove_header_protection(hdr_buf, pn_offset, mask, is_long_header: true)
+      unprotected_header = Bytes.new(pn_offset + pn_len)
+      i = 0; while i < unprotected_header.size
+        unprotected_header[i] = hdr_buf[i]; i = i + 1
+      end
+
+      raise "malformed packet length" if pkt_len.to_i32 < (pn_len + 16)
+      payload_len = pkt_len.to_i32 - pn_len
+      payload_offset = pn_offset + pn_len
+      raise "packet payload truncated" if payload_offset + payload_len > datagram.size
+
+      truncated_pn = 0_u64
+      i = 0
+      while i < pn_len
+        truncated_pn = (truncated_pn.unsafe_shl(8_u64)) | unprotected_header[pn_offset + i].to_u64
+        i = i + 1
+      end
+      pn = PacketNumber.decode(@largest_received_pn[space], truncated_pn, pn_len * 8)
+      @largest_received_pn[space] = pn if pn > @largest_received_pn[space]
+
+      nonce = QuicCrypto.compute_nonce(keys.iv, pn)
+      ciphertext_and_tag = datagram[payload_offset, payload_len]
+
+      plaintext = AES128GCM.decrypt(keys.key, nonce, ciphertext_and_tag, unprotected_header)
+      raise "AEAD decryption failed" if plaintext.nil?
+
+      frames = FrameCodec.decode_frames(plaintext)
+      process_frames(frames, space, current_time)
+
+      {plaintext, frames}
+    else
+      keys = @app_keys_in
+      raise "1-RTT read keys missing" if keys.nil?
+
+      space = PacketSpace::APP_DATA
+      dcid_len = @scid.size
+      pn_offset = 1 + dcid_len
+      sample_offset = pn_offset + 4
+      raise "short packet truncated for sampling" if datagram.size < sample_offset + 16
+
+      sample = datagram[sample_offset, 16]
+      mask = QuicCrypto.generate_mask(keys.hp, sample)
+
+      hdr_buf = Bytes.new(pn_offset + 4)
+      i = 0; while i < hdr_buf.size
+        hdr_buf[i] = datagram[i]; i = i + 1
+      end
+
+      pn_len = QuicCrypto.remove_header_protection(hdr_buf, pn_offset, mask, is_long_header: false)
+      unprotected_header = Bytes.new(pn_offset + pn_len)
+      i = 0; while i < unprotected_header.size
+        unprotected_header[i] = hdr_buf[i]; i = i + 1
+      end
+
+      truncated_pn = 0_u64
+      i = 0
+      while i < pn_len
+        truncated_pn = (truncated_pn.unsafe_shl(8_u64)) | unprotected_header[pn_offset + i].to_u64
+        i = i + 1
+      end
+      pn = PacketNumber.decode(@largest_received_pn[space], truncated_pn, pn_len * 8)
+      @largest_received_pn[space] = pn if pn > @largest_received_pn[space]
+
+      nonce = QuicCrypto.compute_nonce(keys.iv, pn)
+      payload_offset = pn_offset + pn_len
+      ciphertext_and_tag = datagram[payload_offset, datagram.size - payload_offset]
+
+      plaintext = AES128GCM.decrypt(keys.key, nonce, ciphertext_and_tag, unprotected_header)
+      raise "1-RTT AEAD decryption failed" if plaintext.nil?
+
+      frames = FrameCodec.decode_frames(plaintext)
+      process_frames(frames, space, current_time)
+
+      {plaintext, frames}
+    end
+  end
+
+  # Range-accurate ACK processing and sample RTT calculation
+  private def process_frames(frames : Array(DecodedFrame), space : Int32, current_time : Int64) : Nil
+    has_crypto = false
+    i = 0
+    while i < frames.size
+      f = frames[i]
+      if f.frame_type == FrameType::ACK || f.frame_type == FrameType::ACK_ECN
+        new_sent = [] of SentPacket
+        j = 0
+        while j < @sent_packets.size
+          pkt = @sent_packets[j]
+          is_acked = false
+
+          if pkt.packet_space == space
+            k = 0
+            while k < f.ack_ranges.size
+              if f.ack_ranges[k].contains?(pkt.packet_number)
+                is_acked = true
+                break
+              end
+              k = k + 1
+            end
+          end
+
+          if is_acked
+            sample_rtt = current_time - pkt.time_sent
+            sample_rtt = 1_i64 if sample_rtt < 1_i64
+            @rtt_estimator.update_rtt(sample_rtt, f.ack_delay.to_i64, @state == ConnectionState::ACTIVE)
+            @congestion_ctrl.on_packet_acked(pkt.size, pkt.time_sent)
+            if pkt.packet_number > @largest_acked[space]
+              @largest_acked[space] = pkt.packet_number
+            end
+            @pto_count = 0
+          else
+            new_sent << pkt
+          end
+          j = j + 1
+        end
+
+        # Loss detection on remaining unacknowledged packets (RFC 9002 6.1)
+        still_unacked = [] of SentPacket
+        time_loss_thresh = @rtt_estimator.smoothed_rtt > 0 ? ((@rtt_estimator.smoothed_rtt * 9) // 8) : 100_i64
+        time_loss_thresh = 5_i64 if time_loss_thresh < 5_i64
+
+        j = 0
+        while j < new_sent.size
+          pkt = new_sent[j]
+          is_lost = false
+          if pkt.packet_space == space
+            if @largest_acked[space] >= pkt.packet_number + 3_u64
+              is_lost = true
+            elsif @largest_acked[space] > pkt.packet_number && current_time >= (pkt.time_sent + time_loss_thresh)
+              is_lost = true
+            end
+          end
+
+          if is_lost
+            @congestion_ctrl.on_packet_acked(pkt.size, pkt.time_sent)
+            @congestion_ctrl.on_congestion_event(pkt.time_sent)
+            if pkt.retransmittable_frames.size > 0
+              rf_i = 0
+              while rf_i < pkt.retransmittable_frames.size
+                @retransmit_queue[space] << pkt.retransmittable_frames[rf_i]
+                rf_i = rf_i + 1
+              end
+            end
+          else
+            still_unacked << pkt
+          end
+          j = j + 1
+        end
+        @sent_packets = still_unacked
+      elsif f.frame_type == FrameType::CRYPTO
+        cur = @crypto_recv_buf[space]
+        nb = Bytes.new(cur.size + f.data.size)
+        k = 0; while k < cur.size
+          nb[k] = cur[k]; k = k + 1
+        end
+        k = 0; while k < f.data.size
+          nb[cur.size + k] = f.data[k]; k = k + 1
+        end
+        @crypto_recv_buf[space] = nb
+        has_crypto = true
+      elsif f.frame_type == FrameType::STREAM_BASE
+        st = @stream_manager.get_or_create_stream(f.stream_id)
+        st.append_recv(f.offset, f.data, f.fin)
+      elsif f.frame_type == FrameType::DATAGRAM || f.frame_type == FrameType::DATAGRAM_WITH_LEN
+        @datagram_recv_queue << f.data
+      elsif f.frame_type == FrameType::MAX_DATA
+        @stream_manager.record_received(0_u64)
+      elsif f.frame_type == FrameType::CONNECTION_CLOSE_QUIC || f.frame_type == FrameType::CONNECTION_CLOSE_APP
+        @state = ConnectionState::CLOSED
+      end
+      i = i + 1
+    end
+
+    if has_crypto
+      process_handshake_crypto
+    end
+  end
+end
+
+# =============================================================================
+# 10. TLS 1.3 Handshake Protocol over QUIC (RFC 9001 / RFC 8446)
+# =============================================================================
+
+pub class QuicTlsContext
+  getter role : Int32
+  getter hostname : String
+  getter local_tp : TransportParameters
+  getter peer_tp : TransportParameters?
+  getter ca_store : CertificateStore
+  getter peer_cert : Certificate?
+  getter peer_chain : Array(Certificate)
+  getter server_credentials : QuicServerCredentials?
+
+  getter priv_key : Bytes
+  getter pub_key : Bytes
+  getter peer_pub_key : Bytes
+  getter c_hs_traffic : Bytes
+  getter s_hs_traffic : Bytes
+  getter c_ap_traffic : Bytes
+  getter s_ap_traffic : Bytes
+  getter handshake_done : Bool
+  getter cert_verified : Bool
+
+  @transcript : Array(Bytes)
+  @handshake_secret : Bytes
+  @master_secret : Bytes
+  @shared_secret : Bytes
+  @client_random : Bytes
+  @server_random : Bytes
+  @session_id : Bytes
+
+  @verification_time : Int64?
+
+  def initialize(
+    @role : Int32,
+    @local_tp : TransportParameters,
+    @hostname : String = "",
+    ca_store : CertificateStore? = nil,
+    @server_credentials : QuicServerCredentials? = nil,
+    @verification_time : Int64? = nil,
+  )
+    @ca_store = ca_store || (@role == ConnectionRole::CLIENT && @hostname.size > 0 ? CertificateStore.load_system_store : CertificateStore.new)
+    @peer_tp = nil
+    @peer_cert = nil
+    @peer_chain = [] of Certificate
+    @priv_key = Bytes.empty
+    @pub_key = Bytes.empty
+    @peer_pub_key = Bytes.empty
+    @c_hs_traffic = Bytes.empty
+    @s_hs_traffic = Bytes.empty
+    @c_ap_traffic = Bytes.empty
+    @s_ap_traffic = Bytes.empty
+    @handshake_done = false
+    @cert_verified = false
+
+    @transcript = [] of Bytes
+    @handshake_secret = Bytes.empty
+    @master_secret = Bytes.empty
+    @shared_secret = Bytes.empty
+    @client_random = Bytes.empty
+    @server_random = Bytes.empty
+    @session_id = Bytes.empty
+  end
+
+  private def hash_transcript(upto : Int32 = -1) : Bytes
+    h = SHA256.new
+    limit = upto < 0 ? @transcript.size : upto
+    i = 0
+    while i < limit
+      h.update(@transcript[i])
+      i = i + 1
+    end
+    h.final
+  end
+
+  def start_client_handshake : Bytes
+    @priv_key, @pub_key = Std::Tls::X25519.generate_keypair
+    @client_random = Std::Crypto.random_bytes(32)
+    @session_id = Std::Crypto.random_bytes(32)
+    tp_bytes = @local_tp.encode
+
+    sni_len = @hostname.bytesize
+    ext_sni = Bytes.new(4 + 2 + 1 + 2 + sni_len)
+    ext_sni[0] = 0x00_u8; ext_sni[1] = 0x00_u8
+    ext_sni[2] = (((sni_len + 5) >> 8) & 0xff).to_u8; ext_sni[3] = ((sni_len + 5) & 0xff).to_u8
+    ext_sni[4] = (((sni_len + 3) >> 8) & 0xff).to_u8; ext_sni[5] = ((sni_len + 3) & 0xff).to_u8
+    ext_sni[6] = 0x00_u8
+    ext_sni[7] = ((sni_len >> 8) & 0xff).to_u8; ext_sni[8] = (sni_len & 0xff).to_u8
+    i = 0; while i < sni_len
+      ext_sni[9 + i] = @hostname[i].ord.to_u8; i = i + 1
+    end
+
+    ext_groups = Bytes.new(8)
+    ext_groups[0] = 0x00_u8; ext_groups[1] = 0x0a_u8
+    ext_groups[2] = 0x00_u8; ext_groups[3] = 0x04_u8
+    ext_groups[4] = 0x00_u8; ext_groups[5] = 0x02_u8
+    ext_groups[6] = 0x00_u8; ext_groups[7] = 0x1d_u8
+
+    ext_sig_algos = Bytes.new(8)
+    ext_sig_algos[0] = 0x00_u8; ext_sig_algos[1] = 0x0d_u8
+    ext_sig_algos[2] = 0x00_u8; ext_sig_algos[3] = 0x04_u8
+    ext_sig_algos[4] = 0x00_u8; ext_sig_algos[5] = 0x02_u8
+    ext_sig_algos[6] = 0x08_u8; ext_sig_algos[7] = 0x04_u8
+
+    ext_versions = Bytes.new(7)
+    ext_versions[0] = 0x00_u8; ext_versions[1] = 0x2b_u8
+    ext_versions[2] = 0x00_u8; ext_versions[3] = 0x03_u8
+    ext_versions[4] = 0x02_u8
+    ext_versions[5] = 0x03_u8; ext_versions[6] = 0x04_u8
+
+    ext_key_share = Bytes.new(42)
+    ext_key_share[0] = 0x00_u8; ext_key_share[1] = 0x33_u8
+    ext_key_share[2] = 0x00_u8; ext_key_share[3] = 38_u8
+    ext_key_share[4] = 0x00_u8; ext_key_share[5] = 36_u8
+    ext_key_share[6] = 0x00_u8; ext_key_share[7] = 0x1d_u8
+    ext_key_share[8] = 0x00_u8; ext_key_share[9] = 0x20_u8
+    i = 0; while i < 32
+      ext_key_share[10 + i] = @pub_key[i]; i = i + 1
+    end
+
+    ext_tp = Bytes.new(4 + tp_bytes.size)
+    ext_tp[0] = 0x00_u8; ext_tp[1] = 0x39_u8
+    ext_tp[2] = ((tp_bytes.size >> 8) & 0xff).to_u8; ext_tp[3] = (tp_bytes.size & 0xff).to_u8
+    i = 0; while i < tp_bytes.size
+      ext_tp[4 + i] = tp_bytes[i]; i = i + 1
+    end
+
+    all_exts_len = ext_sni.size + ext_groups.size + ext_sig_algos.size + ext_versions.size + ext_key_share.size + ext_tp.size
+    all_exts = Bytes.new(all_exts_len)
+    e_idx = 0
+    i = 0; while i < ext_sni.size
+      all_exts[e_idx] = ext_sni[i]; e_idx = e_idx + 1; i = i + 1
+    end
+    i = 0; while i < ext_groups.size
+      all_exts[e_idx] = ext_groups[i]; e_idx = e_idx + 1; i = i + 1
+    end
+    i = 0; while i < ext_sig_algos.size
+      all_exts[e_idx] = ext_sig_algos[i]; e_idx = e_idx + 1; i = i + 1
+    end
+    i = 0; while i < ext_versions.size
+      all_exts[e_idx] = ext_versions[i]; e_idx = e_idx + 1; i = i + 1
+    end
+    i = 0; while i < ext_key_share.size
+      all_exts[e_idx] = ext_key_share[i]; e_idx = e_idx + 1; i = i + 1
+    end
+    i = 0; while i < ext_tp.size
+      all_exts[e_idx] = ext_tp[i]; e_idx = e_idx + 1; i = i + 1
+    end
+
+    ch_body_len = 2 + 32 + 33 + 6 + 2 + 2 + all_exts_len
+    ch_msg = Bytes.new(4 + ch_body_len)
+    ch_msg[0] = 0x01_u8
+    ch_msg[1] = ((ch_body_len >> 16) & 0xff).to_u8
+    ch_msg[2] = ((ch_body_len >> 8) & 0xff).to_u8
+    ch_msg[3] = (ch_body_len & 0xff).to_u8
+
+    idx = 4
+    ch_msg[idx] = 0x03_u8; ch_msg[idx + 1] = 0x03_u8; idx = idx + 2
+    i = 0; while i < 32
+      ch_msg[idx] = @client_random[i]; idx = idx + 1; i = i + 1
+    end
+    ch_msg[idx] = 32_u8; idx = idx + 1
+    i = 0; while i < 32
+      ch_msg[idx] = @session_id[i]; idx = idx + 1; i = i + 1
+    end
+    ch_msg[idx] = 0x00_u8; ch_msg[idx + 1] = 0x04_u8; idx = idx + 2
+    ch_msg[idx] = 0x13_u8; ch_msg[idx + 1] = 0x01_u8; idx = idx + 2
+    ch_msg[idx] = 0x13_u8; ch_msg[idx + 1] = 0x03_u8; idx = idx + 2
+    ch_msg[idx] = 0x01_u8; ch_msg[idx + 1] = 0x00_u8; idx = idx + 2
+    ch_msg[idx] = ((all_exts_len >> 8) & 0xff).to_u8
+    ch_msg[idx + 1] = (all_exts_len & 0xff).to_u8
+    idx = idx + 2
+    i = 0; while i < all_exts_len
+      ch_msg[idx] = all_exts[i]; idx = idx + 1; i = i + 1
+    end
+
+    @transcript << ch_msg
+    ch_msg
+  end
+
+  def handle_client_hello(ch_data : Bytes) : {Bytes, Bytes, TransportParameters}
+    raise "ClientHello is truncated" if ch_data.size < 4 + 2 + 32 + 1 + 2 + 1 + 2
+    raise "expected ClientHello" unless ch_data[0] == 0x01_u8
+    declared_len = (ch_data[1].to_i32 << 16) | (ch_data[2].to_i32 << 8) | ch_data[3].to_i32
+    raise "ClientHello length mismatch" unless declared_len + 4 == ch_data.size
+    raise "ClientHello legacy_version must be 0x0303" unless ch_data[4] == 0x03_u8 && ch_data[5] == 0x03_u8
+    @transcript << ch_data
+
+    p_idx = 4 + 2 + 32
+    s_id_len = ch_data[p_idx].to_i32
+    p_idx = p_idx + 1
+    raise "ClientHello session id is truncated" if p_idx + s_id_len + 2 > ch_data.size
+    p_idx = p_idx + s_id_len
+    cs_len = (ch_data[p_idx].to_i32 << 8) | ch_data[p_idx + 1].to_i32
+    p_idx = p_idx + 2
+    raise "ClientHello cipher suites are malformed" if cs_len == 0 || (cs_len & 1) != 0 || p_idx + cs_len + 1 > ch_data.size
+    offered_aes128 = false
+    cs_end = p_idx + cs_len
+    while p_idx < cs_end
+      suite = (ch_data[p_idx].to_i32 << 8) | ch_data[p_idx + 1].to_i32
+      offered_aes128 = true if suite == 0x1301
+      p_idx = p_idx + 2
+    end
+    raise "ClientHello did not offer TLS_AES_128_GCM_SHA256" unless offered_aes128
+
+    comp_len = ch_data[p_idx].to_i32
+    p_idx = p_idx + 1
+    raise "ClientHello compression methods are truncated" if comp_len == 0 || p_idx + comp_len + 2 > ch_data.size
+    has_null_compression = false
+    comp_end = p_idx + comp_len
+    while p_idx < comp_end
+      has_null_compression = true if ch_data[p_idx] == 0_u8
+      p_idx = p_idx + 1
+    end
+    raise "ClientHello did not offer null compression" unless has_null_compression
+
+    exts_len = (ch_data[p_idx].to_i32 << 8) | ch_data[p_idx + 1].to_i32
+    p_idx = p_idx + 2
+    exts_end = p_idx + exts_len
+    raise "ClientHello extensions length mismatch" unless exts_end == ch_data.size
+
+    client_pub = Bytes.empty
+    client_tp_bytes = Bytes.empty
+    offered_tls13 = false
+    offered_pss_sha256 = false
+
+    while p_idx < exts_end
+      raise "ClientHello extension header is truncated" if p_idx + 4 > exts_end
+      ext_type = (ch_data[p_idx].to_i32 << 8) | ch_data[p_idx + 1].to_i32
+      ext_l = (ch_data[p_idx + 2].to_i32 << 8) | ch_data[p_idx + 3].to_i32
+      p_idx = p_idx + 4
+      ext_end = p_idx + ext_l
+      raise "ClientHello extension value is truncated" if ext_end > exts_end
+
+      if ext_type == 0x0033
+        raise "duplicate X25519 key share" unless client_pub.empty?
+        raise "key_share extension is truncated" if ext_l < 2
+        shares_len = (ch_data[p_idx].to_i32 << 8) | ch_data[p_idx + 1].to_i32
+        share_idx = p_idx + 2
+        raise "key_share list length mismatch" unless share_idx + shares_len == ext_end
+        while share_idx < ext_end
+          raise "key_share entry is truncated" if share_idx + 4 > ext_end
+          group = (ch_data[share_idx].to_i32 << 8) | ch_data[share_idx + 1].to_i32
+          k_len = (ch_data[share_idx + 2].to_i32 << 8) | ch_data[share_idx + 3].to_i32
+          share_idx = share_idx + 4
+          raise "key_share key is truncated" if share_idx + k_len > ext_end
+          if group == 0x001d
+            raise "X25519 key share must be 32 bytes" unless k_len == 32
+            client_pub = ch_data[share_idx, k_len]
+          end
+          share_idx = share_idx + k_len
+        end
+      elsif ext_type == 0x000d
+        raise "signature_algorithms extension is truncated" if ext_l < 2
+        list_len = (ch_data[p_idx].to_i32 << 8) | ch_data[p_idx + 1].to_i32
+        sig_idx = p_idx + 2
+        raise "signature_algorithms list is malformed" if (list_len & 1) != 0 || sig_idx + list_len != ext_end
+        while sig_idx < ext_end
+          scheme = (ch_data[sig_idx].to_i32 << 8) | ch_data[sig_idx + 1].to_i32
+          offered_pss_sha256 = true if scheme == 0x0804
+          sig_idx = sig_idx + 2
+        end
+      elsif ext_type == 0x002b
+        raise "supported_versions extension is malformed" if ext_l < 3
+        list_len = ch_data[p_idx].to_i32
+        ver_idx = p_idx + 1
+        raise "supported_versions list is malformed" if (list_len & 1) != 0 || ver_idx + list_len != ext_end
+        while ver_idx < ext_end
+          version = (ch_data[ver_idx].to_i32 << 8) | ch_data[ver_idx + 1].to_i32
+          offered_tls13 = true if version == 0x0304
+          ver_idx = ver_idx + 2
+        end
+      elsif ext_type == 0x0039
+        raise "duplicate QUIC transport parameters extension" unless client_tp_bytes.empty?
+        client_tp_bytes = ch_data[p_idx, ext_l]
+      end
+      p_idx = ext_end
+    end
+
+    raise "Client did not offer TLS 1.3" unless offered_tls13
+    raise "Client did not offer rsa_pss_rsae_sha256" unless offered_pss_sha256
+    raise "Client did not provide X25519 key share" if client_pub.size != 32
+    raise "Client did not provide QUIC transport parameters" if client_tp_bytes.empty?
+
+    @peer_pub_key = client_pub
+    parsed_tp = TransportParameters.decode(client_tp_bytes, ConnectionRole::SERVER)
+    @peer_tp = parsed_tp
+
+    @priv_key, @pub_key = Std::Tls::X25519.generate_keypair
+    @server_random = Std::Crypto.random_bytes(32)
+
+    @shared_secret = Std::Tls::X25519.scalar_mult(@priv_key, client_pub)
+    if Std::Tls::X25519.is_all_zero(@shared_secret)
+      raise "X25519 shared secret is all-zero (invalid curve point)"
+    end
+
+    ext_sh_vers = Bytes.new(6)
+    ext_sh_vers[0] = 0x00_u8; ext_sh_vers[1] = 0x2b_u8
+    ext_sh_vers[2] = 0x00_u8; ext_sh_vers[3] = 0x02_u8
+    ext_sh_vers[4] = 0x03_u8; ext_sh_vers[5] = 0x04_u8
+
+    ext_sh_ks = Bytes.new(40)
+    ext_sh_ks[0] = 0x00_u8; ext_sh_ks[1] = 0x33_u8
+    ext_sh_ks[2] = 0x00_u8; ext_sh_ks[3] = 36_u8
+    ext_sh_ks[4] = 0x00_u8; ext_sh_ks[5] = 0x1d_u8
+    ext_sh_ks[6] = 0x00_u8; ext_sh_ks[7] = 0x20_u8
+    i = 0; while i < 32
+      ext_sh_ks[8 + i] = @pub_key[i]; i = i + 1
+    end
+
+    sh_exts_len = ext_sh_vers.size + ext_sh_ks.size
+    sh_body_len = 2 + 32 + 33 + 2 + 1 + 2 + sh_exts_len
+    sh_msg = Bytes.new(4 + sh_body_len)
+    sh_msg[0] = 0x02_u8
+    sh_msg[1] = ((sh_body_len >> 16) & 0xff).to_u8
+    sh_msg[2] = ((sh_body_len >> 8) & 0xff).to_u8
+    sh_msg[3] = (sh_body_len & 0xff).to_u8
+
+    s_idx = 4
+    sh_msg[s_idx] = 0x03_u8; sh_msg[s_idx + 1] = 0x03_u8; s_idx = s_idx + 2
+    i = 0; while i < 32
+      sh_msg[s_idx] = @server_random[i]; s_idx = s_idx + 1; i = i + 1
+    end
+    sh_msg[s_idx] = 32_u8; s_idx = s_idx + 1
+    i = 0; while i < 32
+      sh_msg[s_idx] = ch_data[39 + i]; s_idx = s_idx + 1; i = i + 1
+    end
+    sh_msg[s_idx] = 0x13_u8; sh_msg[s_idx + 1] = 0x01_u8; s_idx = s_idx + 2
+    sh_msg[s_idx] = 0x00_u8; s_idx = s_idx + 1
+    sh_msg[s_idx] = ((sh_exts_len >> 8) & 0xff).to_u8; sh_msg[s_idx + 1] = (sh_exts_len & 0xff).to_u8; s_idx = s_idx + 2
+    i = 0; while i < ext_sh_vers.size
+      sh_msg[s_idx] = ext_sh_vers[i]; s_idx = s_idx + 1; i = i + 1
+    end
+    i = 0; while i < ext_sh_ks.size
+      sh_msg[s_idx] = ext_sh_ks[i]; s_idx = s_idx + 1; i = i + 1
+    end
+
+    @transcript << sh_msg
+
+    zeros32 = Bytes.new(32, 0_u8)
+    early_secret = HKDF.extract(:sha256, zeros32, zeros32)
+    empty_hash = SHA256.digest(Bytes.empty)
+    derived_secret = Std::Tls.derive_secret(early_secret, "derived", empty_hash)
+    @handshake_secret = HKDF.extract(:sha256, @shared_secret, derived_secret)
+
+    th_sh = hash_transcript
+    @c_hs_traffic = Std::Tls.derive_secret(@handshake_secret, "c hs traffic", th_sh)
+    @s_hs_traffic = Std::Tls.derive_secret(@handshake_secret, "s hs traffic", th_sh)
+
+    server_tp_bytes = @local_tp.encode
+    ee_ext_len = 4 + server_tp_bytes.size
+    ee_body_len = 2 + ee_ext_len
+    ee_msg = Bytes.new(4 + ee_body_len)
+    ee_msg[0] = 0x08_u8
+    ee_msg[1] = ((ee_body_len >> 16) & 0xff).to_u8; ee_msg[2] = ((ee_body_len >> 8) & 0xff).to_u8; ee_msg[3] = (ee_body_len & 0xff).to_u8
+    ee_msg[4] = ((ee_ext_len >> 8) & 0xff).to_u8; ee_msg[5] = (ee_ext_len & 0xff).to_u8
+    ee_msg[6] = 0x00_u8; ee_msg[7] = 0x39_u8
+    ee_msg[8] = ((server_tp_bytes.size >> 8) & 0xff).to_u8; ee_msg[9] = (server_tp_bytes.size & 0xff).to_u8
+    i = 0; while i < server_tp_bytes.size
+      ee_msg[10 + i] = server_tp_bytes[i]; i = i + 1
+    end
+    @transcript << ee_msg
+
+    credentials = @server_credentials
+    raise "QUIC TLS server credentials were not configured" if credentials.nil?
+    cert_chain = credentials.certificate_chain
+    cert_list_len = 0
+    i = 0
+    while i < cert_chain.size
+      cert_size = cert_chain[i].size
+      raise "QUIC TLS certificate is too large" if cert_size > 0xffffff
+      cert_list_len = cert_list_len + 3 + cert_size + 2
+      i = i + 1
+    end
+    raise "QUIC TLS certificate list is too large" if cert_list_len > 0xffffff
+
+    cert_body_len = 1 + 3 + cert_list_len
+    cert_msg = Bytes.new(4 + cert_body_len)
+    cert_msg[0] = 0x0b_u8
+    cert_msg[1] = ((cert_body_len >> 16) & 0xff).to_u8; cert_msg[2] = ((cert_body_len >> 8) & 0xff).to_u8; cert_msg[3] = (cert_body_len & 0xff).to_u8
+    cert_msg[4] = 0x00_u8
+    cert_msg[5] = ((cert_list_len >> 16) & 0xff).to_u8; cert_msg[6] = ((cert_list_len >> 8) & 0xff).to_u8; cert_msg[7] = (cert_list_len & 0xff).to_u8
+    cert_offset = 8
+    i = 0
+    while i < cert_chain.size
+      cert_der = cert_chain[i]
+      cert_msg[cert_offset] = ((cert_der.size >> 16) & 0xff).to_u8
+      cert_msg[cert_offset + 1] = ((cert_der.size >> 8) & 0xff).to_u8
+      cert_msg[cert_offset + 2] = (cert_der.size & 0xff).to_u8
+      cert_offset = cert_offset + 3
+      j = 0
+      while j < cert_der.size
+        cert_msg[cert_offset + j] = cert_der[j]
+        j = j + 1
+      end
+      cert_offset = cert_offset + cert_der.size
+      cert_msg[cert_offset] = 0x00_u8; cert_msg[cert_offset + 1] = 0x00_u8
+      cert_offset = cert_offset + 2
+      i = i + 1
+    end
+    @transcript << cert_msg
+
+    th_cert = hash_transcript
+    cv_prefix = "                                                                TLS 1.3, server CertificateVerify"
+    cv_input = Bytes.new(cv_prefix.bytesize + 1 + th_cert.size)
+    i = 0; while i < cv_prefix.bytesize
+      cv_input[i] = cv_prefix[i].ord.to_u8; i = i + 1
+    end
+    cv_input[cv_prefix.bytesize] = 0x00_u8
+    i = 0; while i < th_cert.size
+      cv_input[cv_prefix.bytesize + 1 + i] = th_cert[i]; i = i + 1
+    end
+
+    cv_sig = Std::Tls::RSA.sign_pss(credentials.private_n, credentials.private_d, :sha256, SHA256.digest(cv_input))
+    cv_body_len = 2 + 2 + cv_sig.size
+    cv_msg = Bytes.new(4 + cv_body_len)
+    cv_msg[0] = 0x0f_u8
+    cv_msg[1] = ((cv_body_len >> 16) & 0xff).to_u8; cv_msg[2] = ((cv_body_len >> 8) & 0xff).to_u8; cv_msg[3] = (cv_body_len & 0xff).to_u8
+    cv_msg[4] = 0x08_u8; cv_msg[5] = 0x04_u8
+    cv_msg[6] = ((cv_sig.size >> 8) & 0xff).to_u8; cv_msg[7] = (cv_sig.size & 0xff).to_u8
+    i = 0; while i < cv_sig.size
+      cv_msg[8 + i] = cv_sig[i]; i = i + 1
+    end
+    @transcript << cv_msg
+
+    th_cv = hash_transcript
+    s_fin_key = Std::Tls.hkdf_expand_label(@s_hs_traffic, "finished", Bytes.empty, 32)
+    s_verify_data = HMAC.digest(:sha256, s_fin_key, th_cv)
+    fin_msg = Bytes.new(4 + 32)
+    fin_msg[0] = 0x14_u8
+    fin_msg[1] = 0x00_u8; fin_msg[2] = 0x00_u8; fin_msg[3] = 32_u8
+    i = 0; while i < 32
+      fin_msg[4 + i] = s_verify_data[i]; i = i + 1
+    end
+    @transcript << fin_msg
+
+    @master_secret = HKDF.extract(:sha256, zeros32, Std::Tls.derive_secret(@handshake_secret, "derived", empty_hash))
+    th_sfin = hash_transcript
+    @c_ap_traffic = Std::Tls.derive_secret(@master_secret, "c ap traffic", th_sfin)
+    @s_ap_traffic = Std::Tls.derive_secret(@master_secret, "s ap traffic", th_sfin)
+
+    flight_total = ee_msg.size + cert_msg.size + cv_msg.size + fin_msg.size
+    flight = Bytes.new(flight_total)
+    f_off = 0
+    i = 0; while i < ee_msg.size
+      flight[f_off + i] = ee_msg[i]; i = i + 1
+    end; f_off = f_off + ee_msg.size
+    i = 0; while i < cert_msg.size
+      flight[f_off + i] = cert_msg[i]; i = i + 1
+    end; f_off = f_off + cert_msg.size
+    i = 0; while i < cv_msg.size
+      flight[f_off + i] = cv_msg[i]; i = i + 1
+    end; f_off = f_off + cv_msg.size
+    i = 0; while i < fin_msg.size
+      flight[f_off + i] = fin_msg[i]; i = i + 1
+    end
+
+    {sh_msg, flight, parsed_tp}
+  end
+
+  def handle_server_hello(sh_data : Bytes) : {Bytes, Bytes}
+    raise "ServerHello is truncated" if sh_data.size < 4 + 2 + 32 + 1 + 2 + 1 + 2
+    raise "expected ServerHello" unless sh_data[0] == 0x02_u8
+    declared_len = (sh_data[1].to_i32 << 16) | (sh_data[2].to_i32 << 8) | sh_data[3].to_i32
+    raise "ServerHello length mismatch" unless declared_len + 4 == sh_data.size
+    raise "ServerHello legacy_version must be 0x0303" unless sh_data[4] == 0x03_u8 && sh_data[5] == 0x03_u8
+    @transcript << sh_data
+
+    p_idx = 4 + 2 + 32
+    sess_len = sh_data[p_idx].to_i32
+    p_idx = p_idx + 1
+    raise "ServerHello session id is truncated" if p_idx + sess_len + 5 > sh_data.size
+    raise "ServerHello did not echo the client session id" unless sh_data[p_idx, sess_len] == @session_id
+    p_idx = p_idx + sess_len
+    cs_id = (sh_data[p_idx].to_i32 << 8) | sh_data[p_idx + 1].to_i32
+    raise "ServerHello selected an unoffered cipher suite" unless cs_id == 0x1301
+    p_idx = p_idx + 2
+    raise "ServerHello selected non-null compression" unless sh_data[p_idx] == 0_u8
+    p_idx = p_idx + 1
+    exts_len = (sh_data[p_idx].to_i32 << 8) | sh_data[p_idx + 1].to_i32
+    p_idx = p_idx + 2
+    exts_end = p_idx + exts_len
+    raise "ServerHello extensions length mismatch" unless exts_end == sh_data.size
+
+    server_pub = Bytes.empty
+    selected_tls13 = false
+    while p_idx < exts_end
+      raise "ServerHello extension header is truncated" if p_idx + 4 > exts_end
+      ext_type = (sh_data[p_idx].to_i32 << 8) | sh_data[p_idx + 1].to_i32
+      ext_l = (sh_data[p_idx + 2].to_i32 << 8) | sh_data[p_idx + 3].to_i32
+      p_idx = p_idx + 4
+      ext_end = p_idx + ext_l
+      raise "ServerHello extension value is truncated" if ext_end > exts_end
+      if ext_type == 0x0033
+        raise "duplicate ServerHello key_share" unless server_pub.empty?
+        raise "ServerHello key_share must contain X25519 and 32 bytes" unless ext_l == 36
+        group = (sh_data[p_idx].to_i32 << 8) | sh_data[p_idx + 1].to_i32
+        k_len = (sh_data[p_idx + 2].to_i32 << 8) | sh_data[p_idx + 3].to_i32
+        raise "ServerHello selected an unoffered key-share group" unless group == 0x001d
+        raise "ServerHello X25519 key share must be 32 bytes" unless k_len == 32
+        server_pub = sh_data[p_idx + 4, k_len]
+      elsif ext_type == 0x002b
+        raise "duplicate ServerHello supported_versions" if selected_tls13
+        raise "ServerHello supported_versions must select TLS 1.3" unless ext_l == 2 && sh_data[p_idx] == 0x03_u8 && sh_data[p_idx + 1] == 0x04_u8
+        selected_tls13 = true
+      else
+        raise "ServerHello returned an extension not permitted in ServerHello: #{ext_type}"
+      end
+      p_idx = ext_end
+    end
+
+    raise "Server did not select TLS 1.3" unless selected_tls13
+    raise "Server did not provide X25519 key share" if server_pub.size != 32
+    @peer_pub_key = server_pub
+
+    @shared_secret = Std::Tls::X25519.scalar_mult(@priv_key, server_pub)
+    if Std::Tls::X25519.is_all_zero(@shared_secret)
+      raise "X25519 shared secret is all-zero (invalid curve point)"
+    end
+
+    zeros32 = Bytes.new(32, 0_u8)
+    early_secret = HKDF.extract(:sha256, zeros32, zeros32)
+    empty_hash = SHA256.digest(Bytes.empty)
+    derived_secret = Std::Tls.derive_secret(early_secret, "derived", empty_hash)
+    @handshake_secret = HKDF.extract(:sha256, @shared_secret, derived_secret)
+
+    th_sh = hash_transcript
+    @c_hs_traffic = Std::Tls.derive_secret(@handshake_secret, "c hs traffic", th_sh)
+    @s_hs_traffic = Std::Tls.derive_secret(@handshake_secret, "s hs traffic", th_sh)
+
+    {@c_hs_traffic, @s_hs_traffic}
+  end
+
+  def handle_server_handshake_flight(flight : Bytes) : {Bytes, TransportParameters}
+    offset = 0
+    server_tp = nil.as(TransportParameters?)
+    server_chain = [] of Certificate
+    th_cert = Bytes.empty
+    th_cv = Bytes.empty
+    cert_verify_sig = Bytes.empty
+    cert_verify_scheme = 0
+
+    while offset + 4 <= flight.size
+      msg_type = flight[offset]
+      msg_len = (flight[offset + 1].to_i32 << 16) | (flight[offset + 2].to_i32 << 8) | flight[offset + 3].to_i32
+      raise "TLS handshake message is truncated" if offset + 4 + msg_len > flight.size
+      msg_data = flight[offset, 4 + msg_len]
+      offset = offset + 4 + msg_len
+
+      if msg_type == 0x08_u8
+        raise "EncryptedExtensions is truncated" if msg_data.size < 6
+        ee_exts_len = (msg_data[4].to_i32 << 8) | msg_data[5].to_i32
+        e_idx = 6
+        e_end = 6 + ee_exts_len
+        raise "EncryptedExtensions length overflows message" unless e_end == msg_data.size
+        while e_idx < e_end
+          raise "EncryptedExtensions entry is truncated" if e_idx + 4 > e_end
+          ext_t = (msg_data[e_idx].to_i32 << 8) | msg_data[e_idx + 1].to_i32
+          ext_l = (msg_data[e_idx + 2].to_i32 << 8) | msg_data[e_idx + 3].to_i32
+          e_idx = e_idx + 4
+          raise "EncryptedExtensions value is truncated" if e_idx + ext_l > e_end
+          if ext_t == 0x0039
+            raise "duplicate QUIC transport parameters extension" unless server_tp.nil?
+            tp_b = msg_data[e_idx, ext_l]
+            server_tp = TransportParameters.decode(tp_b, ConnectionRole::CLIENT)
+          end
+          e_idx = e_idx + ext_l
+        end
+        @transcript << msg_data
+      elsif msg_type == 0x0b_u8
+        raise "Certificate message is truncated" if msg_data.size < 8
+        ctx_len = msg_data[4].to_i32
+        c_idx = 5 + ctx_len
+        raise "Certificate context overflows message" if c_idx + 3 > msg_data.size
+        list_len = (msg_data[c_idx].to_i32 << 16) | (msg_data[c_idx + 1].to_i32 << 8) | msg_data[c_idx + 2].to_i32
+        c_idx = c_idx + 3
+        c_end = c_idx + list_len
+        raise "Certificate list length overflows message" unless c_end == msg_data.size
+        while c_idx < c_end
+          raise "Certificate entry length is truncated" if c_idx + 3 > c_end
+          c_len = (msg_data[c_idx].to_i32 << 16) | (msg_data[c_idx + 1].to_i32 << 8) | msg_data[c_idx + 2].to_i32
+          c_idx = c_idx + 3
+          raise "Certificate entry is truncated" if c_idx + c_len + 2 > c_end
+          der_cert = msg_data[c_idx, c_len]
+          parsed_cert = Certificate.parse(der_cert)
+          raise "Certificate entry could not be parsed" if parsed_cert.nil?
+          server_chain << parsed_cert
+          c_idx = c_idx + c_len
+          cert_ext_len = (msg_data[c_idx].to_i32 << 8) | msg_data[c_idx + 1].to_i32
+          c_idx = c_idx + 2
+          raise "Certificate extensions overflow entry" if c_idx + cert_ext_len > c_end
+          c_idx = c_idx + cert_ext_len
+        end
+        raise "Certificate list did not end at declared boundary" unless c_idx == c_end
+        @transcript << msg_data
+        th_cert = hash_transcript
+      elsif msg_type == 0x0f_u8
+        raise "CertificateVerify is truncated" if msg_data.size < 8
+        cert_verify_scheme = (msg_data[4].to_i32 << 8) | msg_data[5].to_i32
+        sig_len = (msg_data[6].to_i32 << 8) | msg_data[7].to_i32
+        raise "CertificateVerify signature length overflows message" unless 8 + sig_len == msg_data.size
+        cert_verify_sig = msg_data[8, sig_len]
+        @transcript << msg_data
+        th_cv = hash_transcript
+      elsif msg_type == 0x14_u8
+        raise "Finished message must contain 32 verify bytes" unless msg_data.size == 36
+        s_verify_data = msg_data[4, 32]
+        s_fin_key = Std::Tls.hkdf_expand_label(@s_hs_traffic, "finished", Bytes.empty, 32)
+        expected_mac = HMAC.digest(:sha256, s_fin_key, th_cv)
+        if !constant_time_compare(s_verify_data, expected_mac)
+          raise "Server Finished MAC verification failed"
+        end
+        @transcript << msg_data
+      else
+        raise "unexpected TLS handshake message type #{msg_type}"
+      end
+    end
+
+    raise "TLS handshake flight has trailing bytes" unless offset == flight.size
+    raise "Server did not provide transport parameters" if server_tp.nil?
+    raise "Server did not provide certificate" if server_chain.empty?
+    @peer_tp = server_tp
+    @peer_chain = server_chain
+    @peer_cert = server_chain[0]
+
+    cert = server_chain[0]
+    now_sec = @verification_time || Time.utc.seconds
+    if !cert.matches_hostname(@hostname)
+      raise "Certificate hostname mismatch: expected #{@hostname}, got #{cert.common_name}"
+    end
+    if !cert.valid_at?(now_sec)
+      raise "Certificate expired or not yet valid"
+    end
+    if !@ca_store.verify_chain(server_chain, @hostname, now_sec)
+      raise "Certificate chain verification failed against trust store"
+    end
+
+    cv_prefix = "                                                                TLS 1.3, server CertificateVerify"
+    cv_input = Bytes.new(cv_prefix.bytesize + 1 + th_cert.size)
+    i = 0; while i < cv_prefix.bytesize
+      cv_input[i] = cv_prefix[i].ord.to_u8; i = i + 1
+    end
+    cv_input[cv_prefix.bytesize] = 0x00_u8
+    i = 0; while i < th_cert.size
+      cv_input[cv_prefix.bytesize + 1 + i] = th_cert[i]; i = i + 1
+    end
+
+    rn = cert.rsa_n
+    re = cert.rsa_e
+    raise "Missing RSA public key on certificate" if rn.zero? || re.zero?
+    raise "TLS 1.3 requires rsa_pss_rsae_sha256 CertificateVerify" unless cert_verify_scheme == 0x0804
+    if !Std::Tls::RSA.verify_pss(rn, re, :sha256, SHA256.digest(cv_input), cert_verify_sig, 32)
+      raise "CertificateVerify signature verification failed"
+    end
+    @cert_verified = true
+
+    zeros32 = Bytes.new(32, 0_u8)
+    empty_hash = SHA256.digest(Bytes.empty)
+    @master_secret = HKDF.extract(:sha256, zeros32, Std::Tls.derive_secret(@handshake_secret, "derived", empty_hash))
+    th_sfin = hash_transcript
+    @c_ap_traffic = Std::Tls.derive_secret(@master_secret, "c ap traffic", th_sfin)
+    @s_ap_traffic = Std::Tls.derive_secret(@master_secret, "s ap traffic", th_sfin)
+
+    c_fin_key = Std::Tls.hkdf_expand_label(@c_hs_traffic, "finished", Bytes.empty, 32)
+    c_verify_data = HMAC.digest(:sha256, c_fin_key, th_sfin)
+    c_fin_msg = Bytes.new(4 + 32)
+    c_fin_msg[0] = 0x14_u8
+    c_fin_msg[1] = 0x00_u8; c_fin_msg[2] = 0x00_u8; c_fin_msg[3] = 32_u8
+    i = 0; while i < 32
+      c_fin_msg[4 + i] = c_verify_data[i]; i = i + 1
+    end
+    @transcript << c_fin_msg
+    @handshake_done = true
+
+    {c_fin_msg, server_tp}
+  end
+
+  def handle_client_finished(c_fin_data : Bytes) : Nil
+    c_verify_data = c_fin_data[4, 32]
+    th_sfin = hash_transcript
+    c_fin_key = Std::Tls.hkdf_expand_label(@c_hs_traffic, "finished", Bytes.empty, 32)
+    expected_mac = HMAC.digest(:sha256, c_fin_key, th_sfin)
+    if !constant_time_compare(c_verify_data, expected_mac)
+      raise "Client Finished MAC verification failed"
+    end
+    @transcript << c_fin_data
+    @handshake_done = true
+  end
+end
+
+pub class QuicEndpoint
+  getter socket : UdpSocket
+  getter connections : Array(QuicConnection)
+
+  def initialize(bind_host : String = "127.0.0.1", port : Int32 = 0)
+    @socket = UdpSocket.bind(bind_host, port)
+    @socket.read_timeout = 50
+    @connections = [] of QuicConnection
+    @closed = false
+  end
+
+  def local_port : Int32
+    @socket.local_port
+  end
+
+  def add_connection(conn : QuicConnection) : Nil
+    @connections << conn
+  end
+
+  def send_to(data : Bytes, host : String, port : Int32) : Int32
+    @socket.send_to(data, host, port)
+  end
+
+  def receive : Datagram?
+    @socket.receive_datagram?
+  end
+
+  def close : Nil
+    return if @closed
+    @closed = true
+    @socket.close
+  end
+
+  # Kernel-backed event loop step with timer and packet dispatching (Finding 20)
+  def step(current_time : Int64, timeout_ms : Int32 = 10) : Int32
+    i = 0
+    while i < @connections.size
+      conn = @connections[i]
+      pto_pkts = conn.check_and_handle_pto(current_time)
+      j = 0
+      while j < pto_pkts.size
+        if conn.remote_host.size > 0 && conn.remote_port > 0
+          @socket.send_to(pto_pkts[j], conn.remote_host, conn.remote_port)
+        end
+        j = j + 1
+      end
+
+      flushed = conn.flush_pending_packets
+      j = 0
+      while j < flushed.size
+        if conn.remote_host.size > 0 && conn.remote_port > 0
+          @socket.send_to(flushed[j], conn.remote_host, conn.remote_port)
+        end
+        j = j + 1
+      end
+      i = i + 1
+    end
+
+    count = 0
+    if @socket.poll_read(timeout_ms)
+      dgram = @socket.receive_datagram?
+      while !dgram.nil?
+        count = count + 1
+        dispatch_datagram(dgram, current_time)
+        break unless @socket.poll_read(0)
+        dgram = @socket.receive_datagram?
+      end
+    end
+    count
+  end
+
+  private def dispatch_datagram(dgram : Datagram, current_time : Int64) : Nil
+    return if dgram.data.size < 21
+    first_byte = dgram.data[0]
+    is_long = (first_byte & 0x80_u8) != 0_u8
+
+    target_conn = nil.as(QuicConnection?)
+
+    if is_long
+      dcid_len = dgram.data[5].to_i32
+      if dgram.data.size >= 6 + dcid_len
+        dcid = dgram.data[6, dcid_len]
+        i = 0
+        while i < @connections.size
+          conn = @connections[i]
+          if conn.scid == dcid || conn.dcid == dcid
+            target_conn = conn
+            break
+          end
+          i = i + 1
+        end
+      end
+    else
+      i = 0
+      while i < @connections.size
+        conn = @connections[i]
+        dcid_l = conn.scid.size
+        if dgram.data.size >= 1 + dcid_l
+          short_dcid = dgram.data[1, dcid_l]
+          if conn.scid == short_dcid
+            target_conn = conn
+            break
+          end
+        end
+        i = i + 1
+      end
+    end
+
+    # A datagram for an unknown destination connection ID belongs to no local
+    # connection. Feeding it to the first entry crosses connection state and
+    # turns an unknown CID into an authenticated-decrypt crash.
+    return if target_conn.nil?
+
+    if conn = target_conn
+      conn.set_remote(dgram.host, dgram.port)
+      conn.receive_packet(dgram.data, current_time)
+    end
+  end
+end

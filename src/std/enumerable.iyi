@@ -383,7 +383,7 @@ pub trait Enumerable
     result
   end
 
-  def to_h(& : Elem -> Tuple(K, V)) : Hash(K, V) forall K : Hashable, V
+  def to_h(& : Elem -> ::Tuple(K, V)) : Hash(K, V) forall K : Hashable, V
     result = {} of K => V
     each do |e|
       pair = yield e
@@ -516,13 +516,13 @@ pub trait Enumerable
     groups
   end
 
-  def zip(other : O) : Array(Tuple(Elem, O::Elem)) forall O : Enumerable
+  def zip(other : O) : Array(::Tuple(Elem, O::Elem)) forall O : Enumerable
     # SPEC.md II.6 finding 6: Crystal's
     # `zip(*others : Indexable | Iterable | Iterator)` is duck typing left over
     # from having no traits. One bound replaces the union, and `O::Elem` names
     # what the other collection yields without the caller stating it.
     theirs = other.to_a
-    result = [] of Tuple(Elem, O::Elem)
+    result = [] of ::Tuple(Elem, O::Elem)
     i = 0
     each do |e|
       result << {e, theirs[i]} if i < theirs.size
@@ -583,19 +583,19 @@ pub trait Enumerable
     raise "empty"
   end
 
-  def minmax? : Tuple(Elem?, Elem?) where Elem : Cmp
+  def minmax? : ::Tuple(Elem?, Elem?) where Elem : Cmp
     low = min?
     high = max?
     {low, high}
   end
 
-  def minmax : Tuple(Elem, Elem) where Elem : Cmp
+  def minmax : ::Tuple(Elem, Elem) where Elem : Cmp
     low = min
     high = max
     {low, high}
   end
 
-  def minmax_by?(& : Elem -> U) : Tuple(Elem?, Elem?) forall U : Cmp
+  def minmax_by?(& : Elem -> U) : ::Tuple(Elem?, Elem?) forall U : Cmp
     min_elem = nil
     max_elem = nil
     min_key = nil
@@ -616,7 +616,7 @@ pub trait Enumerable
     {min_elem, max_elem}
   end
 
-  def minmax_by(& : Elem -> U) : Tuple(Elem, Elem) forall U : Cmp
+  def minmax_by(& : Elem -> U) : ::Tuple(Elem, Elem) forall U : Cmp
     pair = minmax_by? { |e| yield e }
     low = pair[0]
     high = pair[1]
@@ -626,7 +626,7 @@ pub trait Enumerable
     {low, high}
   end
 
-  def minmax_of?(& : Elem -> U) : Tuple(U?, U?) forall U : Cmp
+  def minmax_of?(& : Elem -> U) : ::Tuple(U?, U?) forall U : Cmp
     low = nil
     high = nil
     each do |e|
@@ -643,7 +643,7 @@ pub trait Enumerable
     {low, high}
   end
 
-  def minmax_of(& : Elem -> U) : Tuple(U, U) forall U : Cmp
+  def minmax_of(& : Elem -> U) : ::Tuple(U, U) forall U : Cmp
     pair = minmax_of? { |e| yield e }
     low = pair[0]
     high = pair[1]
@@ -666,6 +666,425 @@ pub trait Enumerable
     acc = U.zero
     each { |e| acc = acc.add(yield e) }
     acc
+  end
+end
+
+# ---------------------------------------------------------------------------
+# Enumerable implementations for core collection types
+# ---------------------------------------------------------------------------
+
+impl Enumerable for Array(T) forall T
+  type Elem = T
+
+  def each(& : T -> Nil) : Nil
+    i = 0
+    while i < @size
+      yield @buffer[i]
+      i = i + 1
+    end
+  end
+end
+
+class ::Hash(K, V)
+  def each_entry(& : ::Tuple(K, V) -> Nil) : Nil
+    entry = 0
+    while entry < @size
+      yield({@keys[entry], @values[entry]})
+      entry = entry + 1
+    end
+  end
+
+  def each_key(& : K -> Nil) : Nil
+    entry = 0
+    while entry < @size
+      yield @keys[entry]
+      entry = entry + 1
+    end
+  end
+
+  def each_value(& : V -> Nil) : Nil
+    entry = 0
+    while entry < @size
+      yield @values[entry]
+      entry = entry + 1
+    end
+  end
+
+  def has_value?(val : V) : Bool
+    entry = 0
+    while entry < @size
+      return true if @values[entry] == val
+      entry = entry + 1
+    end
+    false
+  end
+
+  def fetch(key : K, default : V) : V
+    res = self[key]?
+    res.nil? ? default : res
+  end
+
+  def fetch(key : K, & : K -> V) : V
+    res = self[key]?
+    res.nil? ? (yield key) : res
+  end
+
+  def key_for(val : V) : K
+    key_for?(val) || raise "no such value #{val.inspect}"
+  end
+
+  def key_for?(val : V) : K?
+    entry = 0
+    while entry < @size
+      return @keys[entry] if @values[entry] == val
+      entry = entry + 1
+    end
+    nil
+  end
+
+  def values_at(*search_keys : K) : Array(V)
+    result = Array(V).new(search_keys.size)
+    search_keys.each do |k|
+      result << self[k]
+    end
+    result
+  end
+
+  def merge(other : Hash(K, V)) : Hash(K, V)
+    copy = dup
+    copy.merge_in_place(other)
+    copy
+  end
+
+  def merge_in_place(other : Hash(K, V)) : Hash(K, V)
+    entry = 0
+    while entry < other.size
+      self[other.keys[entry]] = other.values[entry]
+      entry = entry + 1
+    end
+    self
+  end
+
+  def select(& : K, V -> Bool) : Hash(K, V)
+    result = {} of K => V
+    entry = 0
+    while entry < @size
+      k = @keys[entry]
+      v = @values[entry]
+      result[k] = v if yield k, v
+      entry = entry + 1
+    end
+    result
+  end
+
+  def select_in_place(& : K, V -> Bool) : Hash(K, V)
+    to_del = [] of K
+    entry = 0
+    while entry < @size
+      k = @keys[entry]
+      v = @values[entry]
+      to_del << k unless yield k, v
+      entry = entry + 1
+    end
+    to_del.each { |k| delete(k) }
+    self
+  end
+
+  def reject(& : K, V -> Bool) : Hash(K, V)
+    self.select { |k, v| !(yield k, v) }
+  end
+
+  def reject_in_place(& : K, V -> Bool) : Hash(K, V)
+    self.select_in_place { |k, v| !(yield k, v) }
+  end
+
+  def compact : Hash(K, V)
+    self.select { |_, v| !v.nil? }
+  end
+
+  def compact_in_place : Hash(K, V)
+    self.select_in_place { |_, v| !v.nil? }
+  end
+
+  def transform_keys(& : K -> NK) : Hash(NK, V) forall NK
+    result = {} of NK => V
+    entry = 0
+    while entry < @size
+      result[yield @keys[entry]] = @values[entry]
+      entry = entry + 1
+    end
+    result
+  end
+
+  def transform_values(& : V -> NV) : Hash(K, NV) forall NV
+    result = {} of K => NV
+    entry = 0
+    while entry < @size
+      result[@keys[entry]] = yield @values[entry]
+      entry = entry + 1
+    end
+    result
+  end
+
+  def self.zip(keys : Array(K), values : Array(V)) : Hash(K, V)
+    raise "size mismatch in Hash.zip" if keys.size != values.size
+    result = {} of K => V
+    i = 0
+    while i < keys.size
+      result[keys[i]] = values[i]
+      i = i + 1
+    end
+    result
+  end
+
+  def first_key : K
+    first_key? || raise "empty hash"
+  end
+
+  def first_key? : K?
+    @size == 0 ? nil : @keys[0]
+  end
+
+  def first_value : V
+    first_value? || raise "empty hash"
+  end
+
+  def first_value? : V?
+    @size == 0 ? nil : @values[0]
+  end
+
+  def last_key : K
+    last_key? || raise "empty hash"
+  end
+
+  def last_key? : K?
+    @size == 0 ? nil : @keys[@size - 1]
+  end
+
+  def last_value : V
+    last_value? || raise "empty hash"
+  end
+
+  def last_value? : V?
+    @size == 0 ? nil : @values[@size - 1]
+  end
+
+  def shift : ::Tuple(K, V)
+    shift? || raise "empty hash"
+  end
+
+  def shift? : ::Tuple(K, V)?
+    return nil if @size == 0
+    k = @keys[0]
+    v = @values[0]
+    delete(k)
+    {k, v}
+  end
+
+  def clear : Hash(K, V)
+    while @size > 0
+      delete(@keys[0])
+    end
+    self
+  end
+
+  def subset_of?(other : Hash(K, V)) : Bool
+    return false if @size > other.size
+    entry = 0
+    while entry < @size
+      k = @keys[entry]
+      ov = other[k]?
+      return false if ov.nil? || ov != @values[entry]
+      entry = entry + 1
+    end
+    true
+  end
+
+  def proper_subset_of?(other : Hash(K, V)) : Bool
+    @size < other.size && subset_of?(other)
+  end
+
+  def superset_of?(other : Hash(K, V)) : Bool
+    other.subset_of?(self)
+  end
+
+  def proper_superset_of?(other : Hash(K, V)) : Bool
+    other.proper_subset_of?(self)
+  end
+
+  def dup : Hash(K, V)
+    result = {} of K => V
+    entry = 0
+    while entry < @size
+      result[@keys[entry]] = @values[entry]
+      entry = entry + 1
+    end
+    result
+  end
+
+  def invert : Hash(V, K)
+    result = {} of V => K
+    entry = 0
+    while entry < @size
+      result[@values[entry]] = @keys[entry]
+      entry = entry + 1
+    end
+    result
+  end
+
+  def to_a : Array(::Tuple(K, V))
+    result = Array(::Tuple(K, V)).new(@size)
+    entry = 0
+    while entry < @size
+      result << {@keys[entry], @values[entry]}
+      entry = entry + 1
+    end
+    result
+  end
+
+  def to_h : Hash(K, V)
+    self
+  end
+
+  def put_if_absent(key : K, val : V) : V
+    cur = self[key]?
+    if cur.nil?
+      self[key] = val
+      val
+    else
+      cur
+    end
+  end
+
+  def update(key : K, & : V -> V) : V
+    cur = self[key]?
+    if cur.nil?
+      raise "no such key #{key.inspect}"
+    else
+      new_val = yield cur
+      self[key] = new_val
+      new_val
+    end
+  end
+
+  def ==(other : Hash(K, V)) : Bool
+    return false unless @size == other.size
+    entry = 0
+    while entry < @size
+      k = @keys[entry]
+      ov = other[k]?
+      return false if ov.nil? || ov != @values[entry]
+      entry = entry + 1
+    end
+    true
+  end
+end
+
+impl Enumerable for Hash(K, V) forall K, V
+  type Elem = ::Tuple(K, V)
+
+  def each(& : ::Tuple(K, V) -> Nil) : Nil
+    each_entry { |pair| yield pair }
+  end
+end
+
+struct ::Range(B, E)
+  def each_element(& : B -> Nil) : Nil
+    val = @begin
+    if @exclusive
+      while val < @end
+        yield val
+        val = val + 1
+      end
+    else
+      while val <= @end
+        yield val
+        val = val + 1
+      end
+    end
+  end
+
+  def includes?(val : B) : Bool
+    if @exclusive
+      @begin <= val && val < @end
+    else
+      @begin <= val && val <= @end
+    end
+  end
+
+  def cover?(val : B) : Bool
+    includes?(val)
+  end
+
+  def ===(val : B) : Bool
+    includes?(val)
+  end
+
+  def step(by : Int32 = 1, & : B -> Nil) : Nil
+    raise "step must be positive: #{by}" if by <= 0
+    val = @begin
+    if @exclusive
+      while val < @end
+        yield val
+        val = val + by
+      end
+    else
+      while val <= @end
+        yield val
+        val = val + by
+      end
+    end
+  end
+
+  def cycle(& : B -> Nil) : Nil
+    while true
+      each_element { |x| yield x }
+    end
+  end
+
+  def reverse_each(& : B -> Nil) : Nil
+    items = to_a
+    i = items.size - 1
+    while i >= 0
+      yield items[i]
+      i = i - 1
+    end
+  end
+
+  def bsearch(& : B -> Bool) : B?
+    low = @begin
+    high = @exclusive ? @end - 1 : @end
+    ans = nil
+    while low <= high
+      mid = low + (high - low) // 2
+      if yield mid
+        ans = mid
+        high = mid - 1
+      else
+        low = mid + 1
+      end
+    end
+    ans
+  end
+
+  def min : B
+    @begin
+  end
+
+  def max : B
+    @exclusive ? @end - 1 : @end
+  end
+
+  def ==(other : Range(B, E)) : Bool
+    @begin == other.begin && @end == other.end && @exclusive == other.exclusive?
+  end
+end
+
+impl Enumerable for Range(B, E) forall B, E
+  type Elem = B
+
+  def each(& : B -> Nil) : Nil
+    each_element { |x| yield x }
   end
 end
 

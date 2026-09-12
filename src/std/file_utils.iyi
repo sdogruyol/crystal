@@ -1,0 +1,252 @@
+# FileUtils: convenient file and directory utilities.
+#
+# Provides copying (cp, cp_r), moving (mv), removing (rm, rm_r, rm_rf),
+# creating (mkdir, mkdir_p, touch), linking (ln, ln_s), permissions (chmod, chown),
+# and comparison (cmp) without external C libraries.
+
+module std/file_utils
+pub import std/path
+using std/path::{Path}
+
+pub import std/dir
+using std/dir::{Dir}
+
+pub import std/file
+using std/file::{File}
+
+{% if flag?(:darwin) || flag?(:linux) %}
+  lib LibC
+    fun rename(oldpath : UInt8*, newpath : UInt8*) : Int32
+    fun link(oldpath : UInt8*, newpath : UInt8*) : Int32
+    fun symlink(target : UInt8*, linkpath : UInt8*) : Int32
+    fun chmod(path : UInt8*, mode : Int32) : Int32
+    fun chown(path : UInt8*, owner : UInt32, group : UInt32) : Int32
+  end
+{% elsif flag?(:win32) %}
+  lib LibKernel32
+    fun MoveFileA(lpExistingFileName : UInt8*, lpNewFileName : UInt8*) : Int32
+    fun CreateHardLinkA(lpFileName : UInt8*, lpExistingFileName : UInt8*, lpSecurityAttributes : Void*) : Int32
+    fun CreateSymbolicLinkA(lpSymlinkFileName : UInt8*, lpTargetFileName : UInt8*, dwFlags : UInt32) : Int32
+  end
+{% end %}
+
+pub struct FileUtils
+  def self.cd(path : String | Path) : Nil
+    Dir.cd(path)
+  end
+
+  def self.cd(path : String | Path, &block : -> Nil) : Nil
+    Dir.cd(path, &block)
+  end
+
+  def self.pwd : String
+    Dir.current
+  end
+
+  def self.cmp(filename1 : String | Path, filename2 : String | Path) : Bool
+    p1 = filename1.to_s
+    p2 = filename2.to_s
+    return false unless File.exists?(p1) && File.exists?(p2)
+
+    # Read both files and compare contents
+    c1 = File.read(p1)
+    c2 = File.read(p2)
+    c1 == c2
+  end
+
+  def self.touch(path : String | Path, time : Int64 = 0_i64) : Nil
+    p = path.to_s
+    if File.exists?(p)
+      # Append empty content to update modification
+      f = File.open(p, "w")
+      f.close
+    else
+      File.write(p, "")
+    end
+  end
+
+  def self.touch(paths : Array(String), time : Int64 = 0_i64) : Nil
+    paths.each do |p|
+      touch(p, time)
+    end
+  end
+
+  def self.cp(src_path : String | Path, dest_path : String | Path) : Nil
+    s = src_path.to_s
+    d = dest_path.to_s
+
+    raise "Source file does not exist: #{s}" unless File.exists?(s)
+
+    final_dest = if Dir.exists?(d)
+                   Path.new(d).join(Path.new(s).basename).to_s
+                 else
+                   d
+                 end
+
+    content = File.read(s)
+    File.write(final_dest, content)
+  end
+
+  def self.cp(srcs : Array(String), dest : String | Path) : Nil
+    d = dest.to_s
+    raise "Destination must be a directory: #{d}" unless Dir.exists?(d)
+    srcs.each do |s|
+      cp(s, d)
+    end
+  end
+
+  def self.cp_r(src_path : String | Path, dest_path : String | Path) : Nil
+    s = src_path.to_s
+    d = dest_path.to_s
+
+    if Dir.exists?(s)
+      target_dir = if Dir.exists?(d)
+                     Path.new(d).join(Path.new(s).basename).to_s
+                   else
+                     d
+                   end
+      Dir.mkdir_p(target_dir)
+
+      Dir.each_child(s) do |child|
+        child_src = Path.new(s).join(child).to_s
+        child_dest = Path.new(target_dir).join(child).to_s
+        cp_r(child_src, child_dest)
+      end
+    elsif File.exists?(s)
+      cp(s, d)
+    else
+      raise "Source does not exist: #{s}"
+    end
+  end
+
+  def self.mv(src_path : String | Path, dest_path : String | Path) : Nil
+    s = src_path.to_s
+    d = dest_path.to_s
+
+    target = if Dir.exists?(d)
+               Path.new(d).join(Path.new(s).basename).to_s
+             else
+               d
+             end
+
+    {% if flag?(:darwin) || flag?(:linux) %}
+      if LibC.rename(c_str(s), c_str(target)) != 0
+        # If rename fails (e.g. cross-device), copy and remove
+        cp_r(s, target)
+        rm_r(s)
+      end
+    {% elsif flag?(:win32) %}
+      if LibKernel32.MoveFileA(c_str(s), c_str(target)) == 0
+        cp_r(s, target)
+        rm_r(s)
+      end
+    {% end %}
+  end
+
+  def self.mv(srcs : Array(String), dest : String | Path) : Nil
+    d = dest.to_s
+    raise "Destination must be a directory: #{d}" unless Dir.exists?(d)
+    srcs.each do |s|
+      mv(s, d)
+    end
+  end
+
+  def self.rm(path : String | Path) : Nil
+    File.delete(path.to_s)
+  end
+
+  def self.rm(paths : Array(String)) : Nil
+    paths.each do |p|
+      rm(p)
+    end
+  end
+
+  def self.rm_r(path : String | Path) : Nil
+    p = path.to_s
+    if Dir.exists?(p)
+      Dir.each_child(p) do |child|
+        rm_r(Path.new(p).join(child).to_s)
+      end
+      Dir.delete(p)
+    elsif File.exists?(p)
+      File.delete(p)
+    else
+      raise "Path does not exist: #{p}"
+    end
+  end
+
+  def self.rm_rf(path : String | Path) : Nil
+    p = path.to_s
+    if Dir.exists?(p) || File.exists?(p)
+      rm_r(p)
+    end
+  end
+
+  def self.rm_rf(paths : Array(String)) : Nil
+    paths.each do |p|
+      rm_rf(p)
+    end
+  end
+
+  def self.mkdir(path : String | Path, mode : Int32 = 0o777) : Nil
+    Dir.mkdir(path, mode)
+  end
+
+  def self.mkdir_p(path : String | Path, mode : Int32 = 0o777) : Nil
+    Dir.mkdir_p(path, mode)
+  end
+
+  def self.ln(old_path : String | Path, new_path : String | Path) : Nil
+    o = old_path.to_s
+    n = new_path.to_s
+    {% if flag?(:darwin) || flag?(:linux) %}
+      if LibC.link(c_str(o), c_str(n)) != 0
+        raise "Cannot create link from #{o} to #{n}"
+      end
+    {% elsif flag?(:win32) %}
+      if LibKernel32.CreateHardLinkA(c_str(n), c_str(o), Pointer(Void).new(0_u64)) == 0
+        raise "Cannot create link from #{o} to #{n}"
+      end
+    {% end %}
+  end
+
+  def self.ln_s(old_path : String | Path, new_path : String | Path) : Nil
+    o = old_path.to_s
+    n = new_path.to_s
+    {% if flag?(:darwin) || flag?(:linux) %}
+      if LibC.symlink(c_str(o), c_str(n)) != 0
+        raise "Cannot create symlink from #{o} to #{n}"
+      end
+    {% elsif flag?(:win32) %}
+      if LibKernel32.CreateSymbolicLinkA(c_str(n), c_str(o), 0_u32) == 0
+        raise "Cannot create symlink from #{o} to #{n}"
+      end
+    {% end %}
+  end
+
+  def self.chmod(path : String | Path, mode : Int32) : Nil
+    p = path.to_s
+    {% if flag?(:darwin) || flag?(:linux) %}
+      if LibC.chmod(c_str(p), mode) != 0
+        raise "Cannot chmod #{p}"
+      end
+    {% end %}
+  end
+
+  def self.chown(path : String | Path, uid : Int32, gid : Int32) : Nil
+    p = path.to_s
+    {% if flag?(:darwin) || flag?(:linux) %}
+      if LibC.chown(c_str(p), uid.to_u32, gid.to_u32) != 0
+        raise "Cannot chown #{p}"
+      end
+    {% end %}
+  end
+
+  private def self.c_str(str : String) : UInt8*
+    n = str.bytesize
+    buf = Pointer(UInt8).malloc((n + 1).to_u64)
+    buf.copy_from(str.to_unsafe, n)
+    buf[n] = 0_u8
+    buf
+  end
+end

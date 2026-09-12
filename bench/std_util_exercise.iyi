@@ -1,0 +1,271 @@
+# Utility standard library exercise.
+#
+#   ./bin/iyi run bench/std_util_exercise.iyi
+#
+# Exercises std/csv (RFC 4180 parsing, streaming, and generation),
+# std/log (levelled logging, named logger hierarchy, and backends),
+# and std/option_parser (flags, argument parsing, double-dash, and help text).
+#
+# Every section prints a progress line and raises on mismatch.
+
+import std/csv
+using std/csv::{CSV}
+
+import std/log
+using std/log::{Log, Logger, Severity, MemoryBackend, IOBackend}
+
+import std/option_parser
+using std/option_parser::{OptionParser}
+
+# =============================================================================
+# Section 1: CSV (RFC 4180)
+# =============================================================================
+puts "== std/csv: RFC 4180 parsing, streaming, and generation"
+
+# 1. Quoted field containing a comma
+comma_csv = "\"San Francisco, CA\",USA,94102\n"
+comma_parsed = CSV.parse(comma_csv)
+raise "csv: comma parsed rows" unless comma_parsed.size == 1
+raise "csv: comma field 0" unless comma_parsed[0][0] == "San Francisco, CA"
+raise "csv: comma field 1" unless comma_parsed[0][1] == "USA"
+raise "csv: comma field 2" unless comma_parsed[0][2] == "94102"
+puts "    csv: quoted field with comma verified"
+
+# 2. Quoted field containing embedded newline (CRLF and LF)
+nl_csv = "\"line 1\nline 2\r\nline 3\",second\n"
+nl_parsed = CSV.parse(nl_csv)
+raise "csv: newline parsed rows" unless nl_parsed.size == 1
+raise "csv: newline field 0" unless nl_parsed[0][0] == "line 1\nline 2\r\nline 3"
+raise "csv: newline field 1" unless nl_parsed[0][1] == "second"
+puts "    csv: quoted field with embedded newline verified"
+
+# 3. Quoted field containing escaped quotes ("")
+esc_csv = "\"He said \"\"hello\"\" to everyone!\",done\n"
+esc_parsed = CSV.parse(esc_csv)
+raise "csv: escaped quote field 0" unless esc_parsed[0][0] == "He said \"hello\" to everyone!"
+raise "csv: escaped quote field 1" unless esc_parsed[0][1] == "done"
+puts "    csv: quoted field with escaped quote verified"
+
+# 4. Empty field handling (leading, middle, trailing)
+empty_csv = "first,,third,\n"
+empty_parsed = CSV.parse(empty_csv)
+raise "csv: empty field count" unless empty_parsed[0].size == 4
+raise "csv: empty field 0" unless empty_parsed[0][0] == "first"
+raise "csv: empty field 1" unless empty_parsed[0][1] == ""
+raise "csv: empty field 2" unless empty_parsed[0][2] == "third"
+raise "csv: empty field 3" unless empty_parsed[0][3] == ""
+puts "    csv: empty field handling verified"
+
+# 5. Trailing newline (does not create phantom empty row)
+trailing_csv = "alpha,beta\n"
+trailing_parsed = CSV.parse(trailing_csv)
+raise "csv: trailing newline row count" unless trailing_parsed.size == 1
+raise "csv: trailing newline contents" unless trailing_parsed[0] == ["alpha", "beta"]
+puts "    csv: trailing newline handling verified"
+
+# 6. CRLF endings
+crlf_csv = "row1_col1,row1_col2\r\nrow2_col1,row2_col2\r\n"
+crlf_parsed = CSV.parse(crlf_csv)
+raise "csv: crlf row count" unless crlf_parsed.size == 2
+raise "csv: crlf row 0" unless crlf_parsed[0] == ["row1_col1", "row1_col2"]
+raise "csv: crlf row 1" unless crlf_parsed[1] == ["row2_col1", "row2_col2"]
+puts "    csv: CRLF line endings verified"
+
+# 7. Round trip each edge case through build and parse
+test_records = [
+  ["field,with,comma", "simple"],
+  ["multiline\nentry\r\nwith breaks", "normal"],
+  ["with \"\"escaped\"\" quotes", "clean"],
+  ["", "empty_cell"],
+  ["trailing", ""],
+]
+built_csv = CSV.build do |b|
+  test_records.each { |rec| b.row(rec) }
+end
+roundtrip_parsed = CSV.parse(built_csv)
+raise "csv: round trip row count" unless roundtrip_parsed.size == test_records.size
+test_records.each_with_index do |expected_rec, r_idx|
+  raise "csv: roundtrip mismatch at #{r_idx}" unless roundtrip_parsed[r_idx] == expected_rec
+end
+puts "    csv: round trip preservation verified"
+
+# 8. Headers extraction and column lookup
+header_data = "Name,Age,City\nAlice,30,\"New York, NY\"\nBob,25,London\n"
+csv_reader = CSV.new(header_data, headers: true)
+raise "csv: headers array" unless csv_reader.headers == ["Name", "Age", "City"]
+
+raise "csv: next row 1" unless csv_reader.next
+raise "csv: header lookup Name" unless csv_reader["Name"] == "Alice"
+raise "csv: header lookup Age" unless csv_reader["Age"] == "30"
+raise "csv: header lookup City" unless csv_reader["City"] == "New York, NY"
+raise "csv: index lookup 0" unless csv_reader[0] == "Alice"
+hash1 = csv_reader.to_h
+raise "csv: to_h Name" unless hash1["Name"] == "Alice"
+raise "csv: to_h City" unless hash1["City"] == "New York, NY"
+
+raise "csv: next row 2" unless csv_reader.next
+raise "csv: header lookup Bob" unless csv_reader["Name"] == "Bob"
+raise "csv: header lookup London" unless csv_reader["City"] == "London"
+
+raise "csv: eof after row 2" if csv_reader.next
+puts "    csv: headers access verified"
+
+# 9. Streaming row-at-a-time via File IyiIO with small buffer
+tmp_csv_path = "/tmp/std_util_streaming_test.csv"
+File.write(tmp_csv_path, built_csv)
+
+stream_rows = [] of Array(String)
+File.open(tmp_csv_path, "r") do |io|
+  CSV.each_row(io) do |row|
+    stream_rows << row
+  end
+end
+raise "csv: streaming row count" unless stream_rows.size == test_records.size
+test_records.each_with_index do |expected_rec, r_idx|
+  raise "csv: streaming row #{r_idx}" unless stream_rows[r_idx] == expected_rec
+end
+File.delete(tmp_csv_path) if File.exists?(tmp_csv_path)
+puts "    csv: IO streaming verified"
+
+# =============================================================================
+# Section 2: Log (Levels, Hierarchy, Backends)
+# =============================================================================
+puts "== std/log: levelled logging, hierarchy, and backends"
+
+# 1. Output at each level through backend
+mem_backend = MemoryBackend.new
+logger = Logger.new("app", Severity::Debug, mem_backend)
+
+logger.debug("debug message")
+logger.info("info message")
+logger.notice("notice message")
+logger.warn("warn message")
+logger.error("error message")
+logger.fatal("fatal message")
+
+entries = mem_backend.output
+raise "log: total entries size" unless entries.size == 6
+raise "log: debug entry" unless entries[0] == "[DEBUG] app: debug message"
+raise "log: info entry" unless entries[1] == "[INFO] app: info message"
+raise "log: notice entry" unless entries[2] == "[NOTICE] app: notice message"
+raise "log: warn entry" unless entries[3] == "[WARN] app: warn message"
+raise "log: error entry" unless entries[4] == "[ERROR] app: error message"
+raise "log: fatal entry" unless entries[5] == "[FATAL] app: fatal message"
+puts "    log: output at each level through backend verified"
+
+# 2. Level threshold filtering
+mem_backend.clear
+filtered_logger = Logger.new("service", Severity::Warn, mem_backend)
+
+filtered_logger.debug("should be ignored")
+filtered_logger.info("should be ignored")
+filtered_logger.notice("should be ignored")
+filtered_logger.warn("warning accepted")
+filtered_logger.error("error accepted")
+filtered_logger.fatal("fatal accepted")
+
+filtered_entries = mem_backend.output
+raise "log: filtered size" unless filtered_entries.size == 3
+raise "log: filtered 0" unless filtered_entries[0] == "[WARN] service: warning accepted"
+raise "log: filtered 1" unless filtered_entries[1] == "[ERROR] service: error accepted"
+raise "log: filtered 2" unless filtered_entries[2] == "[FATAL] service: fatal accepted"
+puts "    log: level threshold filtering verified"
+
+# 3. Block evaluation suppression
+evaluated = false
+filtered_logger.debug do
+  evaluated = true
+  "should not evaluate"
+end
+raise "log: block should not evaluate when filtered" if evaluated
+puts "    log: block evaluation suppression verified"
+
+# 4. Named logger hierarchy and level override
+root_log = Logger.new("", Severity::Warn, mem_backend)
+db_log = root_log.for("db")
+pool_log = db_log.for("pool")
+
+raise "log: hierarchy root source" unless root_log.source == ""
+raise "log: hierarchy db source" unless db_log.source == "db"
+raise "log: hierarchy pool source" unless pool_log.source == "db.pool"
+
+mem_backend.clear
+# Child inherits root level (Warn)
+db_log.info("ignored db info")
+raise "log: inherited level filtering" unless mem_backend.output.empty?
+
+# Child overrides its level to Debug
+db_log.level = Severity::Debug
+db_log.debug("db query executed")
+pool_log.debug("connection checked out")
+
+hier_entries = mem_backend.output
+raise "log: hierarchy entry count" unless hier_entries.size == 2
+raise "log: hierarchy db log" unless hier_entries[0] == "[DEBUG] db: db query executed"
+raise "log: hierarchy pool log" unless hier_entries[1] == "[DEBUG] db.pool: connection checked out"
+puts "    log: hierarchical logger naming and inheritance verified"
+
+# =============================================================================
+# Section 3: OptionParser
+# =============================================================================
+puts "== std/option_parser: flags, arguments, double-dash, and help"
+
+# 1. Realistic argv parse with short/long flags, arguments, and double-dash
+parsed_verbose = false
+parsed_output = ""
+parsed_level = 0
+caught_invalid = false
+caught_missing = false
+
+opt = OptionParser.new
+opt.banner = "Usage: compiler [options] files..."
+opt.on("-v", "--verbose", "Enable verbose logging") { parsed_verbose = true }
+opt.on("-o FILE", "--output=FILE", "Set output destination") { |f| parsed_output = f }
+opt.on("-l [LEVEL]", "--level[=LEVEL]", "Set optimization level") do |lvl|
+  parsed_level = lvl.empty? ? 1 : lvl.to_i
+end
+opt.missing_option { |f| caught_missing = true }
+opt.invalid_option { |f| caught_invalid = true }
+
+argv = ["-v", "--output", "build/out.bin", "--level=2", "--", "-not-a-flag", "main.iyi"]
+remaining_args = opt.parse(argv)
+
+raise "opt: verbose flag" unless parsed_verbose
+raise "opt: output argument" unless parsed_output == "build/out.bin"
+raise "opt: level argument" unless parsed_level == 2
+raise "opt: double-dash remaining args" unless remaining_args == ["-not-a-flag", "main.iyi"]
+raise "opt: in-place argv mutated" unless argv == ["-not-a-flag", "main.iyi"]
+puts "    option_parser: realistic argv parse with double-dash verified"
+
+# 2. Missing required argument caught
+opt.parse(["--output"])
+raise "opt: missing argument not caught" unless caught_missing
+puts "    option_parser: missing required argument caught verified"
+
+# 3. Optional argument without value
+level_opt = 0
+opt2 = OptionParser.new
+opt2.on("-O [LEVEL]", "--optimize[=LEVEL]", "Optimization level") do |lvl|
+  level_opt = lvl.empty? ? 1 : lvl.to_i
+end
+opt2.parse(["-O"])
+raise "opt: optional flag default" unless level_opt == 1
+
+opt2.parse(["--optimize=3"])
+raise "opt: optional flag with value" unless level_opt == 3
+puts "    option_parser: optional argument handling verified"
+
+# 4. Unknown option handling
+opt.parse(["--unrecognized-option"])
+raise "opt: invalid option not caught" unless caught_invalid
+puts "    option_parser: unknown option handling verified"
+
+# 5. Generated help text formatting
+help_text = opt.to_s
+raise "opt: help banner" unless help_text.includes?("Usage: compiler [options] files...")
+raise "opt: help verbose" unless help_text.includes?("-v, --verbose")
+raise "opt: help output" unless help_text.includes?("-o FILE, --output=FILE")
+raise "opt: help level" unless help_text.includes?("-l [LEVEL], --level[=LEVEL]")
+puts "    option_parser: generated help text verified"
+
+puts "all std/util checks passed"

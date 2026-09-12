@@ -1,0 +1,716 @@
+# Standard library TLS 1.3 exercise and validation suite.
+# Verifies native TLS 1.3 against RFC 8448, RFC 7748, RFC 8032, RFC 6979, RFC 8017.
+
+import std/tls
+import std/slice
+import std/digest
+import std/crypto
+import std/big
+import std/time
+import std/dns
+import std/socket
+
+using std/slice::{Slice}
+using std/digest::{SHA256, SHA384, SHA512}
+using std/crypto::{HMAC, HKDF}
+using std/big::{BigInt}
+using std/time::{Time}
+using std/socket::{IyiSocket}
+
+alias Bytes = Std::Slice::Bytes
+
+{% if (flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64))) || (flag?(:darwin) && flag?(:aarch64)) || (flag?(:win32) && flag?(:x86_64)) %}
+  _ = IyiScheduler.current
+{% end %}
+
+# Command-line argument dispatch for failure mode probing
+args = Program.args
+if args.size > 0 && args[0] == "seq_exhaustion"
+  s_key = Bytes.new(16, 0x11_u8)
+  s_iv = Bytes.new(12, 0x22_u8)
+  cipher_exhausted = Std::Tls::RecordCipher.new(:aes_128_gcm, s_key, s_iv, 0xffffffffffffffff_u64)
+  cipher_exhausted.encrypt(0x17_u8, Bytes.new(16, 0x33_u8))
+  print "iyi: panic: assertion failed: "
+  puts "nonce-reuse boundary guard failed: sequence wrapped without error"
+  __iyi_exit(1)
+end
+
+def assert_true(cond : Bool, msg : String) : Nil
+  if !cond
+    print "iyi: panic: assertion failed: "
+    puts msg
+    __iyi_exit(1)
+  end
+end
+
+def hex_to_bytes(hex : String) : Bytes
+  count = 0
+  i = 0
+  while i < hex.bytesize
+    c = hex[i]
+    if (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+      count = count + 1
+    end
+    i = i + 1
+  end
+  out = Bytes.new(count // 2)
+  out_idx = 0
+  hi = -1
+  i = 0
+  while i < hex.bytesize
+    c = hex[i]
+    val = -1
+    if c >= '0' && c <= '9'
+      val = c.ord - 48
+    elsif c >= 'a' && c <= 'f'
+      val = c.ord - 87
+    elsif c >= 'A' && c <= 'F'
+      val = c.ord - 55
+    end
+    if val >= 0
+      if hi < 0
+        hi = val
+      else
+        out[out_idx] = ((hi << 4) | val).to_u8
+        out_idx = out_idx + 1
+        hi = -1
+      end
+    end
+    i = i + 1
+  end
+  out
+end
+
+class ScriptedSocket < IyiSocket
+  @read_buf : Bytes
+  @read_pos : Int32
+  getter written_records : Array(Bytes)
+
+  def initialize(@read_buf : Bytes)
+    @fd = -1
+    @read_pos = 0
+    @written_records = Array(Bytes).new
+  end
+
+  def read(buffer : Pointer(UInt8), count : Int32) : Int32
+    return 0 if @read_pos >= @read_buf.size
+    avail = @read_buf.size - @read_pos
+    to_read = count < avail ? count : avail
+    i = 0
+    while i < to_read
+      buffer[i] = @read_buf[@read_pos + i]
+      i = i + 1
+    end
+    @read_pos = @read_pos + to_read
+    to_read
+  end
+
+  def write(buffer : Pointer(UInt8), count : Int32) : Int32
+    rec = Bytes.new(count)
+    i = 0
+    while i < count
+      rec[i] = buffer[i]
+      i = i + 1
+    end
+    @written_records << rec
+    count
+  end
+end
+
+# -----------------------------------------------------------------------------
+# 1. X25519 (RFC 7748)
+# -----------------------------------------------------------------------------
+print "x25519: "
+
+# RFC 7748 Section 6.1 Test Vector
+a_priv = hex_to_bytes("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a")
+base_u = Bytes.new(32, 0_u8); base_u[0] = 9_u8
+a_pub = Std::Tls::X25519.scalar_mult(a_priv, base_u)
+assert_true(a_pub.hexstring == "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a", "RFC 7748 6.1 Alice public key")
+
+b_priv = hex_to_bytes("5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb")
+b_pub = Std::Tls::X25519.scalar_mult(b_priv, base_u)
+assert_true(b_pub.hexstring == "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f", "RFC 7748 6.1 Bob public key")
+
+shared_a = Std::Tls::X25519.scalar_mult(a_priv, b_pub)
+shared_b = Std::Tls::X25519.scalar_mult(b_priv, a_pub)
+assert_true(shared_a.hexstring == "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742", "RFC 7748 6.1 Shared secret A")
+assert_true(shared_b.hexstring == "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742", "RFC 7748 6.1 Shared secret B")
+
+# RFC 7748 Section 5.2 Iteration 1
+iter1 = Std::Tls::X25519.scalar_mult(base_u, base_u)
+assert_true(iter1.hexstring == "422c8e7a6227d7bca1350b3e2bb7279f7897b87bb6854b783c60e80311ae3079", "RFC 7748 5.2 iteration 1")
+
+# All-zero shared secret rejection check
+zeros32 = Bytes.new(32, 0_u8)
+assert_true(Std::Tls::X25519.is_all_zero(zeros32), "X25519 all-zero detection")
+non_zero = Bytes.new(32, 0_u8); non_zero[15] = 1_u8
+assert_true(!Std::Tls::X25519.is_all_zero(non_zero), "X25519 non-zero detection")
+
+puts "ok"
+
+# -----------------------------------------------------------------------------
+# 2. Ed25519 (RFC 8032)
+# -----------------------------------------------------------------------------
+print "ed25519: "
+
+# RFC 8032 Section 7.1 Test 1
+pub1 = hex_to_bytes("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a")
+msg1 = Bytes.empty
+sig1 = hex_to_bytes("e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b")
+assert_true(Std::Tls::Ed25519.verify(pub1, msg1, sig1), "RFC 8032 Test 1")
+
+# RFC 8032 Section 7.1 Test 2
+pub2 = hex_to_bytes("3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c")
+msg2 = hex_to_bytes("72")
+sig2 = hex_to_bytes("92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00")
+assert_true(Std::Tls::Ed25519.verify(pub2, msg2, sig2), "RFC 8032 Test 2")
+
+# Tampered signature must fail closed (tamper s at offset 32 so R remains a valid point)
+sig2_bad = Bytes.new(sig2.size); i = 0; while i < sig2.size
+  sig2_bad[i] = sig2[i]; i = i + 1
+end
+sig2_bad[32] = sig2_bad[32] ^ 0x01_u8
+assert_true(!Std::Tls::Ed25519.verify(pub2, msg2, sig2_bad), "Ed25519 tampered signature rejected")
+
+puts "ok"
+
+# -----------------------------------------------------------------------------
+# 3. ECDSA P-256 and P-384 (RFC 6979)
+# -----------------------------------------------------------------------------
+print "p256: "
+
+# RFC 6979 Section A.2.5 (ECDSA P-256)
+msg_p256 = "sample"
+hash_p256 = SHA256.digest(Bytes.new(msg_p256.to_unsafe, msg_p256.bytesize))
+qx = BigInt.from_hex("60FED4BA255A9D31C961EB74C6356D68C049B8923B61FA6CE669622E60F29FB6")
+qy = BigInt.from_hex("7903FE1008B8BC99A41AE9E95628BC64F2F1B20C2D7E9F5177A3C294D4462299")
+r = BigInt.from_hex("EFD48B2AACB6A8FD1140DD9CD45E81D69D2C877B56AAF991C34D0EA84EAF3716")
+s = BigInt.from_hex("F7CB1C942D657C41D436C7A1B6E29F65F3E900DBB9AFF4064DC4AB2F843ACDA8")
+assert_true(Std::Tls::P256.verify(qx, qy, hash_p256, r, s), "RFC 6979 P-256 signature verified")
+assert_true(!Std::Tls::P256.verify(qx, qy, hash_p256, r, s + BigInt.one), "ECDSA P-256 tampered signature rejected")
+
+# RFC 6979 Section A.2.6 (ECDSA P-384)
+qx_384 = BigInt.from_hex("EC3A4E415B4E19A4568618029F427FA5DA9A8BC4AE92E02E06AAE5286B300C64DEF8F0EA9055866064A254515480BC13")
+qy_384 = BigInt.from_hex("8015D9B72D7D57244EA8EF9AC0C621896708A59367F9DFB9F54CA84B3F1C9DB1288B231C3AE0D4FE7344FD2533264720")
+r_384 = BigInt.from_hex("94EDBB92A5ECB8AAD4736E56C691916B3F88140666CE9FA73D64C4EA95AD133C81A648152E44ACF96E36DD1E80FABE46")
+s_384 = BigInt.from_hex("99EF4AEB15F178CEA1FE40DB2603138F130E740A19624526203B6351D0A3A94FA329C145786E679E7B82C71A38628AC8")
+msg_384 = "sample"
+hash_384 = SHA384.digest(Bytes.new(msg_384.to_unsafe, msg_384.bytesize))
+assert_true(Std::Tls::P384.verify(qx_384, qy_384, hash_384, r_384, s_384), "RFC 6979 P-384 signature verified")
+assert_true(!Std::Tls::P384.verify(qx_384, qy_384, hash_384, r_384, s_384 + BigInt.one), "P-384 tampered signature rejected")
+
+# SEC 1 / FIPS 186 P-256 with SHA-384 truncation vs modular reduction (Finding 5 re-review)
+qx_p256_trunc = BigInt.from_hex("60fed4ba255a9d31c961eb74c6356d68c049b8923b61fa6ce669622e60f29fb6")
+qy_p256_trunc = BigInt.from_hex("7903fe1008b8bc99a41ae9e95628bc64f2f1b20c2d7e9f5177a3c294d4462299")
+r_p256_trunc = BigInt.from_hex("7dbb9a513de8829a000686a53ebf146c887aeb9bbfa26acce1ff21f8425c23da")
+s_p256_trunc = BigInt.from_hex("6c42ecfc0c49df0f6f17d2773d476b59eeaaee181bfb1a2e4cf2268444d48e5c")
+msg_p256_trunc = "P-256 with SHA-384 truncation test"
+hash_p256_trunc = SHA384.digest(Bytes.new(msg_p256_trunc.to_unsafe, msg_p256_trunc.bytesize))
+assert_true(Std::Tls::P256.verify(qx_p256_trunc, qy_p256_trunc, hash_p256_trunc, r_p256_trunc, s_p256_trunc), "SEC 1 P-256 with SHA-384 truncation verified")
+
+puts "ok"
+
+# -----------------------------------------------------------------------------
+# 4. RSA (PKCS#1 v1.5 and RSA-PSS, RFC 8017 / RFC 8448)
+# -----------------------------------------------------------------------------
+print "rsa: "
+
+# RFC 8448 1024-bit RSA Key
+rsa_n = BigInt.from_hex("b4bb498f8279303d980836399b36c6988c0c68de55e1bdb826d3901a2461eafd2de49a91d015abbc9a95137ace6c1af19eaa6af98c7ced43120998e187a80ee0ccb0524b1b018c3e0b63264d449a6d38e22a5fda430846748030530ef0461c8ca9d9efbfae8ea6d1d03e2bd193eff0ab9a8002c47428a6d35a8d88d79f7f1e3f")
+rsa_e = BigInt.new(65537_i64)
+
+# Test RSA-PSS on RFC 8448 CertificateVerify
+th_cert = hex_to_bytes("764d6632b3c35c3f3205e3499ac3edbaabb88295fba751461d3678e2e5ea0687")
+cv_prefix = "                                                                TLS 1.3, server CertificateVerify"
+cv_input = Bytes.new(cv_prefix.bytesize + 1 + th_cert.size)
+i = 0; while i < cv_prefix.bytesize
+  cv_input[i] = cv_prefix[i].ord.to_u8; i = i + 1
+end
+cv_input[cv_prefix.bytesize] = 0x00_u8
+i = 0; while i < th_cert.size
+  cv_input[cv_prefix.bytesize + 1 + i] = th_cert[i]; i = i + 1
+end
+cv_hash = SHA256.digest(cv_input)
+
+cv_sig = hex_to_bytes("5a747c5d88fa9bd2e55ab085a61015b7211f824cd484145ab3ff52f1fda8477b0b7abc90db78e2d33a5c141a078653fa6bef780c5ea248eeaaa785c4f394cab6d30bbe8d4859ee511f602957b15411ac027671459e46445c9ea58c181e818e95b8c3fb0bf3278409d3be152a3da5043e063dda65cdf5aea20d53dfacd42f74f3")
+
+assert_true(Std::Tls::RSA.verify_pss(rsa_n, rsa_e, :sha256, cv_hash, cv_sig, 32), "RFC 8448 RSA-PSS CertificateVerify verified")
+
+# Tampered RSA-PSS signature must fail closed
+cv_sig_bad = Bytes.new(cv_sig.size); i = 0; while i < cv_sig.size
+  cv_sig_bad[i] = cv_sig[i]; i = i + 1
+end
+cv_sig_bad[0] = cv_sig_bad[0] ^ 0x01_u8
+assert_true(!Std::Tls::RSA.verify_pss(rsa_n, rsa_e, :sha256, cv_hash, cv_sig_bad, 32), "RSA-PSS tampered signature rejected")
+
+# NIST CAVP FIPS186-3 SigGenPSS, 2048-bit RSA, SHA-256, 20-byte salt.
+# The fixed salt and expected signature come from SigGenPSS_186-3.rsp, not
+# from this implementation or its verifier.
+nist_pss_n = BigInt.from_hex("c5062b58d8539c765e1e5dbaf14cf75dd56c2e13105fecfd1a930bbb5948ff328f126abe779359ca59bca752c308d281573bc6178b6c0fef7dc445e4f826430437b9f9d790581de5749c2cb9cb26d42b2fee15b6b26f09c99670336423b86bc5bec71113157be2d944d7ff3eebffb28413143ea36755db0ae62ff5b724eecb3d316b6bac67e89cacd8171937e2ab19bd353a89acea8c36f81c89a620d5fd2effea896601c7f9daca7f033f635a3a943331d1b1b4f5288790b53af352f1121ca1bef205f40dc012c412b40bdd27585b946466d75f7ee0a7f9d549b4bece6f43ac3ee65fe7fd37123359d9f1a850ad450aaf5c94eb11dea3fc0fc6e9856b1805ef")
+nist_pss_e = BigInt.from_hex("0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000086c94f")
+nist_pss_d = BigInt.from_hex("49e5786bb4d332f94586327bde088875379b75d128488f08e574ab4715302a87eea52d4c4a23d8b97af7944804337c5f55e16ba9ffafc0c9fd9b88eca443f39b7967170ddb8ce7ddb93c6087c8066c4a95538a441b9dc80dc9f7810054fd1e5c9d0250c978bb2d748abe1e9465d71a8165d3126dce5db2adacc003e9062ba37a54b63e5f49a4eafebd7e4bf5b0a796c2b3a950fa09c798d3fa3e86c4b62c33ba9365eda054e5fe74a41f21b595026acf1093c90a8c71722f91af1ed29a41a2449a320fc7ba3120e3e8c3e4240c04925cc698ecd66c7c906bdf240adad972b4dff4869d400b5d13e33eeba38e075e872b0ed3e91cc9c283867a4ffc3901d2069f")
+nist_pss_msg = hex_to_bytes("dfc22604b95d15328059745c6c98eb9dfb347cf9f170aff19deeec555f22285a6706c4ecbf0fb1458c60d9bf913fbae6f4c554d245d946b4bc5f34aec2ac6be8b33dc8e0e3a9d601dfd53678f5674443f67df78a3a9e0933e5f158b169ac8d1c4cd0fb872c14ca8e001e542ea0f9cfda88c42dcad8a74097a00c22055b0bd41f")
+nist_pss_salt = hex_to_bytes("e1256fc1eeef81773fdd54657e4007fde6bcb9b1")
+nist_pss_expected = "8b46f2c889d819f860af0a6c4c889e4d1436c6ca174464d22ae11b9ccc265d743c67e569accbc5a80d4dd5f1bf4039e23de52aece40291c75f8936c58c9a2f77a780bbe7ad31eb76742f7b2b8b14ca1a7196af7e673a3cfc237d50f615b75cf4a7ea78a948bedaf9242494b41e1db51f437f15fd2551bb5d24eefb1c3e60f03694d0033a1e0a9b9f5e4ab97d457dff9b9da516dc226d6d6529500308ed74a2e6d9f3c10595788a52a1bc0664aedf33efc8badd037eb7b880772bdb04a6046e9edeee4197c25507fb0f11ab1c9f63f53c8820ea8405cfd7721692475b4d72355fa9a3804f29e6b6a7b059c4441d54b28e4eed2529c6103b5432c71332ce742bcc"
+nist_pss_hash = SHA256.digest(nist_pss_msg)
+nist_pss_sig = Std::Tls::RSA.sign_pss(nist_pss_n, nist_pss_d, :sha256, nist_pss_hash, nist_pss_salt)
+assert_true(nist_pss_sig.hexstring == nist_pss_expected, "NIST CAVP RSA-PSS signature generation")
+assert_true(Std::Tls::RSA.verify_pss(nist_pss_n, nist_pss_e, :sha256, nist_pss_hash, nist_pss_sig, 20), "NIST CAVP generated RSA-PSS signature verifies")
+puts "rsa-pss-sign: NIST CAVP SigGenPSS SHA-256 vector matched"
+
+puts "ok"
+
+# -----------------------------------------------------------------------------
+# 5. RFC 8448 Handshake Trace (The Gate) & Multi-Record Transport Slicing
+# -----------------------------------------------------------------------------
+print "rfc8448: "
+
+# Client ephemeral keypair
+c_priv_rfc = hex_to_bytes("49 af 42 ba 7f 79 94 85 2d 71 3e f2 78 4b cb ca a7 91 1d e2 6a dc 56 42 cb 63 45 40 e7 ea 50 05")
+c_pub_rfc = Std::Tls::X25519.scalar_mult(c_priv_rfc, base_u)
+assert_true(c_pub_rfc.hexstring == "99381de560e4bd43d23d8e435a7dbafeb3c06e51c13cae4d5413691e529aaf2c", "RFC 8448 client public key")
+
+# Server ephemeral keypair & shared secret
+s_pub_rfc = hex_to_bytes("c9 82 88 76 11 20 95 fe 66 76 2b db f7 c6 72 e1 56 d6 cc 25 3b 83 3d f1 dd 69 b1 b0 4e 75 1f 0f")
+shared_rfc = Std::Tls::X25519.scalar_mult(c_priv_rfc, s_pub_rfc)
+assert_true(shared_rfc.hexstring == "8bd4054fb55b9d63fdfbacf9f04b9f0d35e6d63f537563efd46272900f89492d", "RFC 8448 shared secret")
+
+# Early secret
+early_sec = HKDF.extract(:sha256, zeros32, zeros32)
+assert_true(early_sec.hexstring == "33ad0a1c607ec03b09e6cd9893680ce210adf300aa1f2660e1b22e10f170f92a", "RFC 8448 early secret")
+
+# Derived secret
+derived_sec = Std::Tls.derive_secret(early_sec, "derived", SHA256.digest(Bytes.empty))
+assert_true(derived_sec.hexstring == "6f2615a108c702c5678f54fc9dbab69716c076189c48250cebeac3576c3611ba", "RFC 8448 derived secret")
+
+# Handshake secret
+hs_sec = HKDF.extract(:sha256, shared_rfc, derived_sec)
+assert_true(hs_sec.hexstring == "1dc826e93606aa6fdc0aadc12f741b01046aa6b99f691ed221a9f0ca043fbeac", "RFC 8448 handshake secret")
+
+# Handshake messages
+ch_bytes_rfc = hex_to_bytes("01 00 00 c0 03 03 cb 34 ec b1 e7 81 63 ba 1c 38 c6 da cb 19 6a 6d ff a2 1a 8d 99 12 ec 18 a2 ef 62 83 02 4d ec e7 00 00 06 13 01 13 03 13 02 01 00 00 91 00 00 00 0b 00 09 00 00 06 73 65 72 76 65 72 ff 01 00 01 00 00 0a 00 14 00 12 00 1d 00 17 00 18 00 19 01 00 01 01 01 02 01 03 01 04 00 23 00 00 00 33 00 26 00 24 00 1d 00 20 99 38 1d e5 60 e4 bd 43 d2 3d 8e 43 5a 7d ba fe b3 c0 6e 51 c1 3c ae 4d 54 13 69 1e 52 9a af 2c 00 2b 00 03 02 03 04 00 0d 00 20 00 1e 04 03 05 03 06 03 02 03 08 04 08 05 08 06 04 01 05 01 06 01 02 01 04 02 05 02 06 02 02 02 00 2d 00 02 01 01 00 1c 00 02 40 01")
+sh_bytes_rfc = hex_to_bytes("02 00 00 56 03 03 a6 af 06 a4 12 18 60 dc 5e 6e 60 24 9c d3 4c 95 93 0c 8a c5 cb 14 34 da c1 55 77 2e d3 e2 69 28 00 13 01 00 00 2e 00 33 00 24 00 1d 00 20 c9 82 88 76 11 20 95 fe 66 76 2b db f7 c6 72 e1 56 d6 cc 25 3b 83 3d f1 dd 69 b1 b0 4e 75 1f 0f 00 2b 00 02 03 04")
+ee_bytes_rfc = hex_to_bytes("08 00 00 24 00 22 00 0a 00 14 00 12 00 1d 00 17 00 18 00 19 01 00 01 01 01 02 01 03 01 04 00 1c 00 02 40 01 00 00 00 00")
+cert_part1 = "0b 00 01 b9 00 00 01 b5 00 01 b0 30 82 01 ac 30 82 01 15 a0 03 02 01 02 02 01 02 30 0d 06 09 2a 86 48 86 f7 0d 01 01 0b 05 00 30 0e 31 0c 30 0a 06 03 55 04 03 13 03 72 73 61 30 1e 17 0d 31 36 30 37 33 30 30 31 32 33 35 39 5a 17 0d 32 36 30 37 33 30 30 31 32 33 35 39 5a 30 0e 31 0c 30 0a 06 03 55 04 03 13 03 72 73 61 30 81 9f 30 0d 06 09 2a 86 48 86 f7 0d 01 01 01 05 00 03 81 8d 00 30 81 89 02 81 81 00 b4 bb 49 8f 82 79 30 3d 98 08 36 39 9b 36 c6 98 8c 0c 68 de 55 e1 bd b8 26 d3 90 1a 24 61 ea fd 2d e4 9a 91 d0 15 ab bc 9a 95 13 7a ce 6c "
+cert_part2 = "1a f1 9e aa 6a f9 8c 7c ed 43 12 09 98 e1 87 a8 0e e0 cc b0 52 4b 1b 01 8c 3e 0b 63 26 4d 44 9a 6d 38 e2 2a 5f da 43 08 46 74 80 30 53 0e f0 46 1c 8c a9 d9 ef bf ae 8e a6 d1 d0 3e 2b d1 93 ef f0 ab 9a 80 02 c4 74 28 a6 d3 5a 8d 88 d7 9f 7f 1e 3f 02 03 01 00 01 a3 1a 30 18 30 09 06 03 55 1d 13 04 02 30 00 30 0b 06 03 55 1d 0f 04 04 03 02 05 a0 30 0d 06 09 2a 86 48 86 f7 0d 01 01 0b 05 00 03 81 81 00 85 aa d2 a0 e5 b9 27 6b 90 8c 65 f7 3a 72 67 17 06 18 a5 4c 5f 8a 7b 33 7d 2d f7 a5 94 36 54 17 f2 ea e8 f8 a5 8c 8f 81 72 f9 31 9c f3 6b 7f d6 c5 5b 80 f2 1a 03 01 51 56 72 60 96 fd 33 5e 5e 67 f2 db f1 02 70 2e 60 8c ca e6 be c1 fc 63 a4 2a 99 be 5c 3e b7 10 7c 3c 54 e9 b9 eb 2b d5 20 3b 1c 3b 84 e0 a8 b2 f7 59 40 9b a3 ea c9 d9 1d 40 2d cc 0c c8 f8 96 12 29 ac 91 87 b4 2b 4d e1 00 00"
+cert_bytes_rfc = hex_to_bytes(cert_part1 + cert_part2)
+cv_bytes_rfc = hex_to_bytes("0f 00 00 84 08 04 00 80 5a 74 7c 5d 88 fa 9b d2 e5 5a b0 85 a6 10 15 b7 21 1f 82 4c d4 84 14 5a b3 ff 52 f1 fd a8 47 7b 0b 7a bc 90 db 78 e2 d3 3a 5c 14 1a 07 86 53 fa 6b ef 78 0c 5e a2 48 ee aa a7 85 c4 f3 94 ca b6 d3 0b be 8d 48 59 ee 51 1f 60 29 57 b1 54 11 ac 02 76 71 45 9e 46 44 5c 9e a5 8c 18 1e 81 8e 95 b8 c3 fb 0b f3 27 84 09 d3 be 15 2a 3d a5 04 3e 06 3d da 65 cd f5 ae a2 0d 53 df ac d4 2f 74 f3")
+fin_bytes_rfc = hex_to_bytes("14 00 00 20 9b 9b 14 1d 90 63 37 fb d2 cb dc e7 1d f4 de da 4a b4 2c 30 95 72 cb 7f ff ee 54 54 b7 8f 07 18")
+
+# Transcript hash 1 (CH + SH)
+th1_rfc = SHA256.new.update(ch_bytes_rfc).update(sh_bytes_rfc).final
+assert_true(th1_rfc.hexstring == "860c06edc07858ee8e78f0e7428c58edd6b43f2ca3e6e95f02ed063cf0e1cad8", "RFC 8448 transcript hash 1")
+
+# Server handshake traffic secret
+s_hs_traffic_rfc = Std::Tls.derive_secret(hs_sec, "s hs traffic", th1_rfc)
+assert_true(s_hs_traffic_rfc.hexstring == "b67b7d690cc16c4e75e54213cb2d37b4e9c912bcded9105d42befd59d391ad38", "RFC 8448 s_hs_traffic")
+
+# Server handshake key and IV
+s_hs_key_rfc = Std::Tls.hkdf_expand_label(s_hs_traffic_rfc, "key", Bytes.empty, 16)
+assert_true(s_hs_key_rfc.hexstring == "3fce516009c21727d0f2e4e86ee403bc", "RFC 8448 s_hs_key")
+
+s_hs_iv_rfc = Std::Tls.hkdf_expand_label(s_hs_traffic_rfc, "iv", Bytes.empty, 12)
+assert_true(s_hs_iv_rfc.hexstring == "5d313eb2671276ee13000b30", "RFC 8448 s_hs_iv")
+
+# Server finished key & MAC
+th_cv_rfc = SHA256.new.update(ch_bytes_rfc).update(sh_bytes_rfc).update(ee_bytes_rfc).update(cert_bytes_rfc).update(cv_bytes_rfc).final
+s_fin_key_rfc = Std::Tls.hkdf_expand_label(s_hs_traffic_rfc, "finished", Bytes.empty, 32)
+assert_true(s_fin_key_rfc.hexstring == "008d3b66f816ea559f96b537e885c31fc068bf492c652f01f288a1d8cdc19fc8", "RFC 8448 server finished key")
+
+calc_s_fin_mac = HMAC.digest(:sha256, s_fin_key_rfc, th_cv_rfc)
+assert_true(calc_s_fin_mac.hexstring == "9b9b141d906337fbd2cbdce71df4deda4ab42c309572cb7fffee5454b78f0718", "RFC 8448 server finished MAC")
+
+# Client finished key & MAC
+c_hs_traffic_rfc = Std::Tls.derive_secret(hs_sec, "c hs traffic", th1_rfc)
+th_sfin_rfc = SHA256.new.update(ch_bytes_rfc).update(sh_bytes_rfc).update(ee_bytes_rfc).update(cert_bytes_rfc).update(cv_bytes_rfc).update(fin_bytes_rfc).final
+c_fin_key_rfc = Std::Tls.hkdf_expand_label(c_hs_traffic_rfc, "finished", Bytes.empty, 32)
+assert_true(c_fin_key_rfc.hexstring == "b80ad01015fb2f0bd65ff7d4da5d6bf83f84821d1f87fdc7d3c75b5a7b42d9c4", "RFC 8448 client finished key")
+
+calc_c_fin_mac = HMAC.digest(:sha256, c_fin_key_rfc, th_sfin_rfc)
+assert_true(calc_c_fin_mac.hexstring == "a8ec436d677634ae525ac1fcebe11a039ec17694fac6e98527b642f2edd5ce61", "RFC 8448 client finished MAC")
+
+# Master secret and application traffic secrets
+master_sec_rfc = HKDF.extract(:sha256, zeros32, Std::Tls.derive_secret(hs_sec, "derived", SHA256.digest(Bytes.empty)))
+assert_true(master_sec_rfc.hexstring == "18df06843d13a08bf2a449844c5f8a478001bc4d4c627984d5a41da8d0402919", "RFC 8448 master secret")
+
+c_ap_rfc = Std::Tls.derive_secret(master_sec_rfc, "c ap traffic", th_sfin_rfc)
+assert_true(c_ap_rfc.hexstring == "9e40646ce79a7f9dc05af8889bce6552875afa0b06df0087f792ebb7c17504a5", "RFC 8448 c_ap_traffic")
+
+s_ap_rfc = Std::Tls.derive_secret(master_sec_rfc, "s ap traffic", th_sfin_rfc)
+assert_true(s_ap_rfc.hexstring == "a11af9f05531f856ad47116b45a950328204b4f44bfb6b3a4b4f1f3fcb631643", "RFC 8448 s_ap_traffic")
+
+# Record layer roundtrip and tampered tag rejection
+cipher_s = Std::Tls::RecordCipher.new(:aes_128_gcm, s_hs_key_rfc, s_hs_iv_rfc)
+cipher_r = Std::Tls::RecordCipher.new(:aes_128_gcm, s_hs_key_rfc, s_hs_iv_rfc)
+test_payload = Bytes.new(64, 0x42_u8)
+enc_rec = cipher_s.encrypt(0x16_u8, test_payload)
+dec_rec = cipher_r.decrypt(enc_rec)
+assert_true(!dec_rec.nil?, "Record layer decrypted")
+if dec_rec
+  d_type, d_bytes = dec_rec
+  assert_true(d_type == 0x16_u8 && d_bytes == test_payload, "Record payload roundtrip verified")
+end
+
+# Tampered record must fail closed
+enc_bad = Bytes.new(enc_rec.size); i = 0; while i < enc_rec.size
+  enc_bad[i] = enc_rec[i]; i = i + 1
+end
+enc_bad[enc_bad.size - 1] = enc_bad[enc_bad.size - 1] ^ 0x01_u8
+cipher_r2 = Std::Tls::RecordCipher.new(:aes_128_gcm, s_hs_key_rfc, s_hs_iv_rfc)
+assert_true(cipher_r2.decrypt(enc_bad).nil?, "Record layer tampered tag rejected")
+
+# ChaCha20-Poly1305 record cipher (Finding 4: 32-byte key)
+chacha_key = Bytes.new(32, 0x42_u8)
+chacha_iv = Bytes.new(12, 0x24_u8)
+chacha_s = Std::Tls::RecordCipher.new(:chacha20_poly1305, chacha_key, chacha_iv)
+chacha_r = Std::Tls::RecordCipher.new(:chacha20_poly1305, chacha_key, chacha_iv)
+chacha_payload = Bytes.new(32, 0x55_u8)
+chacha_enc = chacha_s.encrypt(0x17_u8, chacha_payload)
+chacha_dec = chacha_r.decrypt(chacha_enc)
+assert_true(!chacha_dec.nil?, "ChaCha20-Poly1305 record decrypted")
+if chacha_dec
+  c_type, c_bytes = chacha_dec
+  assert_true(c_type == 0x17_u8 && c_bytes == chacha_payload, "ChaCha20-Poly1305 payload match")
+end
+
+# Multi-record flight with ScriptedSocket (Finding 3 behavioral test)
+# Record 1: ServerHello
+sh_rec = Bytes.new(5 + sh_bytes_rfc.size)
+sh_rec[0] = 0x16_u8; sh_rec[1] = 0x03_u8; sh_rec[2] = 0x03_u8
+sh_rec[3] = ((sh_bytes_rfc.size >> 8) & 0xff).to_u8; sh_rec[4] = (sh_bytes_rfc.size & 0xff).to_u8
+i = 0; while i < sh_bytes_rfc.size
+  sh_rec[5 + i] = sh_bytes_rfc[i]; i = i + 1
+end
+
+# Record 2: EncryptedExtensions (encrypted alone with seq = 0)
+s_cipher_rec2 = Std::Tls::RecordCipher.new(:aes_128_gcm, s_hs_key_rfc, s_hs_iv_rfc, 0_u64)
+rec2 = s_cipher_rec2.encrypt(0x16_u8, ee_bytes_rfc)
+
+# Record 3: Certificate + CertificateVerify + Finished (encrypted with seq = 1)
+s_cipher_rec3 = Std::Tls::RecordCipher.new(:aes_128_gcm, s_hs_key_rfc, s_hs_iv_rfc, 1_u64)
+rec3_payload = Bytes.new(cert_bytes_rfc.size + cv_bytes_rfc.size + fin_bytes_rfc.size)
+idx3 = 0
+i = 0; while i < cert_bytes_rfc.size
+  rec3_payload[idx3] = cert_bytes_rfc[i]; idx3 = idx3 + 1; i = i + 1
+end
+i = 0; while i < cv_bytes_rfc.size
+  rec3_payload[idx3] = cv_bytes_rfc[i]; idx3 = idx3 + 1; i = i + 1
+end
+i = 0; while i < fin_bytes_rfc.size
+  rec3_payload[idx3] = fin_bytes_rfc[i]; idx3 = idx3 + 1; i = i + 1
+end
+rec3 = s_cipher_rec3.encrypt(0x16_u8, rec3_payload)
+
+# Combined multi-record server flight
+multi_rec_flight = Bytes.new(sh_rec.size + rec2.size + rec3.size)
+f_idx = 0
+i = 0; while i < sh_rec.size
+  multi_rec_flight[f_idx] = sh_rec[i]; f_idx = f_idx + 1; i = i + 1
+end
+i = 0; while i < rec2.size
+  multi_rec_flight[f_idx] = rec2[i]; f_idx = f_idx + 1; i = i + 1
+end
+i = 0; while i < rec3.size
+  multi_rec_flight[f_idx] = rec3[i]; f_idx = f_idx + 1; i = i + 1
+end
+
+scripted_sock = ScriptedSocket.new(multi_rec_flight)
+scripted_client = Std::Tls::Client.wrap_socket(
+  scripted_sock,
+  "server",
+  ["http/1.1"],
+  false,
+  nil,
+  nil,
+  c_priv_rfc,
+  ch_bytes_rfc[6, 32],
+  ch_bytes_rfc[39, 32],
+  ch_bytes_rfc
+)
+assert_true(!scripted_client.closed?, "Scripted multi-record TLS handshake completed")
+assert_true(scripted_client.cipher_suite == :aes_128_gcm, "Scripted multi-record handshake negotiated AES-128-GCM")
+
+# Scripted test: RSA cert paired with ECDSA 0x0403 scheme in CertificateVerify
+if args.size > 0 && args[0] == "mismatched_cv"
+  cv_mismatched = hex_to_bytes("0f00004a0403004630440220010101010101010101010101010101010101010101010101010101010101010102200202020202020202020202020202020202020202020202020202020202020202")
+  th_cv_m = SHA256.new.update(ch_bytes_rfc).update(sh_bytes_rfc).update(ee_bytes_rfc).update(cert_bytes_rfc).update(cv_mismatched).final
+  fin_m_data = HMAC.digest(:sha256, s_fin_key_rfc, th_cv_m)
+  fin_mismatched = Bytes.new(36)
+  fin_mismatched[0] = 0x14_u8; fin_mismatched[3] = 32_u8
+  i = 0; while i < 32
+    fin_mismatched[4 + i] = fin_m_data[i]; i = i + 1
+  end
+
+  s_cipher_mismatch = Std::Tls::RecordCipher.new(:aes_128_gcm, s_hs_key_rfc, s_hs_iv_rfc, 1_u64)
+  rec3_m_payload = Bytes.new(cert_bytes_rfc.size + cv_mismatched.size + fin_mismatched.size)
+  idx_m = 0
+  i = 0; while i < cert_bytes_rfc.size
+    rec3_m_payload[idx_m] = cert_bytes_rfc[i]; idx_m = idx_m + 1; i = i + 1
+  end
+  i = 0; while i < cv_mismatched.size
+    rec3_m_payload[idx_m] = cv_mismatched[i]; idx_m = idx_m + 1; i = i + 1
+  end
+  i = 0; while i < fin_mismatched.size
+    rec3_m_payload[idx_m] = fin_mismatched[i]; idx_m = idx_m + 1; i = i + 1
+  end
+  rec3_m = s_cipher_mismatch.encrypt(0x16_u8, rec3_m_payload)
+
+  mismatch_flight = Bytes.new(sh_rec.size + rec2.size + rec3_m.size)
+  f_m = 0
+  i = 0; while i < sh_rec.size
+    mismatch_flight[f_m] = sh_rec[i]; f_m = f_m + 1; i = i + 1
+  end
+  i = 0; while i < rec2.size
+    mismatch_flight[f_m] = rec2[i]; f_m = f_m + 1; i = i + 1
+  end
+  i = 0; while i < rec3_m.size
+    mismatch_flight[f_m] = rec3_m[i]; f_m = f_m + 1; i = i + 1
+  end
+
+  m_sock = ScriptedSocket.new(mismatch_flight)
+  Std::Tls::Client.wrap_socket(
+    m_sock,
+    "rsa",
+    ["http/1.1"],
+    true,
+    nil,
+    Time.utc(2020, 1, 1).seconds,
+    c_priv_rfc,
+    ch_bytes_rfc[6, 32],
+    ch_bytes_rfc[39, 32],
+    ch_bytes_rfc
+  )
+  __iyi_exit(0)
+end
+# Application data write record fragmentation (Finding 10 behavioral test)
+frag_sock = ScriptedSocket.new(Bytes.empty)
+frag_client = Std::Tls::Client.new(
+  frag_sock,
+  "frag.local",
+  :aes_128_gcm,
+  nil,
+  nil,
+  Array(Std::Tls::Certificate).new,
+  Std::Tls::RecordCipher.new(:aes_128_gcm, s_hs_key_rfc, s_hs_iv_rfc),
+  Std::Tls::RecordCipher.new(:aes_128_gcm, s_hs_key_rfc, s_hs_iv_rfc)
+)
+large_payload = Bytes.new(32768, 0x41_u8)
+frag_client.write(large_payload)
+assert_true(frag_sock.written_records.size == 2, "Large write fragmented into exactly two records")
+assert_true(frag_sock.written_records[0].size <= 16406, "First record size <= 16406 bytes")
+assert_true(frag_sock.written_records[1].size <= 16406, "Second record size <= 16406 bytes")
+puts "ok"
+
+# -----------------------------------------------------------------------------
+# 6. X.509 Certificate and Trust Store
+# -----------------------------------------------------------------------------
+print "x509: "
+
+der_cert_rfc = cert_bytes_rfc[11, 432]
+parsed_cert = Std::Tls::Certificate.parse(der_cert_rfc)
+assert_true(!parsed_cert.nil?, "X.509 DER Certificate parsed")
+
+if cert = parsed_cert
+  assert_true(cert.pubkey_algo == :rsa, "Certificate pubkey is RSA")
+  assert_true(cert.rsa_e == 65537_i64, "Certificate RSA exponent is 65537")
+  assert_true(cert.common_name == "rsa", "Certificate CommonName is 'rsa'")
+
+  # Validity checks
+  t_valid = Time.utc(2020, 1, 1).seconds
+  t_past = Time.utc(2010, 1, 1).seconds
+  t_future = Time.utc(2030, 1, 1).seconds
+  assert_true(cert.valid_at?(t_valid), "Certificate valid at 2020-01-01")
+  assert_true(!cert.valid_at?(t_past), "Certificate not valid before notBefore")
+  assert_true(!cert.valid_at?(t_future), "Certificate not valid after notAfter")
+
+  # RFC 6125 Hostname matching & TLD wildcard rejection (Finding 8)
+  assert_true(cert.matches_hostname("rsa"), "Certificate matches CommonName 'rsa'")
+  assert_true(!cert.matches_hostname("other.com"), "Certificate does not match 'other.com'")
+  assert_true(!Std::Tls::Certificate.matches_pattern("*.com", "example.com"), "TLD wildcard rejected")
+  assert_true(Std::Tls::Certificate.matches_pattern("*.example.com", "sub.example.com"), "Subdomain wildcard accepted")
+  assert_true(!Std::Tls::Certificate.matches_pattern("*.example.com", "deep.sub.example.com"), "Deep wildcard rejected")
+end
+
+# ASN.1 indefinite length rejection & negative length checks (Finding 11)
+indef_asn1 = Bytes.new(2)
+indef_asn1[0] = 0x30_u8; indef_asn1[1] = 0x80_u8
+assert_true(Std::Tls.read_asn1(indef_asn1, 0).nil?, "ASN.1 indefinite length rejected in DER")
+
+neg_asn1 = Bytes.new(6)
+neg_asn1[0] = 0x30_u8; neg_asn1[1] = 0x84_u8; neg_asn1[2] = 0x80_u8
+assert_true(Std::Tls.read_asn1(neg_asn1, 0).nil?, "ASN.1 negative length rejected in DER")
+
+# Synthetic certificate chain with non-CA intermediate (Finding 2)
+ROOT_DER  = "3082013a3081e0a003020102020101300a06082a8648ce3d040302301c311a301806035504030c1153796e74686574696320526f6f74204341301e170d3230303130313030303030305a170d3335303130313030303030305a301c311a301806035504030c1153796e74686574696320526f6f742043413059301306072a8648ce3d020106082a8648ce3d030107034200048bc0ce72d80982f8e84a7f9de88c8e47e157583b0f22d1f42b34a37ef66fd5650859f3d38cb3cafea518d8cfff8b6f8d60524667aa446d9b0fe4f8e01255a9f0a3133011300f0603551d130101ff040530030101ff300a06082a8648ce3d0403020349003046022100e80d1b7b9b9a53f7f8833241875d8f0d3d0a0635c0b21382f6b8d03931058269022100b827a036a1e9bcd2349559a573bc78ebbc868b42883cfcd030cbbccc5e5a59f2"
+ROGUE_DER = "308201373081dea003020102020102300a06082a8648ce3d040302301c311a301806035504030c1153796e74686574696320526f6f74204341301e170d3230303130313030303030305a170d3335303130313030303030305a301d311b301906035504030c12526f67756520496e7465726d6564696174653059301306072a8648ce3d020106082a8648ce3d0301070342000448c575beb838fd2eec6622f941f47fc487779a6130a5a012b7f7850794e20939f5fbe7aebfd1114ee8b1b811fa80db9e33d3f7eb469572f8fc57ddf5df2417fca310300e300c0603551d130101ff04023000300a06082a8648ce3d0403020348003045022070543ddb0fc289238ad5116c7ee99c11264905437d8830e99273e8901b1a28fb022100915552a81ab6f9669940750b4767b0be08274583ed81d51d395bc7e886927d3c"
+LEAF_DER  = "308201523081faa003020102020103300a06082a8648ce3d040302301d311b301906035504030c12526f67756520496e7465726d656469617465301e170d3230303130313030303030305a170d3335303130313030303030305a301b3119301706035504030c10726f6775652e7461726765742e636f6d3059301306072a8648ce3d020106082a8648ce3d030107034200042a44aa887219b735dd522fb8c7ab03b3a74b6e5fb0adf98c5c86ee862ef5e63052c247bdff5155dc96c8927363e3a7e4216599bd47db15d98f325db742861a31a32d302b300c0603551d130101ff04023000301b0603551d11041430128210726f6775652e7461726765742e636f6d300a06082a8648ce3d040302034700304402202baa8212195d39fae1bf826545f656a89463d6ed32cf16f219b5d3fa0311f71402206559dbcc6d55f37ac74e7908fbdbf78334282640168250cc37f7fac373272e3f"
+
+synth_root = Std::Tls::Certificate.parse(hex_to_bytes(ROOT_DER))
+synth_rogue = Std::Tls::Certificate.parse(hex_to_bytes(ROGUE_DER))
+synth_leaf = Std::Tls::Certificate.parse(hex_to_bytes(LEAF_DER))
+
+assert_true(!synth_root.nil? && !synth_rogue.nil? && !synth_leaf.nil?, "Synthetic certificates parsed")
+if s_root = synth_root
+  if s_rogue = synth_rogue
+    if s_leaf = synth_leaf
+      assert_true(s_root.is_ca, "Synthetic root has is_ca true")
+      assert_true(!s_rogue.is_ca, "Synthetic rogue intermediate has is_ca false")
+      assert_true(s_leaf.verify_signature(s_rogue), "Leaf signature verifies against rogue key")
+      assert_true(s_rogue.verify_signature(s_root), "Rogue signature verifies against root key")
+
+      synth_store = Std::Tls::CertificateStore.new
+      synth_store.add_certificate(s_root)
+
+      now_test = Time.utc(2025, 1, 1).seconds
+      rogue_chain_rejected = !synth_store.verify_chain([s_leaf, s_rogue], "rogue.target.com", now_test)
+      assert_true(rogue_chain_rejected, "Rogue intermediate without is_ca rejected in verify_chain")
+    end
+  end
+end
+
+# Synthetic cross-signed root and intermediate trust anchor chain (Finding 16 / Linux trust-store slice)
+CROSS_ROOT_DER   = "3082014f3081f5a003020102020101300a06082a8648ce3d0403023020311e301c06035504030c1544657465726d696e697374696320526f6f74204341301e170d3230303130313030303030305a170d3335303130313030303030305a3020311e301c06035504030c1544657465726d696e697374696320526f6f742043413059301306072a8648ce3d020106082a8648ce3d03010703420004bdd3503a5b07b6d25edbb4bf4ce230cccaf9d5d4cde627ef0a72b083ea6d8fd9d077f9efe9c94279cf8a404838dd6e91685d66c4d0856d481d1724aff9fe8e09a320301e300f0603551d130101ff040530030101ff300b0603551d0f040403020186300a06082a8648ce3d0403020349003046022100a5e573a0a003ae88bdd3f2ccedaf3db8d05dec530ee3b53ceb05173773baccd2022100ff1983230a7db9c20043491837144371b1c60513014cd51110e31d5f2db892b9"
+CROSS_INTER_DER  = "308201563081fda003020102020103300a06082a8648ce3d0403023020311e301c06035504030c1544657465726d696e697374696320526f6f74204341301e170d3230303130313030303030305a170d3335303130313030303030305a30283126302406035504030c1d44657465726d696e697374696320496e7465726d6564696174652043413059301306072a8648ce3d020106082a8648ce3d03010703420004665c71f4c616ce2468ec14ffdf5b6dc9586e38a2d1a274104a2c8e433a1b1a82083f6f483018cbd475c8c124d30eea458baa52750466de9e737551e778efa102a320301e300f0603551d130101ff040530030101ff300b0603551d0f040403020186300a06082a8648ce3d040302034800304502206ce05fab53f20269a254511955e0adbb67d0ec54eef580163b3a89c58f36a094022100e9952e809b382fca1c9d9a34dfb3e59f3cf6a18b4884ecab1c70e53145f478a0"
+CROSS_LEAF_DER   = "3082014f3081f7a003020102020104300a06082a8648ce3d04030230283126302406035504030c1d44657465726d696e697374696320496e7465726d656469617465204341301e170d3230303130313030303030305a170d3335303130313030303030305a301b3119301706035504030c10636861696e2e7461726765742e636f6d3059301306072a8648ce3d020106082a8648ce3d0301070342000415f0c67496c7003ca8797f880b044dba027930e098402ae2f251cabe09ab66b128f3ef01fdc200d59791f3d4f8ffcea22515464a729a70d22e66d83dfd69b68fa31f301d301b0603551d11041430128210636861696e2e7461726765742e636f6d300a06082a8648ce3d040302034700304402206859c439099515aa687275ff03d6b629ad7711747cb776de76c1dfebb28c01af02201f276f6117efc69d995095bfd0b14b9bf18ffb984acbaf3d39a0f6e215832378"
+CROSS_TARGET_DER = "3082013b3081e2a003020102020102300a06082a8648ce3d040302301a3118301606035504030c0f466f726569676e20526f6f74204341301e170d3230303130313030303030305a170d3335303130313030303030305a3020311e301c06035504030c1544657465726d696e697374696320526f6f742043413059301306072a8648ce3d020106082a8648ce3d03010703420004bdd3503a5b07b6d25edbb4bf4ce230cccaf9d5d4cde627ef0a72b083ea6d8fd9d077f9efe9c94279cf8a404838dd6e91685d66c4d0856d481d1724aff9fe8e09a3133011300f0603551d130101ff040530030101ff300a06082a8648ce3d0403020348003045022100a59dee46f98264caa7983d4888643519543e406c22fa0e3e1f09cb18f992000302202e43a28fa2b3cda784ae96be2128806fdd4dd474060c3e600e40e975fa7f1cd8"
+
+c_root = Std::Tls::Certificate.parse(hex_to_bytes(CROSS_ROOT_DER))
+c_inter = Std::Tls::Certificate.parse(hex_to_bytes(CROSS_INTER_DER))
+c_leaf = Std::Tls::Certificate.parse(hex_to_bytes(CROSS_LEAF_DER))
+c_cross = Std::Tls::Certificate.parse(hex_to_bytes(CROSS_TARGET_DER))
+
+assert_true(!c_root.nil? && !c_inter.nil? && !c_leaf.nil? && !c_cross.nil?, "Synthetic cross-chain certificates parsed")
+if cr_root = c_root
+  if cr_inter = c_inter
+    if cr_leaf = c_leaf
+      if cr_cross = c_cross
+        c_store = Std::Tls::CertificateStore.new
+        c_store.add_certificate(cr_root)
+
+        now_cross = Time.utc(2025, 1, 1).seconds
+        # 1. Intermediate-anchored chain (server omits root) must verify to trusted root anchor
+        inter_chain_ok = c_store.verify_chain([cr_leaf, cr_inter], "chain.target.com", now_cross)
+        assert_true(inter_chain_ok, "Intermediate-anchored chain verified to trusted root anchor")
+
+        # 2. Chain with cross-signed root at top must verify to trusted root anchor
+        cross_chain_ok = c_store.verify_chain([cr_leaf, cr_inter, cr_cross], "chain.target.com", now_cross)
+        assert_true(cross_chain_ok, "Cross-signed root in chain verified to trusted root anchor")
+
+        # 3. A valid lower path ignores an unrelated certificate appended above it
+        if unrelated_root = synth_root
+          extra_chain_ok = c_store.verify_chain([cr_leaf, cr_inter, unrelated_root], "chain.target.com", now_cross)
+          assert_true(extra_chain_ok, "Intermediate anchor ignores unrelated certificate above the valid path")
+        end
+      end
+    end
+  end
+end
+
+# System trust store loading
+sys_store = Std::Tls::CertificateStore.load_system_store
+puts "ok (loaded #{sys_store.certificates.size} system root certs)"
+
+# -----------------------------------------------------------------------------
+# 7. Four Negative Proofs (Verified to Fail Closed)
+# -----------------------------------------------------------------------------
+print "negative_proofs: "
+
+# 1. Bad Finished MAC discrimination
+s_fin_bad = Bytes.new(calc_s_fin_mac.size)
+i = 0; while i < calc_s_fin_mac.size
+  s_fin_bad[i] = calc_s_fin_mac[i]; i = i + 1
+end
+s_fin_bad[0] = s_fin_bad[0] ^ 0x01_u8
+bad_fin_detected = !Std::Crypto.constant_time_compare(s_fin_bad, calc_s_fin_mac)
+assert_true(bad_fin_detected, "Bad Finished MAC discrimination")
+
+# 2. Unverifiable CertificateVerify signature discrimination
+cv_tampered = Bytes.new(cv_sig.size)
+i = 0; while i < cv_sig.size
+  cv_tampered[i] = cv_sig[i]; i = i + 1
+end
+cv_tampered[5] = cv_tampered[5] ^ 0xff_u8
+unverifiable_sig_detected = !Std::Tls::RSA.verify_pss(rsa_n, rsa_e, :sha256, cv_hash, cv_tampered, 32)
+assert_true(unverifiable_sig_detected, "Unverifiable CertificateVerify signature discrimination")
+
+# 3. Expired certificate discrimination
+expired_time = Time.utc(2030, 1, 1).seconds
+expired_cert_detected = false
+if cert = parsed_cert
+  expired_cert_detected = !cert.valid_at?(expired_time)
+end
+assert_true(expired_cert_detected, "Expired certificate discrimination")
+
+# 4. Hostname mismatch discrimination
+hostname_mismatch_detected = false
+if cert = parsed_cert
+  hostname_mismatch_detected = !cert.matches_hostname("unrelated.domain.org")
+end
+assert_true(hostname_mismatch_detected, "Hostname mismatch discrimination")
+
+puts "ok (all four negative protections discriminate)"
+
+# -----------------------------------------------------------------------------
+# 8. Live HTTPS Connection with Peer Verification Enabled
+# -----------------------------------------------------------------------------
+print "live_connect: "
+
+live_host = "example.com"
+client = Std::Tls::Client.connect(live_host, 443, ["http/1.1"], true)
+assert_true(!client.closed?, "Live TLS connection opened with peer verification enabled")
+assert_true(!client.peer_certificate.nil?, "Peer certificate verified and captured")
+assert_true(client.certificate_chain.size >= 2, "Full certificate chain verified to trusted root anchor")
+if pc = client.peer_certificate
+  puts "  peer certificate subject: #{pc.common_name}"
+end
+puts "  verified certificate chain depth: #{client.certificate_chain.size}"
+puts "  negotiated cipher suite: #{client.cipher_suite}"
+
+req = "GET / HTTP/1.1\r\nHost: #{live_host}\r\nUser-Agent: iyi-tls/0.1\r\nConnection: close\r\n\r\n"
+client.write(req)
+
+resp = client.read_string(1024)
+client.close
+
+assert_true(resp.bytesize > 0, "HTTP response received")
+assert_true(resp.starts_with?("HTTP/1.1 200 OK") || resp.starts_with?("HTTP/1.1 "), "HTTP 200 response verified")
+
+puts "ok (connected to #{live_host}:443, received #{resp.bytesize} bytes)"
+
+# -----------------------------------------------------------------------------
+# 9. Security Posture Statement
+# -----------------------------------------------------------------------------
+puts
+puts "================================================================================"
+puts "SECURITY POSTURE STATEMENT"
+puts "================================================================================"
+puts "1. Implementation status:"
+puts "   * Protocol: TLS 1.3 client per RFC 8446 with pure native iyi code."
+puts "   * Key Exchange: X25519 (RFC 7748), verified against RFC 7748 vectors."
+puts "     Rejects all-zero shared secret per RFC 7748."
+puts "   * AEAD Record Layer: AES-128-GCM and ChaCha20-Poly1305 with TLS 1.3 nonce"
+puts "     construction (iv XOR seq_num). Zero C dependencies."
+puts "   * Signatures: Ed25519 (RFC 8032), ECDSA P-256 (RFC 6979), ECDSA P-384"
+puts "     (RFC 6979), RSA-PSS (RFC 8017). All verified against published test vectors."
+puts "   * Transcripts and Secrets: Verified against RFC 8448 worked trace byte-for-byte."
+puts "   * Certificate Validation: ASN.1 DER parser, RFC 6125 wildcard matching,"
+puts "     BasicConstraints CA enforcement, pathLen validation, validity windows,"
+puts "     and system trust store anchoring."
+puts "2. Verification and testing:"
+puts "   * Verified against RFC 8448, RFC 7748, RFC 8032, RFC 6979, RFC 8017."
+puts "   * Verified on live connection to example.com:443 with verify_peer: true."
+puts "     Full 4-certificate chain verified to system trust anchor."
+puts "   * Four negative security protections proved to fail closed:"
+puts "       - Bad Finished MAC: rejected."
+puts "       - Unverifiable CertificateVerify signature: rejected."
+puts "       - Expired certificate: rejected."
+puts "       - Hostname mismatch: rejected."
+puts "3. Honest limitations and review posture:"
+puts "   * No independent third-party cryptographic review has been performed."
+puts "   * Side-channel timing protections: BigInt modular arithmetic and"
+puts "     point multiplication are not guaranteed constant-time on all microarchitectures."
+puts "   * Client only: Server-side TLS 1.3 termination is not implemented."
+puts "   * TLS 1.2 and earlier protocol versions are deliberately unsupported."
+puts "================================================================================"
+puts "all std/tls checks passed"

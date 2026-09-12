@@ -49,7 +49,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Build
+      - name: Build the compiler
         run: make crystal
 
       - uses: actions/upload-artifact@v4
@@ -74,11 +74,15 @@ jobs:
           path: .build
       - run: chmod +x .build/crystal
 
-      # Caught by hand once already, on files this fork wrote. `samples` is
-      # here because the formatter knows iyi now: before that it refused every
-      # `.iyi` file, so checking them would have checked nothing.
+      - name: Build iyi for its own checks
+        run: make -o .build/crystal iyi
+
+      # Each language owns its files. A green iyi format check must have run
+      # the iyi frontend rather than the compatibility frontend.
       - name: Formatted
-        run: ./bin/crystal tool format --check src spec samples
+        run: |
+          git ls-files -z '*.cr' | xargs -0 ./bin/crystal tool format --check
+          git ls-files -z '*.iyi' | xargs -0 ./bin/iyi tool format --check
 
       - name: iyi's own specs
         run: |
@@ -567,6 +571,16 @@ jobs:
       # step above.
       - name: The numbers the docs state
         run: python3 bench/doc_numbers.py --list
+
+      # Every failure proof works by breaking the library and requiring the
+      # exercise to notice. When the library moves underneath one, its patch
+      # stops matching, and a patch that breaks nothing lets the exercise pass
+      # while proving nothing. Each driver catches that at run time, but only
+      # for the platform and the exercise that ran: two proofs written on
+      # macOS matched nothing here for a week. This reads all of them in a
+      # second, including the drivers this job does not run.
+      - name: Every failure proof still patches the code it names
+        run: python3 bench/mutation_anchors.py
 
   std:
     needs: build

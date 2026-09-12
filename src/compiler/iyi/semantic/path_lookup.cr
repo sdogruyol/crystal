@@ -130,7 +130,21 @@ module Iyi
 
       # Try our namespace, unless we are the top-level
       if lookup_in_namespace && self != program
-        return namespace.lookup_path_item(name, false, lookup_in_namespace, include_private, location)
+        match = namespace.lookup_path_item(name, false, lookup_in_namespace, include_private, location)
+
+        # iyi: a sibling module's namespace is not a name this file can see.
+        # `module std/bool` makes a `Std::Bool` compilation unit, and a file
+        # that wrote `module std/set` shares the `Std` namespace with it
+        # without importing it. Reaching that unit from here would give `Bool`
+        # a different meaning in `std/set` than in any other file, decided by
+        # which siblings happen to be in the program - the coupling R-1 exists
+        # to refuse. So a unit found this way loses to the top-level type of
+        # the same name; a real type declared in the namespace does not.
+        if match.is_a?(ModuleType) && match.iyi_unit? && program.types[name]?
+          return program.lookup_path_item(name, false, false, include_private, location)
+        end
+
+        return match if match
       end
 
       nil

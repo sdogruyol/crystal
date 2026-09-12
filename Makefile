@@ -285,7 +285,8 @@ llvm_ext: $(LLVM_EXT_OBJ)
 
 .PHONY: format
 format: ## Format sources
-	./bin/crystal tool format$(if $(check), --check) src spec samples scripts
+	git ls-files -z '*.cr' | xargs -0 ./bin/crystal tool format$(if $(check), --check)
+	git ls-files -z '*.iyi' | xargs -0 ./bin/iyi tool format$(if $(check), --check)
 
 .PHONY: generate_data
 generate_data: ## Run generator scripts for Unicode, SSL config, ...
@@ -349,7 +350,7 @@ install_iyi: $(O)/iyi$(EXE) $(O)/$(IYI_DAEMON_BIN)
 	cp -R -p $(if $(deref_symlinks),-L,-P) src/. "$(DESTDIR)$(DATADIR)/iyi/crystal/"
 	rm -rf "$(DESTDIR)$(DATADIR)/iyi/crystal/iyi"
 # And `std/`, for the reason it is above under its own name: nothing in
-# Crystal's library requires `std/...`, the directory's 153 KB is a second
+# Crystal's library requires `std/...`, the directory's 1,868 KB is a second
 # copy of a library that already shipped, and while it is there it answers
 # `import std/text` out of `share/iyi/crystal` — which is how the accident
 # looked before `src/std` was installed at all, and which would let that
@@ -378,11 +379,19 @@ uninstall_iyi: ## iyi: remove what install_iyi installed
 # was slow.
 #
 # So it is asked of the binary rather than of the build: `--version` says which
-# it is.
+# it is. A binary that cannot answer is also a failed guard, not empty input for
+# `grep`: upload-artifact strips executable bits, and the old pipeline treated
+# that execution error as a release build.
 .PHONY: check_iyi_is_release
 check_iyi_is_release: $(O)/iyi$(EXE) $(O)/$(IYI_DAEMON_BIN)
 	@for bin in iyi$(EXE) $(IYI_DAEMON_BIN); do \
-	   if $(O)/$$bin --version | grep -q "not built in release mode"; then \
+	   version="$$("$(O)/$$bin" --version 2>&1)"; status=$$?; \
+	   if [ $$status -ne 0 ]; then \
+	     echo "$(O)/$$bin could not report its build mode:"; \
+	     printf '%s\n' "$$version"; \
+	     exit 1; \
+	   fi; \
+	   if printf '%s\n' "$$version" | grep -q "not built in release mode"; then \
 	     echo "$(O)/$$bin is not an optimised build, and a tarball ships what it packages."; \
 	     echo "It is up to date by file times, so make will not rebuild it. Force it:"; \
 	     echo "  make -B iyi iyi-daemon release=1"; \

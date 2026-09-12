@@ -1,0 +1,720 @@
+# Complete collections parity exercise for iyi standard library.
+# Exercises:
+#   1. Deque: double-ended queue, ring-buffer wraparound, growth, rotation, Indexable & Enumerable
+#   2. Set: complete set algebra, relations, mathematical identities, Enumerable
+#   3. Tuple & NamedTuple: compile-time indexing, properties, iteration, conversions, merge
+#   4. Slice & Bytes: bounded pointers, bounds-checks, sub-slices, mutations, Indexable & Enumerable
+#   5. Big numbers: BigInt (arithmetic, gcd, lcm, bitwise, shifts, pow_mod), BigDecimal, BigRational, BigFloat
+#   6. Enumerable: query and sequence methods across Array, Hash, Range, Deque, Set, Slice, List
+#   7. Hash: key-value dictionary, search, mutations, transformations, subset/superset, Enumerable
+#   8. Indexable & IndexableMutable: indexing, bounds, bsearch, update, swap, reverse, rotate, fill
+#   9. Iterator: lazy adaptors (map, select, take, skip, zip, chain), concrete iterators (Array, Range, Hash)
+#  10. Range: boundaries, inclusion, bsearch, step, Enumerable
+#  11. List: shareable immutable sequence, appended, concatenated, Enumerable
+#  12. Cmp & Traits: comparison hierarchy, min, max, clamp, Num arithmetic identities
+
+module bench/std_collections_parity_exercise
+
+import std/deque
+using std/deque::{Deque}
+import std/set
+using std/set::{Set}
+import std/tuple
+import std/slice
+using std/slice::{Slice, Bytes}
+import std/big
+using std/big::{BigInt, BigDecimal, BigRational, BigFloat}
+import std/enumerable
+using std/enumerable::{Enumerable}
+import std/indexable
+using std/indexable::{Indexable, IndexableMutable}
+import std/iterator
+using std/iterator::{Iterator}
+import std/list
+using std/list::{List}
+import std/traits
+using std/traits::{Cmp, Num, Hashable}
+import std/cmp
+
+def assert_true(cond : Bool, msg : String) : Nil
+  if !cond
+    raise "ASSERTION FAILED: #{msg}"
+  end
+end
+
+def assert_equal(expected : Int32, actual : Int32, msg : String) : Nil
+  if expected != actual
+    raise "ASSERTION FAILED: #{msg} (expected #{expected}, got #{actual})"
+  end
+end
+
+def assert_str_equal(expected : String, actual : String, msg : String) : Nil
+  if expected != actual
+    raise "ASSERTION FAILED: #{msg} (expected '#{expected}', got '#{actual}')"
+  end
+end
+
+# Check for probe mode from command line arguments
+mode = Program.args.size > 0 ? Program.args[0] : ""
+
+if mode == "probe_deque_out_of_range"
+  d = Deque(Int32).new
+  d.push(1)
+  d[5]
+elsif mode == "probe_deque_empty_pop"
+  d = Deque(Int32).new
+  d.pop
+elsif mode == "probe_deque_empty_shift"
+  d = Deque(Int32).new
+  d.shift
+elsif mode == "probe_deque_negative_capacity"
+  Deque(Int32).new(-1)
+elsif mode == "probe_bigint_div_zero"
+  a = BigInt.new(100)
+  b = BigInt.zero
+  a // b
+elsif mode == "probe_bigdec_div_zero"
+  a = BigDecimal.new("10.5")
+  b = BigDecimal.zero
+  a / b
+elsif mode == "probe_bigrat_div_zero"
+  BigRational.new(1, 0)
+elsif mode == "probe_slice_out_of_bounds"
+  s = Slice(Int32).new(3) { |i| i }
+  s[10]
+elsif mode == "probe_slice_readonly"
+  s = Slice(Int32).new(3, read_only: true)
+  s[0] = 99
+end
+
+# ===========================================================================
+# Section 1: Deque parity & ring buffer mechanics
+# ===========================================================================
+puts "== deque parity: operations, wraparound, indexable, and enumerable"
+
+d = Deque(Int32).new
+assert_true(d.empty?, "new deque is empty")
+assert_equal(0, d.size, "new deque size is 0")
+
+d.push(10)
+d.push(20)
+d.push(30)
+assert_equal(3, d.size, "size after 3 pushes")
+assert_equal(10, d.first, "first is 10")
+assert_equal(30, d.last, "last is 30")
+assert_equal(10, d[0], "d[0] is 10")
+assert_equal(30, d[-1], "d[-1] is 30")
+
+assert_equal(10, d.shift, "shift returns 10")
+assert_equal(20, d.shift, "shift returns 20")
+assert_equal(30, d.shift, "shift returns 30")
+assert_true(d.empty?, "deque is empty after shifting all")
+
+d.unshift(100)
+d.unshift(200)
+d.unshift(300)
+assert_equal(300, d[0], "d[0] is 300")
+assert_equal(200, d[1], "d[1] is 200")
+assert_equal(100, d[2], "d[2] is 100")
+assert_equal(100, d.pop, "pop returns 100")
+assert_equal(200, d.pop, "pop returns 200")
+assert_equal(300, d.pop, "pop returns 300")
+
+# Ring buffer wraparound and growth
+w1 = Deque(Int32).new(4)
+w1.push(1)
+w1.push(2)
+w1.push(3)
+w1.push(4)
+w1.shift   # removes 1
+w1.shift   # removes 2
+w1.push(5) # wraps
+w1.push(6) # wraps
+assert_equal(4, w1.size, "wrapped size is 4")
+assert_equal(3, w1[0], "wrapped w1[0]")
+assert_equal(4, w1[1], "wrapped w1[1]")
+assert_equal(5, w1[2], "wrapped w1[2]")
+assert_equal(6, w1[3], "wrapped w1[3]")
+
+# Grow while wrapped
+w1.push(7)
+w1.push(8)
+assert_equal(6, w1.size, "post-growth size")
+assert_equal(3, w1[0], "post-growth [0]")
+assert_equal(4, w1[1], "post-growth [1]")
+assert_equal(5, w1[2], "post-growth [2]")
+assert_equal(6, w1[3], "post-growth [3]")
+assert_equal(7, w1[4], "post-growth [4]")
+assert_equal(8, w1[5], "post-growth [5]")
+
+# Rotate, insert, delete_at, swap
+w1.rotate_in_place(2)
+assert_equal(5, w1[0], "rotated [0]")
+w1.insert(1, 999)
+assert_equal(999, w1[1], "inserted [1]")
+assert_equal(999, w1.delete_at(1), "deleted_at [1]")
+w1.swap(0, 1)
+assert_equal(6, w1[0], "swapped [0]")
+assert_equal(5, w1[1], "swapped [1]")
+
+# Indexable & Enumerable integration on Deque
+assert_true(w1.any? { |x| x == 8 }, "deque enumerable any?")
+assert_true(w1.none? { |x| x < 0 }, "deque enumerable none?")
+d_sort = Deque(Int32).new([1, 2, 3, 4, 5])
+assert_equal(3, d_sort.bsearch { |x| x >= 3 } || 0, "deque bsearch")
+vals = w1.values_at(0, 1)
+assert_equal(6, vals[0], "deque values_at [0]")
+assert_equal(5, vals[1], "deque values_at [1]")
+
+puts "deque parity: all passed"
+
+# ===========================================================================
+# Section 2: Set parity & algebra
+# ===========================================================================
+puts "== set parity: algebra and identities"
+
+s1 = Set(Int32).new([1, 2, 3, 4])
+s2 = Set(Int32).new([3, 4, 5, 6])
+
+union = s1 | s2
+assert_equal(6, union.size, "union size is 6")
+assert_true(union.includes?(1) && union.includes?(6), "union includes all")
+
+inter = s1 & s2
+assert_equal(2, inter.size, "intersection size is 2")
+assert_true(inter.includes?(3) && inter.includes?(4), "intersection elements")
+
+diff = s1 - s2
+assert_equal(2, diff.size, "difference size is 2")
+assert_true(diff.includes?(1) && diff.includes?(2), "difference elements")
+
+sym_diff = s1 ^ s2
+assert_equal(4, sym_diff.size, "symmetric difference size is 4")
+assert_true(sym_diff.includes?(1) && sym_diff.includes?(6), "sym diff elements")
+
+# Mathematical identities
+assert_equal(s1.size + s2.size, union.size + inter.size, "inclusion-exclusion")
+assert_true((s1 - s1).empty?, "self-difference is empty")
+assert_true((s1 ^ s1).empty?, "self-sym-diff is empty")
+assert_true(inter.subset_of?(s1), "intersection is subset")
+assert_true(s1.superset_of?(inter), "s1 is superset of intersection")
+assert_true((s1 - s2).disjoint?(s2), "difference is disjoint from other")
+
+# Enumerable integration on Set
+assert_true(s1.all? { |x| x > 0 }, "set all? positive")
+assert_true(s1.any? { |x| x == 2 }, "set any? 2")
+sum_s1 = 0
+s1.each { |x| sum_s1 = sum_s1 + x }
+assert_equal(10, sum_s1, "set each sum")
+
+puts "set parity: all passed"
+
+# ===========================================================================
+# Section 3: Tuple and NamedTuple parity
+# ===========================================================================
+puts "== tuple and named_tuple parity"
+
+t = {10, "hello", true}
+assert_equal(3, t.size, "tuple size is 3")
+assert_true(!t.empty?, "tuple not empty")
+assert_equal(10, t.first, "tuple first")
+assert_true(t.last, "tuple last")
+assert_str_equal("hello", t[1], "tuple [1]")
+
+t2 = {10, "hello", true}
+assert_true(t == t2, "tuple equality")
+t3 = {10, "world", true}
+assert_true(!(t == t3), "tuple inequality")
+
+# Concatenation and reverse
+t_cat = {1, 2} + {3, 4}
+assert_equal(4, t_cat.size, "tuple concat size")
+assert_equal(1, t_cat[0], "tuple concat [0]")
+assert_equal(4, t_cat[3], "tuple concat [3]")
+t_rev = {1, 2, 3}.reverse
+assert_equal(3, t_rev[0], "tuple reverse [0]")
+assert_equal(1, t_rev[2], "tuple reverse [2]")
+
+# NamedTuple
+nt = {name: "iyi", version: 1, active: true}
+assert_equal(3, nt.size, "named tuple size")
+assert_true(nt.has_key?(:name), "has_key? :name")
+assert_true(!nt.has_key?(:missing), "has_key? :missing false")
+assert_str_equal("iyi", nt[:name], "nt[:name]")
+assert_equal(1, nt[:version], "nt[:version]")
+assert_true(nt[:active], "nt[:active]")
+
+keys = nt.keys
+assert_equal(3, keys.size, "named tuple keys size")
+vals = nt.values
+assert_equal(3, vals.size, "named tuple values size")
+
+puts "tuple and named_tuple parity: all passed"
+
+# ===========================================================================
+# Section 4: Slice & Bytes parity
+# ===========================================================================
+puts "== slice and bytes parity"
+
+s = Slice(Int32).new(6) { |i| (i + 1) * 10 }
+assert_equal(6, s.size, "slice size 6")
+assert_equal(10, s.first, "slice first")
+assert_equal(60, s.last, "slice last")
+assert_equal(30, s[2], "slice [2]")
+assert_equal(60, s[-1], "slice [-1]")
+
+# Mutability and in-place manipulations
+s.swap(0, 5)
+assert_equal(60, s[0], "slice swapped [0]")
+assert_equal(10, s[5], "slice swapped [5]")
+s.swap(0, 5)
+assert_equal(10, s[0], "slice swapped back [0]")
+assert_equal(60, s[5], "slice swapped back [5]")
+
+# Slicing
+sub = s[1, 3]
+assert_equal(3, sub.size, "subslice size")
+assert_equal(20, sub[0], "subslice [0]")
+assert_equal(40, sub[2], "subslice [2]")
+
+# Copying
+dest = Slice(Int32).new(3)
+sub.copy_to(dest)
+assert_equal(20, dest[0], "dest copied [0]")
+assert_equal(40, dest[2], "dest copied [2]")
+
+# Indexable & Enumerable on Slice
+assert_equal(40, s.bsearch { |x| x >= 35 } || 0, "slice bsearch")
+assert_true(s.all? { |x| x > 0 }, "slice all?")
+assert_true(s.any? { |x| x == 50 }, "slice any?")
+
+# Bytes
+bytes = Bytes.new(4)
+bytes[0] = 0xDE_u8
+bytes[1] = 0xAD_u8
+bytes[2] = 0xBE_u8
+bytes[3] = 0xEF_u8
+assert_equal(4, bytes.size, "bytes size 4")
+assert_equal(0xDE_u8, bytes[0], "bytes [0]")
+assert_str_equal("deadbeef", bytes.hexstring, "bytes hexstring")
+
+# Array#to_slice
+arr_slice = [1, 2, 3].to_slice
+assert_equal(3, arr_slice.size, "arr_slice size")
+assert_equal(2, arr_slice[1], "arr_slice [1]")
+
+puts "slice and bytes parity: all passed"
+
+# ===========================================================================
+# Section 5: Big numbers parity (BigInt, BigDecimal, BigRational, BigFloat)
+# ===========================================================================
+puts "== big numbers parity: BigInt, BigDecimal, BigRational, BigFloat"
+
+# BigInt
+bi1 = 120_i64.to_big_i
+bi2 = 45_i64.to_big_i
+assert_str_equal("165", (bi1 + bi2).to_s, "bigint addition")
+assert_str_equal("75", (bi1 - bi2).to_s, "bigint subtraction")
+assert_str_equal("5400", (bi1 * bi2).to_s, "bigint multiplication")
+assert_str_equal("2", (bi1 // bi2).to_s, "bigint division")
+assert_str_equal("30", (bi1 % bi2).to_s, "bigint modulo")
+assert_str_equal("15", bi1.gcd(bi2).to_s, "bigint gcd")
+assert_str_equal("360", bi1.lcm(bi2).to_s, "bigint lcm")
+assert_str_equal("-121", (~bi1).to_s, "bigint bitwise NOT")
+assert_str_equal("14400", bi1.abs2.to_s, "bigint abs2")
+assert_str_equal("40", (bi1 & bi2).to_s, "bigint bitwise AND")
+assert_str_equal("125", (bi1 | bi2).to_s, "bigint bitwise OR")
+assert_str_equal("85", (bi1 ^ bi2).to_s, "bigint bitwise XOR")
+assert_str_equal("480", (bi1 << 2).to_s, "bigint shift left")
+assert_str_equal("30", (bi1 >> 2).to_s, "bigint shift right")
+assert_str_equal("1000000", (BigInt.new(10) ** 6).to_s, "bigint power")
+assert_str_equal("1", bi1.pow_mod(3_i64, 7_i64).to_s, "bigint pow_mod")
+assert_true(bi1 > bi2, "bigint comparison >")
+assert_true(bi2 < bi1, "bigint comparison <")
+assert_true(bi1 == BigInt.new(120), "bigint equality")
+
+# BigDecimal
+bd1 = BigDecimal.new("12.34")
+bd2 = BigDecimal.new("5.6")
+assert_str_equal("17.94", (bd1 + bd2).to_s, "bigdecimal addition")
+assert_str_equal("6.74", (bd1 - bd2).to_s, "bigdecimal subtraction")
+assert_str_equal("69.104", (bd1 * bd2).to_s, "bigdecimal multiplication")
+assert_str_equal("2.203571428571428571428", (bd1 / bd2).to_s, "bigdecimal division")
+assert_true(bd1 > bd2, "bigdecimal comparison")
+assert_true(bd1.positive?, "bigdecimal positive?")
+assert_str_equal("-12.34", bd1.negate.to_s, "bigdecimal negate")
+assert_equal(12, bd1.to_i32, "bigdecimal to_i32")
+
+# BigRational
+br1 = BigRational.new("7/3")
+br2 = BigRational.new("1/6")
+assert_str_equal("5/2", (br1 + br2).to_s, "bigrational addition")
+assert_str_equal("13/6", (br1 - br2).to_s, "bigrational subtraction")
+assert_str_equal("7/18", (br1 * br2).to_s, "bigrational multiplication")
+assert_str_equal("14", (br1 / br2).to_s, "bigrational division")
+assert_str_equal("3/7", br1.inv.to_s, "bigrational inv")
+assert_str_equal("49/9", (br1 ** 2).to_s, "bigrational power")
+assert_true(br1 > br2, "bigrational comparison")
+assert_equal(2, br1.to_big_i.to_i32, "bigrational to_big_i")
+
+# BigFloat
+bf1 = BigFloat.new("3.14159")
+bf2 = BigFloat.new("2.0")
+assert_str_equal("5.14159", (bf1 + bf2).to_s, "bigfloat addition")
+assert_str_equal("1.14159", (bf1 - bf2).to_s, "bigfloat subtraction")
+assert_str_equal("6.283180", (bf1 * bf2).to_s, "bigfloat multiplication")
+assert_true(bf1 > bf2, "bigfloat comparison")
+
+# Primitive conversion helpers
+assert_str_equal("42", 42.to_big_i.to_s, "int32 to_big_i")
+assert_str_equal("42", 42_i64.to_big_i.to_s, "int64 to_big_i")
+assert_str_equal("42", "42".to_big_i.to_s, "string to_big_i")
+assert_str_equal("3.14", "3.14".to_big_d.to_s, "string to_big_d")
+assert_str_equal("3/4", "3/4".to_big_r.to_s, "string to_big_r")
+
+puts "big numbers parity: all passed"
+
+# ===========================================================================
+# Section 6: Enumerable parity
+# ===========================================================================
+puts "== enumerable parity: query, transformation, and reduction"
+
+arr = [1, 2, 3, 4, 5, 6]
+
+# Query methods
+assert_true(arr.any? { |x| x == 4 }, "enum any?")
+assert_true(!arr.any? { |x| x == 99 }, "enum any? false")
+assert_true(arr.all? { |x| x > 0 }, "enum all?")
+assert_true(!arr.all? { |x| x > 3 }, "enum all? false")
+assert_true(arr.none? { |x| x < 0 }, "enum none?")
+assert_true(arr.one? { |x| x == 2 }, "enum one?")
+assert_true(!arr.one? { |x| x > 3 }, "enum one? false")
+assert_equal(3, arr.count { |x| x % 2 == 0 }, "enum count with block")
+assert_true(arr.includes?(5), "enum includes?")
+assert_equal(4, arr.find { |x| x > 3 }, "enum find")
+assert_true(arr.find? { |x| x > 100 }.nil?, "enum find? nil")
+assert_equal(5, arr.find_value { |x| x == 5 ? x : nil } || 0, "enum find_value")
+
+# Transformation & filtering
+mapped = arr.map { |x| x * 10 }
+assert_equal(10, mapped[0], "map [0]")
+assert_equal(60, mapped[5], "map [5]")
+
+evens = arr.select { |x| x % 2 == 0 }
+assert_equal(3, evens.size, "select size")
+assert_equal(2, evens[0], "select [0]")
+
+odds = arr.reject { |x| x % 2 == 0 }
+assert_equal(3, odds.size, "reject size")
+assert_equal(1, odds[0], "reject [0]")
+
+flat = arr.flat_map { |x| [x, x * 10] }
+assert_equal(12, flat.size, "flat_map size")
+assert_equal(1, flat[0], "flat_map [0]")
+assert_equal(10, flat[1], "flat_map [1]")
+
+# Reduction & statistics
+sum_val = arr.reduce(0) { |acc, x| acc + x }
+assert_equal(21, sum_val, "reduce sum")
+assert_equal(21, arr.sum, "enum sum")
+assert_equal(720, arr.product, "enum product")
+assert_equal(1, arr.min, "enum min")
+assert_equal(6, arr.max, "enum max")
+mm = arr.minmax
+assert_equal(1, mm[0], "minmax min")
+assert_equal(6, mm[1], "minmax max")
+
+# Grouping & indexing
+grouped = arr.group_by { |x| x % 2 == 0 ? "even" : "odd" }
+assert_equal(3, grouped["even"].size, "grouped even size")
+assert_equal(3, grouped["odd"].size, "grouped odd size")
+
+indexed = arr.index_by { |x| x * 10 }
+assert_equal(4, indexed[40], "indexed 40")
+
+# Slicing & chunking
+cons_count = 0
+arr.each_cons(2) { |_| cons_count = cons_count + 1 }
+assert_equal(5, cons_count, "each_cons count")
+
+slice_count = 0
+arr.each_slice(2) { |_| slice_count = slice_count + 1 }
+assert_equal(3, slice_count, "each_slice count")
+
+# Sorting
+unsorted = [4, 2, 5, 1, 3]
+sorted_arr = unsorted.sorted
+assert_equal(1, sorted_arr[0], "sorted [0]")
+assert_equal(5, sorted_arr[4], "sorted [4]")
+
+# Taking and skipping
+taken = arr.take(3)
+assert_equal(3, taken.size, "take size")
+assert_equal(3, taken[2], "take [2]")
+skipped = arr.skip(3)
+assert_equal(3, skipped.size, "skip size")
+assert_equal(4, skipped[0], "skip [0]")
+
+puts "enumerable parity: all passed"
+
+# ===========================================================================
+# Section 7: Hash parity
+# ===========================================================================
+puts "== hash parity: dictionary operations, transformations, and set-relations"
+
+h = {"a" => 1, "b" => 2, "c" => 3}
+assert_true(h.has_key?("b"), "hash has_key?")
+assert_true(!h.has_key?("z"), "hash has_key? false")
+assert_true(h.has_value?(2), "hash has_value?")
+assert_true(!h.has_value?(99), "hash has_value? false")
+assert_equal(2, h.fetch("b", 0), "hash fetch default")
+assert_equal(99, h.fetch("z", 99), "hash fetch fallback")
+assert_equal(42, h.fetch("z") { |k| 42 }, "hash fetch block")
+assert_str_equal("b", h.key_for(2), "hash key_for")
+assert_str_equal("b", h.key_for?(2) || "", "hash key_for?")
+
+# Merging
+h_merged = h.merge({"c" => 30, "d" => 4})
+assert_equal(4, h_merged.size, "merge size")
+assert_equal(30, h_merged["c"], "merge updated c")
+assert_equal(4, h_merged["d"], "merge added d")
+
+# Selection & rejection
+h_sel = h.select { |k, v| v > 1 }
+assert_equal(2, h_sel.size, "hash select size")
+assert_true(!h_sel.has_key?("a"), "hash select excludes a")
+
+h_rej = h.reject { |k, v| v > 1 }
+assert_equal(1, h_rej.size, "hash reject size")
+assert_true(h_rej.has_key?("a"), "hash reject keeps a")
+
+# Transformation
+h_tk = h.transform_keys { |k| k + "!" }
+assert_true(h_tk.has_key?("a!"), "transform_keys a!")
+h_tv = h.transform_values { |v| v * 100 }
+assert_equal(100, h_tv["a"], "transform_values 100")
+
+# Zip
+h_zip = Hash.zip(["one", "two"], [1, 2])
+assert_equal(1, h_zip["one"], "hash zip one")
+assert_equal(2, h_zip["two"], "hash zip two")
+
+# Boundary keys and values
+assert_str_equal("a", h.first_key, "first_key")
+assert_str_equal("c", h.last_key, "last_key")
+assert_equal(1, h.first_value, "first_value")
+assert_equal(3, h.last_value, "last_value")
+
+# Invert
+inv = h.invert
+assert_str_equal("a", inv[1], "invert [1]")
+assert_str_equal("b", inv[2], "invert [2]")
+
+# Subsets and supersets
+sub_h = {"a" => 1, "b" => 2}
+assert_true(sub_h.subset_of?(h), "subset_of?")
+assert_true(sub_h.proper_subset_of?(h), "proper_subset_of?")
+assert_true(h.superset_of?(sub_h), "superset_of?")
+assert_true(h.proper_superset_of?(sub_h), "proper_superset_of?")
+
+# Shift and clear
+h_mut = h.dup
+shifted = h_mut.shift
+assert_str_equal("a", shifted[0], "shifted key")
+assert_equal(1, shifted[1], "shifted value")
+assert_equal(2, h_mut.size, "size after shift")
+h_mut.clear
+assert_true(h_mut.empty?, "hash clear")
+
+# Enumerable integration on Hash
+assert_true(h.any? { |pair| pair[1] == 2 }, "hash enumerable any?")
+assert_true(h.all? { |pair| pair[1] > 0 }, "hash enumerable all?")
+
+puts "hash parity: all passed"
+
+# ===========================================================================
+# Section 8: Indexable and IndexableMutable parity
+# ===========================================================================
+puts "== indexable parity: searching, binary search, slicing, and mutation"
+
+arr_idx = [10, 20, 30, 40, 50, 60]
+
+# Search & binary search
+assert_equal(2, arr_idx.index(30) || -1, "index value")
+assert_equal(4, arr_idx.rindex(50) || -1, "rindex value")
+assert_equal(30, arr_idx.bsearch { |x| x >= 25 } || 0, "bsearch")
+assert_equal(2, arr_idx.bsearch_index { |x| x >= 25 } || -1, "bsearch_index")
+
+# Values_at and join
+va = arr_idx.values_at(0, 2, 4)
+assert_equal(10, va[0], "values_at [0]")
+assert_equal(30, va[1], "values_at [1]")
+assert_equal(50, va[2], "values_at [2]")
+assert_str_equal("10-20-30-40-50-60", arr_idx.join("-"), "indexable join")
+
+# IndexableMutable mutations on Array
+mut_arr = [1, 2, 3, 4, 5]
+mut_arr.update(2) { |x| x * 10 }
+assert_equal(30, mut_arr[2], "update at index")
+mut_arr.swap(0, 4)
+assert_equal(5, mut_arr[0], "swap [0]")
+assert_equal(1, mut_arr[4], "swap [4]")
+mut_arr.reverse_in_place
+assert_equal(1, mut_arr[0], "reverse_in_place [0]")
+assert_equal(5, mut_arr[4], "reverse_in_place [4]")
+mut_arr.rotate_in_place(1)
+assert_equal(4, mut_arr[0], "rotate_in_place [0]")
+mut_arr.fill(99, 1, 2)
+assert_equal(99, mut_arr[1], "fill range [1]")
+assert_equal(99, mut_arr[2], "fill range [2]")
+
+# Array mutations: insert, delete_at, delete_if, compact_in_place
+mut_arr.insert(1, 777)
+assert_equal(777, mut_arr[1], "array insert")
+assert_equal(777, mut_arr.delete_at(1), "array delete_at")
+mut_arr.delete_if { |x| x == 99 }
+assert_equal(3, mut_arr.size, "delete_if size")
+
+puts "indexable parity: all passed"
+
+# ===========================================================================
+# Section 9: Iterator parity
+# ===========================================================================
+puts "== iterator parity: lazy adaptors and concrete iterators"
+
+# Array iterator
+ai = Iterator.of([1, 2, 3])
+assert_equal(1, ai.next || 0, "ai next 1")
+assert_equal(2, ai.next || 0, "ai next 2")
+assert_equal(3, ai.next || 0, "ai next 3")
+assert_true(ai.next.nil?, "ai next exhausted")
+
+# Range iterator
+ri = Iterator.of(10..12)
+assert_equal(10, ri.next || 0, "ri next 10")
+assert_equal(11, ri.next || 0, "ri next 11")
+assert_equal(12, ri.next || 0, "ri next 12")
+assert_true(ri.next.nil?, "ri next exhausted")
+
+# Hash key and value iterators
+h_iter = {"alpha" => 1, "beta" => 2}
+ki = Iterator.of_keys(h_iter)
+assert_str_equal("alpha", ki.next || "", "ki next alpha")
+assert_str_equal("beta", ki.next || "", "ki next beta")
+assert_true(ki.next.nil?, "ki next nil")
+
+vi = Iterator.of_values(h_iter)
+assert_equal(1, vi.next || 0, "vi next 1")
+assert_equal(2, vi.next || 0, "vi next 2")
+assert_true(vi.next.nil?, "vi next nil")
+
+ei = Iterator.of_entries(h_iter)
+e1 = ei.next || {"", 0}
+assert_str_equal("alpha", e1[0], "ei entry 1 key")
+assert_equal(1, e1[1], "ei entry 1 val")
+
+# Lazy adaptor pipeline
+pipeline = Iterator.of([1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+  .select { |x| x % 2 == 0 }
+  .map { |x| x * 10 }
+  .take(3)
+
+p_res = pipeline.to_a
+assert_equal(3, p_res.size, "pipeline size 3")
+assert_equal(20, p_res[0], "pipeline [0]")
+assert_equal(40, p_res[1], "pipeline [1]")
+assert_equal(60, p_res[2], "pipeline [2]")
+
+# Step, cycle, with_index
+step_res = Iterator.of([1, 2, 3, 4, 5]).step(2).to_a
+assert_equal(3, step_res.size, "step size")
+assert_equal(1, step_res[0], "step [0]")
+assert_equal(3, step_res[1], "step [1]")
+assert_equal(5, step_res[2], "step [2]")
+
+indexed_iter = Iterator.of(["a", "b"]).with_index(10).to_a
+assert_equal(2, indexed_iter.size, "with_index size")
+t_idx0 = indexed_iter[0]
+assert_str_equal("a", t_idx0[0], "with_index item")
+assert_equal(10, t_idx0[1], "with_index offset")
+
+puts "iterator parity: all passed"
+
+# ===========================================================================
+# Section 10: Range parity
+# ===========================================================================
+puts "== range parity: boundaries, inclusion, and step"
+
+r_inc = 1..5
+r_exc = 1...5
+assert_equal(1, r_inc.begin, "r_inc begin")
+assert_equal(5, r_inc.end, "r_inc end")
+assert_true(!r_inc.exclusive?, "r_inc not exclusive")
+assert_true(r_exc.exclusive?, "r_exc exclusive")
+
+assert_true(r_inc.includes?(5), "r_inc includes 5")
+assert_true(!r_exc.includes?(5), "r_exc excludes 5")
+assert_true(r_inc.cover?(3), "r_inc cover? 3")
+assert_true(r_inc === 4, "r_inc === 4")
+
+# Range bsearch
+assert_equal(3, r_inc.bsearch { |x| x >= 3 } || 0, "range bsearch")
+
+# Range step
+step_vals = [] of Int32
+(1..10).step(3) { |x| step_vals << x }
+assert_equal(4, step_vals.size, "range step count")
+assert_equal(1, step_vals[0], "range step [0]")
+assert_equal(4, step_vals[1], "range step [1]")
+assert_equal(7, step_vals[2], "range step [2]")
+assert_equal(10, step_vals[3], "range step [3]")
+
+# Range Enumerable
+assert_true((1..5).all? { |x| x > 0 }, "range all?")
+assert_equal(15, (1..5).sum, "range sum")
+
+puts "range parity: all passed"
+
+# ===========================================================================
+# Section 11: List parity (immutable shareable sequence)
+# ===========================================================================
+puts "== list parity: immutable shareable sequence"
+
+lst = List(Int32).new([1, 2, 3])
+assert_equal(3, lst.size, "list size")
+assert_equal(1, lst.first, "list first")
+assert_equal(3, lst.last, "list last")
+assert_equal(2, lst.at(1), "list at")
+
+lst2 = lst.appended(4)
+assert_equal(3, lst.size, "original list unchanged")
+assert_equal(4, lst2.size, "appended list size 4")
+assert_equal(4, lst2.last, "appended list last 4")
+
+lst3 = lst.concatenated(List(Int32).new([10, 20]))
+assert_equal(5, lst3.size, "concatenated list size 5")
+assert_equal(10, lst3.at(3), "concatenated list [3]")
+
+# Enumerable on List
+assert_true(lst.any? { |x| x == 2 }, "list enumerable any?")
+assert_equal(6, lst.sum, "list enumerable sum")
+
+puts "list parity: all passed"
+
+# ===========================================================================
+# Section 12: Cmp and Traits parity
+# ===========================================================================
+puts "== cmp and traits parity"
+
+assert_equal(10, Std::Cmp.min(10, 20), "cmp min")
+assert_equal(20, Std::Cmp.max(10, 20), "cmp max")
+assert_equal(15, Std::Cmp.clamp(15, 10, 20), "cmp clamp inside")
+assert_equal(10, Std::Cmp.clamp(5, 10, 20), "cmp clamp low")
+assert_equal(20, Std::Cmp.clamp(25, 10, 20), "cmp clamp high")
+
+assert_true(10.between?(5, 15), "between? true")
+assert_true(!20.between?(5, 15), "between? false")
+
+puts "cmp and traits parity: all passed"
+
+puts "\nall collections checks passed"

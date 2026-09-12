@@ -1,0 +1,264 @@
+# Standard YAML 1.2 Core Schema library exercise.
+#
+#   ./bin/iyi run bench/std_yaml_exercise.iyi
+#
+# Exercises the entire YAML 1.2 Core Schema parser and emitter surface:
+# block mappings, block sequences, nested sequences at the same indentation level,
+# flow mappings, flow sequences, scalars (plain, single-quoted, double-quoted),
+# block scalars (| and >) with clip, strip (-), and keep (+) chomping,
+# the Norway problem (NO, no, off, y, n as strings),
+# sexagesimal (22:22) and version-like (1.2.3) scalars as strings,
+# leading zeros (0777) and underscores (1_000) as strings,
+# octal (0o777), hex (0x1f), floats (3.14, .inf, -.inf, .nan),
+# anchors, aliases, merge keys (<<),
+# multi-document streams, empty documents,
+# and emitter round-trip fidelity.
+
+import std/yaml
+using std/yaml::{YAML, Any}
+
+# 1. Block mappings and sequences
+block_text = "
+server:
+  host: 127.0.0.1
+  port: 8080
+  enabled: true
+tags:
+  - web
+  - api
+"
+doc1 = YAML.parse(block_text)
+raise "mapping: host" unless doc1["server"]["host"].as_s == "127.0.0.1"
+raise "mapping: port" unless doc1["server"]["port"].as_i == 8080
+raise "mapping: enabled" unless doc1["server"]["enabled"].as_bool == true
+raise "sequence: tag 0" unless doc1["tags"][0].as_s == "web"
+raise "sequence: tag 1" unless doc1["tags"][1].as_s == "api"
+raise "sequence: size" unless doc1["tags"].size == 2
+puts "    std/yaml: block mapping and sequence: verified"
+
+# 2. Sequence nested under mapping key at the SAME indentation level (Grammar Trap)
+same_indent_text = "
+fruits:
+- apple
+- banana
+vegetables:
+- carrot
+- daikon
+"
+doc_si = YAML.parse(same_indent_text)
+raise "same indent: fruits size" unless doc_si["fruits"].size == 2
+raise "same indent: fruits[0]" unless doc_si["fruits"][0].as_s == "apple"
+raise "same indent: fruits[1]" unless doc_si["fruits"][1].as_s == "banana"
+raise "same indent: veg size" unless doc_si["vegetables"].size == 2
+raise "same indent: veg[0]" unless doc_si["vegetables"][0].as_s == "carrot"
+raise "same indent: veg[1]" unless doc_si["vegetables"][1].as_s == "daikon"
+puts "    std/yaml: sequence nested at same indent: verified"
+
+# 3. The Norway problem and Core Schema tag resolution
+# YAML 1.1 treated NO, no, off, y, n as booleans.
+# YAML 1.2 Core Schema treats only true/True/TRUE and false/False/FALSE as booleans.
+norway_text = "
+country: NO
+flag_no: no
+flag_yes: yes
+status_off: off
+status_on: on
+short_n: n
+short_y: y
+bool_true: true
+bool_True: True
+bool_TRUE: TRUE
+bool_false: false
+bool_False: False
+bool_FALSE: FALSE
+null_tilde: ~
+null_word: null
+null_caps: NULL
+"
+doc_norway = YAML.parse(norway_text)
+raise "norway: country NO must be String" unless doc_norway["country"].as_s? == "NO"
+raise "norway: flag_no must be String" unless doc_norway["flag_no"].as_s? == "no"
+raise "norway: flag_yes must be String" unless doc_norway["flag_yes"].as_s? == "yes"
+raise "norway: status_off must be String" unless doc_norway["status_off"].as_s? == "off"
+raise "norway: status_on must be String" unless doc_norway["status_on"].as_s? == "on"
+raise "norway: short_n must be String" unless doc_norway["short_n"].as_s? == "n"
+raise "norway: short_y must be String" unless doc_norway["short_y"].as_s? == "y"
+
+raise "bool: true" unless doc_norway["bool_true"].as_bool == true
+raise "bool: True" unless doc_norway["bool_True"].as_bool == true
+raise "bool: TRUE" unless doc_norway["bool_TRUE"].as_bool == true
+raise "bool: false" unless doc_norway["bool_false"].as_bool == false
+raise "bool: False" unless doc_norway["bool_False"].as_bool == false
+raise "bool: FALSE" unless doc_norway["bool_FALSE"].as_bool == false
+
+raise "null: ~" unless doc_norway["null_tilde"].null?
+raise "null: null" unless doc_norway["null_word"].null?
+raise "null: NULL" unless doc_norway["null_caps"].null?
+puts "    std/yaml: norway problem and scalar resolution: verified"
+
+# 4. Sexagesimal, version-like, leading zeros, and underscores
+num_text = "
+time_entry: 22:22
+version_str: 1.2.3
+octal_no_prefix: 0777
+octal_core: 0o777
+underscore_num: 1_000
+hex_num: 0x2A
+dec_neg: -42
+dec_zero: 0
+float_val: 3.14159
+float_exp: 1.2e3
+inf_pos: .inf
+inf_neg: -.inf
+nan_val: .nan
+"
+doc_num = YAML.parse(num_text)
+raise "sexagesimal: 22:22 must be String" unless doc_num["time_entry"].as_s == "22:22"
+raise "version: 1.2.3 must be String" unless doc_num["version_str"].as_s == "1.2.3"
+raise "leading zero: 0777 must be String in 1.2 Core" unless doc_num["octal_no_prefix"].as_s == "0777"
+raise "octal: 0o777 must be Int64 511" unless doc_num["octal_core"].as_i == 511
+raise "underscore: 1_000 must be String in 1.2 Core" unless doc_num["underscore_num"].as_s == "1_000"
+raise "hex: 0x2A must be Int64 42" unless doc_num["hex_num"].as_i == 42
+raise "dec: -42" unless doc_num["dec_neg"].as_i == -42
+raise "dec: 0" unless doc_num["dec_zero"].as_i == 0
+raise "float: 3.14159" unless (doc_num["float_val"].as_f - 3.14159).abs < 0.00001
+raise "float: 1.2e3" unless (doc_num["float_exp"].as_f - 1200.0).abs < 0.00001
+raise "float: .inf" unless doc_num["inf_pos"].as_f > 1e308
+raise "float: -.inf" unless doc_num["inf_neg"].as_f < -1e308
+raise "float: .nan" unless doc_num["nan_val"].as_f != doc_num["nan_val"].as_f
+puts "    std/yaml: sexagesimal, version, leading zeros and underscores: verified"
+
+# 5. Block scalars and chomping indicators (| and > with clip, -, +)
+scalar_text = "
+literal_clip: |
+  first line
+  second line
+
+literal_strip: |-
+  first line
+  second line
+
+literal_keep: |+
+  first line
+  second line
+
+folded_clip: >
+  this is folded
+  into a single
+  line
+
+folded_strip: >-
+  this is folded
+  into a single
+  line
+"
+doc_scalar = YAML.parse(scalar_text)
+raise "block: literal clip" unless doc_scalar["literal_clip"].as_s == "first line\nsecond line\n"
+raise "block: literal strip" unless doc_scalar["literal_strip"].as_s == "first line\nsecond line"
+raise "block: literal keep" unless doc_scalar["literal_keep"].as_s == "first line\nsecond line\n"
+raise "block: folded clip" unless doc_scalar["folded_clip"].as_s == "this is folded into a single line\n"
+raise "block: folded strip" unless doc_scalar["folded_strip"].as_s == "this is folded into a single line"
+puts "    std/yaml: block scalars and chomping: verified"
+
+# 6. Flow collections and nesting
+flow_text = "
+flow_map: { a: 1, b: [2, 3], c: { d: \"hello, world\" } }
+flow_seq: [ 10, 20, [ 30, 40 ], { key: true, empty: null } ]
+single_quoted: 'can contain ''escaped'' quotes'
+double_quoted: \"escapes: \\n \\t \\\" \\u0041\"
+"
+doc_flow = YAML.parse(flow_text)
+raise "flow: map.a" unless doc_flow["flow_map"]["a"].as_i == 1
+raise "flow: map.b[0]" unless doc_flow["flow_map"]["b"][0].as_i == 2
+raise "flow: map.b[1]" unless doc_flow["flow_map"]["b"][1].as_i == 3
+raise "flow: map.c.d" unless doc_flow["flow_map"]["c"]["d"].as_s == "hello, world"
+raise "flow: seq[0]" unless doc_flow["flow_seq"][0].as_i == 10
+raise "flow: seq[2][1]" unless doc_flow["flow_seq"][2][1].as_i == 40
+raise "flow: seq[3].key" unless doc_flow["flow_seq"][3]["key"].as_bool == true
+raise "flow: seq[3].empty" unless doc_flow["flow_seq"][3]["empty"].null?
+raise "single quote" unless doc_flow["single_quoted"].as_s == "can contain 'escaped' quotes"
+raise "double quote" unless doc_flow["double_quoted"].as_s == "escapes: \n \t \" A"
+puts "    std/yaml: flow collections and nesting: verified"
+
+# 7. Anchors, aliases, and merge keys (<<)
+anchor_text = "
+default_db: &db_anchor
+  adapter: postgres
+  pool: 5
+  timeout: 30
+
+production:
+  <<: *db_anchor
+  database: prod_db
+  pool: 25
+
+staging:
+  <<: *db_anchor
+  database: stage_db
+"
+doc_anchors = YAML.parse(anchor_text)
+raise "merge: prod adapter" unless doc_anchors["production"]["adapter"].as_s == "postgres"
+raise "merge: prod pool overridden" unless doc_anchors["production"]["pool"].as_i == 25
+raise "merge: prod timeout" unless doc_anchors["production"]["timeout"].as_i == 30
+raise "merge: prod database" unless doc_anchors["production"]["database"].as_s == "prod_db"
+raise "merge: stage pool inherited" unless doc_anchors["staging"]["pool"].as_i == 5
+raise "merge: stage database" unless doc_anchors["staging"]["database"].as_s == "stage_db"
+puts "    std/yaml: anchors, aliases, and merge keys: verified"
+
+# 8. Multi-document streams and empty documents
+stream_text = "
+---
+# Document 1
+doc_id: 1
+name: first
+---
+# Document 2
+doc_id: 2
+name: second
+---
+# Document 3: empty document
+...
+"
+stream_docs = YAML.parse_all(stream_text)
+raise "stream: size" unless stream_docs.size == 3
+raise "stream: doc 1" unless stream_docs[0]["doc_id"].as_i == 1
+raise "stream: doc 2" unless stream_docs[1]["name"].as_s == "second"
+raise "stream: doc 3 empty" unless stream_docs[2].null?
+
+empty_doc = YAML.parse("")
+raise "empty doc must be nil" unless empty_doc.null?
+puts "    std/yaml: multi-document streams and empty documents: verified"
+
+# 9. Emitter round-trip
+original_data = Hash(Any, Any).new
+original_data[Any.new("app")] = Any.new("auth-service")
+original_data[Any.new("port")] = Any.new(9090)
+original_data[Any.new("enabled")] = Any.new(true)
+original_data[Any.new("country")] = Any.new("NO")
+original_data[Any.new("version")] = Any.new("1.2.3")
+
+sub_h = Hash(Any, Any).new
+sub_h[Any.new("user")] = Any.new("postgres")
+sub_h[Any.new("connections")] = Any.new(10)
+original_data[Any.new("db")] = Any.new(sub_h)
+
+tags = [] of Any
+tags << Any.new("prod")
+tags << Any.new("secure")
+original_data[Any.new("tags")] = Any.new(tags)
+
+dumped = YAML.dump(Any.new(original_data))
+parsed_back = YAML.parse(dumped)
+
+raise "roundtrip: app" unless parsed_back["app"].as_s == "auth-service"
+raise "roundtrip: port" unless parsed_back["port"].as_i == 9090
+raise "roundtrip: enabled" unless parsed_back["enabled"].as_bool == true
+raise "roundtrip: country" unless parsed_back["country"].as_s == "NO"
+raise "roundtrip: version" unless parsed_back["version"].as_s == "1.2.3"
+raise "roundtrip: db user" unless parsed_back["db"]["user"].as_s == "postgres"
+raise "roundtrip: db connections" unless parsed_back["db"]["connections"].as_i == 10
+raise "roundtrip: tags[0]" unless parsed_back["tags"][0].as_s == "prod"
+raise "roundtrip: tags[1]" unless parsed_back["tags"][1].as_s == "secure"
+puts "    std/yaml: emitter round-trip: verified"
+
+puts "all std/yaml checks passed"

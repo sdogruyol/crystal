@@ -81,6 +81,10 @@ module Iyi
         interpret_read_file(node, nilable: true)
       when "run"
         interpret_run(node)
+      when "ecr_process"
+        interpret_ecr_process(node)
+      when "ecr_process_string"
+        interpret_ecr_process_string(node)
       else
         nil
       end
@@ -299,6 +303,74 @@ module Iyi
           node.raise ex.to_s unless nilable
           @last = NilLiteral.new
         end
+      end
+    end
+
+    def interpret_ecr_process(node)
+      if node.args.size == 0
+        node.wrong_number_of_arguments "macro '::ecr_process'", 0, "1..2"
+      elsif node.args.size > 2
+        node.wrong_number_of_arguments "macro '::ecr_process'", node.args.size, "1..2"
+      end
+
+      node.args.first.accept self
+      original_filename = @last.to_macro_id
+
+      buffer_name = "__str__"
+      if node.args.size > 1
+        node.args[1].accept self
+        buffer_name = @last.to_macro_id
+      end
+
+      filepath = original_filename
+      unless File.file?(filepath)
+        if (loc = @location) && (orig = loc.original_filename)
+          dir = File.dirname(orig)
+          candidate = File.expand_path(original_filename, dir)
+          filepath = candidate if File.file?(candidate)
+        end
+      end
+
+      unless File.file?(filepath)
+        node.raise "error executing macro 'ecr_process': can't find file '#{original_filename}'"
+      end
+
+      begin
+        content = File.read(filepath)
+        processed = ::ECR.process_string(content, filepath, buffer_name)
+        @last = MacroId.new(processed)
+      rescue ex
+        node.raise "error processing ECR template '#{filepath}': #{ex.message}"
+      end
+    end
+
+    def interpret_ecr_process_string(node)
+      if node.args.size == 0
+        node.wrong_number_of_arguments "macro '::ecr_process_string'", 0, "1..3"
+      elsif node.args.size > 3
+        node.wrong_number_of_arguments "macro '::ecr_process_string'", node.args.size, "1..3"
+      end
+
+      node.args.first.accept self
+      template_string = @last.to_macro_id
+
+      filename = ""
+      if node.args.size > 1
+        node.args[1].accept self
+        filename = @last.to_macro_id
+      end
+
+      buffer_name = "__str__"
+      if node.args.size > 2
+        node.args[2].accept self
+        buffer_name = @last.to_macro_id
+      end
+
+      begin
+        processed = ::ECR.process_string(template_string, filename, buffer_name)
+        @last = MacroId.new(processed)
+      rescue ex
+        node.raise "error processing ECR template string: #{ex.message}"
       end
     end
 

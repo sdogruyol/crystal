@@ -55,7 +55,7 @@ class File
   end
 
   # The kernel wants a NUL it can walk. iyi's strings do not carry one.
-  private def self.c_path(path : String) : UInt8*
+  def self.c_path(path : String) : UInt8*
     n = path.bytesize
     buffer = Pointer(UInt8).malloc((n + 1).to_u64)
     buffer.copy_from(path.to_unsafe, n)

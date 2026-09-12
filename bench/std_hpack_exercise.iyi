@@ -1,0 +1,472 @@
+# Standard HPACK exercise: RFC 7541 compliance and security verification
+#
+# Covers:
+# 1. Integer representation (C.1.1, C.1.2, C.1.3, multi-byte, overflow)
+# 2. Canonical Huffman coding (Appendix B, C.4 authority hex, EOS rejection, padding checks)
+# 3. Header field representations (C.2.1, C.2.2, C.2.3, C.2.4)
+# 4. Request sequence without Huffman (C.3.1, C.3.2, C.3.3)
+# 5. Request sequence with Huffman (C.4.1, C.4.2, C.4.3)
+# 6. Response sequence without Huffman with FIFO eviction (C.5.1, C.5.2, C.5.3)
+# 7. Response sequence with Huffman with FIFO eviction (C.6.1, C.6.2, C.6.3)
+# 8. Dynamic table size updates & protocol settings enforcement
+# 9. Decompression bomb protection (list size bound, count bound)
+# 10. Invalid index detection & never-indexed persistence
+
+module bench/std_hpack_exercise
+
+import std/slice
+import std/hpack
+using std/slice::{Slice, Bytes}
+using std/hpack::{HeaderField, IndexingMode, HpackError, StaticTable, DynamicTable, Table, Integer, Huffman, Decoder, Encoder}
+
+def hex_to_bytes(hex : String) : Bytes
+  len = hex.bytesize // 2
+  Bytes.new(len) do |i|
+    c1 = hex.to_unsafe[i * 2].to_i32
+    c2 = hex.to_unsafe[i * 2 + 1].to_i32
+    v1 = c1 >= 97 ? c1 - 87 : (c1 >= 65 ? c1 - 55 : c1 - 48)
+    v2 = c2 >= 97 ? c2 - 87 : (c2 >= 65 ? c2 - 55 : c2 - 48)
+    ((v1 << 4) | v2).to_u8
+  end
+end
+
+def bytes_to_hex(bytes : Bytes) : String
+  hex_chars = "0123456789abcdef"
+  String.new(bytes.size * 2) do |buf|
+    i = 0
+    while i < bytes.size
+      b = bytes[i].to_i32
+      buf[i * 2] = hex_chars.to_unsafe[(b >> 4) & 15]
+      buf[i * 2 + 1] = hex_chars.to_unsafe[b & 15]
+      i = i + 1
+    end
+  end
+end
+
+def assert_eq(actual : String, expected : String, label : String) : Nil
+  if actual == expected
+    puts "  pass: #{label}"
+  else
+    puts "  FAIL: #{label} - expected #{expected}, got #{actual}"
+    raise "assertion failed: #{label}"
+  end
+end
+
+def assert_int(actual : Int32, expected : Int32, label : String) : Nil
+  if actual == expected
+    puts "  pass: #{label} (= #{actual})"
+  else
+    puts "  FAIL: #{label} - expected #{expected}, got #{actual}"
+    raise "assertion failed: #{label}"
+  end
+end
+
+def assert_bool(actual : Bool, expected : Bool, label : String) : Nil
+  if actual == expected
+    puts "  pass: #{label}"
+  else
+    puts "  FAIL: #{label} - expected #{expected}, got #{actual}"
+    raise "assertion failed: #{label}"
+  end
+end
+
+def main : Nil
+  puts "== integer representation (rfc 7541 c.1)"
+  # C.1.1: 10 with 5-bit prefix
+  b1 = Integer.encode(10_u64, 5, 0_u8)
+  assert_eq(bytes_to_hex(b1), "0a", "c.1.1 encode 10 with 5-bit prefix")
+  d1 = Integer.decode(b1, 0, 5)
+  if d1.is_a?(Tuple(UInt64, Int32))
+    assert_bool(d1[0] == 10_u64 && d1[1] == 1, true, "c.1.1 decode 10")
+  else
+    raise "c.1.1 decode failed"
+  end
+
+  # C.1.2: 1337 with 5-bit prefix
+  b2 = Integer.encode(1337_u64, 5, 0_u8)
+  assert_eq(bytes_to_hex(b2), "1f9a0a", "c.1.2 encode 1337 with 5-bit prefix")
+  d2 = Integer.decode(b2, 0, 5)
+  if d2.is_a?(Tuple(UInt64, Int32))
+    assert_bool(d2[0] == 1337_u64 && d2[1] == 3, true, "c.1.2 decode 1337")
+  else
+    raise "c.1.2 decode failed"
+  end
+
+  # C.1.3: 42 starting at octet boundary (8-bit prefix)
+  b3 = Integer.encode(42_u64, 8, 0_u8)
+  assert_eq(bytes_to_hex(b3), "2a", "c.1.3 encode 42 with 8-bit prefix")
+  d3 = Integer.decode(b3, 0, 8)
+  if d3.is_a?(Tuple(UInt64, Int32))
+    assert_bool(d3[0] == 42_u64 && d3[1] == 1, true, "c.1.3 decode 42")
+  else
+    raise "c.1.3 decode failed"
+  end
+
+  puts "== huffman coding (rfc 7541 appendix b)"
+  # Verify C.4.1 authority string www.example.com
+  h_auth = Huffman.encode("www.example.com")
+  assert_eq(bytes_to_hex(h_auth), "f1e3c2e5f23a6ba0ab90f4ff", "c.4.1 huffman encode www.example.com")
+  dec_auth = Huffman.decode(h_auth)
+  if dec_auth.is_a?(String)
+    assert_eq(dec_auth, "www.example.com", "c.4.1 huffman decode www.example.com")
+  else
+    raise "huffman decode failed"
+  end
+
+  # Roundtrip on mixed characters
+  test_str = "custom-key: custom-value / 12345 _ !~"
+  h_test = Huffman.encode(test_str)
+  dec_test = Huffman.decode(h_test)
+  if dec_test.is_a?(String)
+    assert_eq(dec_test, test_str, "huffman roundtrip mixed string")
+  else
+    raise "huffman roundtrip failed"
+  end
+
+  # Strict check 1: Reject EOS symbol in stream
+  # 30 bits of 1s (EOS) + 2 bits of 1s padding = 4 bytes of 0xff
+  eos_payload = Bytes.new(4, 0xff_u8)
+  err_eos = Huffman.decode(eos_payload)
+  assert_bool(err_eos.is_a?(HpackError), true, "huffman rejects EOS symbol")
+
+  # Strict check 2: Reject padding strictly longer than 7 bits
+  # 12 bytes of h_auth + 1 extra byte of 0xff (8 bits of 1s padding)
+  long_pad = Bytes.new(h_auth.size + 1) do |i|
+    i < h_auth.size ? h_auth[i] : 0xff_u8
+  end
+  err_long_pad = Huffman.decode(long_pad)
+  assert_bool(err_long_pad.is_a?(HpackError), true, "huffman rejects padding > 7 bits")
+
+  # Strict check 3: Reject padding containing 0 bit (not all 1s)
+  corrupt_pad = Bytes.new(h_auth.size) do |i|
+    i == h_auth.size - 1 ? (h_auth[i] ^ 1_u8) : h_auth[i]
+  end
+  err_corrupt_pad = Huffman.decode(corrupt_pad)
+  assert_bool(err_corrupt_pad.is_a?(HpackError), true, "huffman rejects non-1s padding")
+
+  puts "== header field representations (rfc 7541 c.2)"
+  # C.2.1 Literal with Incremental Indexing
+  c21_hex = "400a637573746f6d2d6b65790d637573746f6d2d686561646572"
+  dec21 = Decoder.new
+  res21 = dec21.decode(hex_to_bytes(c21_hex))
+  if res21.is_a?(Array(HeaderField))
+    assert_int(res21.size, 1, "c.2.1 decoded count")
+    assert_eq(res21[0].name, "custom-key", "c.2.1 decoded name")
+    assert_eq(res21[0].value, "custom-header", "c.2.1 decoded value")
+    assert_int(dec21.dynamic_table.size, 55, "c.2.1 dynamic table size 55")
+    assert_int(dec21.dynamic_table.length, 1, "c.2.1 dynamic table length 1")
+    # Encode back
+    enc21 = Encoder.new
+    enc21_bytes = enc21.encode(res21, force_huffman: false)
+    assert_eq(bytes_to_hex(enc21_bytes), c21_hex, "c.2.1 encode back matches hex")
+  else
+    raise "c.2.1 decode failed"
+  end
+
+  # C.2.2 Literal without Indexing
+  c22_hex = "040c2f73616d706c652f70617468"
+  dec22 = Decoder.new
+  res22 = dec22.decode(hex_to_bytes(c22_hex))
+  if res22.is_a?(Array(HeaderField))
+    assert_int(res22.size, 1, "c.2.2 decoded count")
+    assert_eq(res22[0].name, ":path", "c.2.2 decoded name")
+    assert_eq(res22[0].value, "/sample/path", "c.2.2 decoded value")
+    assert_int(dec22.dynamic_table.size, 0, "c.2.2 dynamic table empty")
+    enc22 = Encoder.new
+    enc22_bytes = enc22.encode(res22, force_huffman: false)
+    assert_eq(bytes_to_hex(enc22_bytes), c22_hex, "c.2.2 encode back matches hex")
+  else
+    raise "c.2.2 decode failed"
+  end
+
+  # C.2.3 Literal Never Indexed
+  c23_hex = "100870617373776f726406736563726574"
+  dec23 = Decoder.new
+  res23 = dec23.decode(hex_to_bytes(c23_hex))
+  if res23.is_a?(Array(HeaderField))
+    assert_int(res23.size, 1, "c.2.3 decoded count")
+    assert_eq(res23[0].name, "password", "c.2.3 decoded name")
+    assert_eq(res23[0].value, "secret", "c.2.3 decoded value")
+    assert_bool(res23[0].never_indexed, true, "c.2.3 never_indexed flag preserved")
+    assert_int(dec23.dynamic_table.size, 0, "c.2.3 dynamic table empty")
+    enc23 = Encoder.new
+    enc23_bytes = enc23.encode(res23, force_huffman: false)
+    assert_eq(bytes_to_hex(enc23_bytes), c23_hex, "c.2.3 encode back matches hex")
+  else
+    raise "c.2.3 decode failed"
+  end
+
+  # C.2.4 Indexed Header Field
+  c24_hex = "82"
+  dec24 = Decoder.new
+  res24 = dec24.decode(hex_to_bytes(c24_hex))
+  if res24.is_a?(Array(HeaderField))
+    assert_int(res24.size, 1, "c.2.4 decoded count")
+    assert_eq(res24[0].name, ":method", "c.2.4 decoded name")
+    assert_eq(res24[0].value, "GET", "c.2.4 decoded value")
+    assert_int(dec24.dynamic_table.size, 0, "c.2.4 dynamic table empty")
+    enc24 = Encoder.new
+    enc24_bytes = enc24.encode(res24, force_huffman: false)
+    assert_eq(bytes_to_hex(enc24_bytes), c24_hex, "c.2.4 encode back matches hex")
+  else
+    raise "c.2.4 decode failed"
+  end
+
+  puts "== request sequence without huffman (rfc 7541 c.3)"
+  dec3 = Decoder.new
+  enc3 = Encoder.new
+
+  # C.3.1 First Request
+  c31_hex = "828684410f7777772e6578616d706c652e636f6d"
+  req31 = dec3.decode(hex_to_bytes(c31_hex))
+  if req31.is_a?(Array(HeaderField))
+    assert_int(req31.size, 4, "c.3.1 header count")
+    assert_int(dec3.dynamic_table.size, 57, "c.3.1 dynamic table size 57")
+    enc31_bytes = enc3.encode(req31, force_huffman: false)
+    assert_eq(bytes_to_hex(enc31_bytes), c31_hex, "c.3.1 encode matches rfc hex")
+  else
+    raise "c.3.1 decode failed"
+  end
+
+  # C.3.2 Second Request
+  c32_hex = "828684be58086e6f2d6361636865"
+  req32 = dec3.decode(hex_to_bytes(c32_hex))
+  if req32.is_a?(Array(HeaderField))
+    assert_int(req32.size, 5, "c.3.2 header count")
+    assert_int(dec3.dynamic_table.size, 110, "c.3.2 dynamic table size 110")
+    assert_int(dec3.dynamic_table.length, 2, "c.3.2 dynamic table entries count")
+    enc32_bytes = enc3.encode(req32, force_huffman: false)
+    assert_eq(bytes_to_hex(enc32_bytes), c32_hex, "c.3.2 encode matches rfc hex")
+  else
+    raise "c.3.2 decode failed"
+  end
+
+  # C.3.3 Third Request
+  c33_hex = "828785bf400a637573746f6d2d6b65790c637573746f6d2d76616c7565"
+  req33 = dec3.decode(hex_to_bytes(c33_hex))
+  if req33.is_a?(Array(HeaderField))
+    assert_int(req33.size, 5, "c.3.3 header count")
+    assert_int(dec3.dynamic_table.size, 164, "c.3.3 dynamic table size 164")
+    assert_int(dec3.dynamic_table.length, 3, "c.3.3 dynamic table entries count")
+    enc33_bytes = enc3.encode(req33, force_huffman: false)
+    assert_eq(bytes_to_hex(enc33_bytes), c33_hex, "c.3.3 encode matches rfc hex")
+  else
+    raise "c.3.3 decode failed"
+  end
+
+  puts "== request sequence with huffman (rfc 7541 c.4)"
+  dec4 = Decoder.new
+  enc4 = Encoder.new(use_huffman: true)
+
+  # C.4.1 First Request
+  c41_hex = "828684418cf1e3c2e5f23a6ba0ab90f4ff"
+  req41 = dec4.decode(hex_to_bytes(c41_hex))
+  if req41.is_a?(Array(HeaderField))
+    assert_int(req41.size, 4, "c.4.1 header count")
+    assert_int(dec4.dynamic_table.size, 57, "c.4.1 dynamic table size 57")
+    enc41_bytes = enc4.encode(req41, force_huffman: true)
+    assert_eq(bytes_to_hex(enc41_bytes), c41_hex, "c.4.1 encode matches rfc hex")
+  else
+    raise "c.4.1 decode failed"
+  end
+
+  # C.4.2 Second Request
+  c42_hex = "828684be5886a8eb10649cbf"
+  req42 = dec4.decode(hex_to_bytes(c42_hex))
+  if req42.is_a?(Array(HeaderField))
+    assert_int(req42.size, 5, "c.4.2 header count")
+    assert_int(dec4.dynamic_table.size, 110, "c.4.2 dynamic table size 110")
+    enc42_bytes = enc4.encode(req42, force_huffman: true)
+    assert_eq(bytes_to_hex(enc42_bytes), c42_hex, "c.4.2 encode matches rfc hex")
+  else
+    raise "c.4.2 decode failed"
+  end
+
+  # C.4.3 Third Request
+  c43_hex = "828785bf408825a849e95ba97d7f8925a849e95bb8e8b4bf"
+  req43 = dec4.decode(hex_to_bytes(c43_hex))
+  if req43.is_a?(Array(HeaderField))
+    assert_int(req43.size, 5, "c.4.3 header count")
+    assert_int(dec4.dynamic_table.size, 164, "c.4.3 dynamic table size 164")
+    enc43_bytes = enc4.encode(req43, force_huffman: true)
+    assert_eq(bytes_to_hex(enc43_bytes), c43_hex, "c.4.3 encode matches rfc hex")
+  else
+    raise "c.4.3 decode failed"
+  end
+
+  puts "== response sequence without huffman and eviction (rfc 7541 c.5)"
+  dec5 = Decoder.new(max_table_size: 256, protocol_max_table_size: 256)
+  enc5 = Encoder.new(max_table_size: 256, protocol_max_table_size: 256, use_huffman: false)
+
+  # C.5.1 First Response
+  c51_hex = "4803333032580770726976617465611d4d6f6e2c203231204f637420323031332032303a31333a323120474d546e1768747470733a2f2f7777772e6578616d706c652e636f6d"
+  resp51 = dec5.decode(hex_to_bytes(c51_hex))
+  if resp51.is_a?(Array(HeaderField))
+    assert_int(resp51.size, 4, "c.5.1 header count")
+    assert_int(dec5.dynamic_table.size, 222, "c.5.1 dynamic table size 222")
+    assert_int(dec5.dynamic_table.length, 4, "c.5.1 dynamic table length 4")
+    enc51_bytes = enc5.encode(resp51, force_huffman: false)
+    assert_eq(bytes_to_hex(enc51_bytes), c51_hex, "c.5.1 encode matches rfc hex")
+  else
+    raise "c.5.1 decode failed"
+  end
+
+  # C.5.2 Second Response
+  c52_hex = "4803333037c1c0bf"
+  resp52 = dec5.decode(hex_to_bytes(c52_hex))
+  if resp52.is_a?(Array(HeaderField))
+    assert_int(resp52.size, 4, "c.5.2 header count")
+    assert_int(dec5.dynamic_table.size, 222, "c.5.2 dynamic table size 222 (after eviction)")
+    assert_int(dec5.dynamic_table.length, 4, "c.5.2 dynamic table length 4")
+    # Verify :status: 302 was evicted and :status: 307 is newest
+    entry1 = dec5.dynamic_table.get(1)
+    if entry1
+      assert_eq(entry1.value, "307", "c.5.2 entry 1 is 307")
+    else
+      raise "c.5.2 entry 1 is nil"
+    end
+    enc52_bytes = enc5.encode(resp52, force_huffman: false)
+    assert_eq(bytes_to_hex(enc52_bytes), c52_hex, "c.5.2 encode matches rfc hex")
+  else
+    raise "c.5.2 decode failed"
+  end
+
+  # C.5.3 Third Response
+  c53_hex = "88c1611d4d6f6e2c203231204f637420323031332032303a31333a323220474d54c05a04677a69707738666f6f3d4153444a4b48514b425a584f5157454f50495541585157454f49553b206d61782d6167653d333630303b2076657273696f6e3d31"
+  resp53 = dec5.decode(hex_to_bytes(c53_hex))
+  if resp53.is_a?(Array(HeaderField))
+    assert_int(resp53.size, 6, "c.5.3 header count")
+    assert_int(dec5.dynamic_table.size, 215, "c.5.3 dynamic table size 215")
+    assert_int(dec5.dynamic_table.length, 3, "c.5.3 dynamic table length 3")
+    enc53_bytes = enc5.encode(resp53, force_huffman: false)
+    assert_eq(bytes_to_hex(enc53_bytes), c53_hex, "c.5.3 encode matches rfc hex")
+  else
+    raise "c.5.3 decode failed"
+  end
+
+  puts "== response sequence with huffman and eviction (rfc 7541 c.6)"
+  dec6 = Decoder.new(max_table_size: 256, protocol_max_table_size: 256)
+  enc6 = Encoder.new(max_table_size: 256, protocol_max_table_size: 256, use_huffman: true)
+
+  # C.6.1 First Response
+  c61_hex = "488264025885aec3771a4b6196d07abe941054d444a8200595040b8166e082a62d1bff6e919d29ad171863c78f0b97c8e9ae82ae43d3"
+  resp61 = dec6.decode(hex_to_bytes(c61_hex))
+  if resp61.is_a?(Array(HeaderField))
+    assert_int(resp61.size, 4, "c.6.1 header count")
+    assert_int(dec6.dynamic_table.size, 222, "c.6.1 dynamic table size 222")
+    enc61_bytes = enc6.encode(resp61, force_huffman: true)
+    assert_eq(bytes_to_hex(enc61_bytes), c61_hex, "c.6.1 encode matches rfc hex")
+  else
+    raise "c.6.1 decode failed"
+  end
+
+  # C.6.2 Second Response
+  c62_hex = "4883640effc1c0bf"
+  resp62 = dec6.decode(hex_to_bytes(c62_hex))
+  if resp62.is_a?(Array(HeaderField))
+    assert_int(resp62.size, 4, "c.6.2 header count")
+    assert_int(dec6.dynamic_table.size, 222, "c.6.2 dynamic table size 222")
+    enc62_bytes = enc6.encode(resp62, force_huffman: true)
+    assert_eq(bytes_to_hex(enc62_bytes), c62_hex, "c.6.2 encode matches rfc hex")
+  else
+    raise "c.6.2 decode failed"
+  end
+
+  # C.6.3 Third Response
+  c63_hex = "88c16196d07abe941054d444a8200595040b8166e084a62d1bffc05a839bd9ab77ad94e7821dd7f2e6c7b335dfdfcd5b3960d5af27087f3672c1ab270fb5291f9587316065c003ed4ee5b1063d5007"
+  resp63 = dec6.decode(hex_to_bytes(c63_hex))
+  if resp63.is_a?(Array(HeaderField))
+    assert_int(resp63.size, 6, "c.6.3 header count")
+    assert_int(dec6.dynamic_table.size, 215, "c.6.3 dynamic table size 215")
+    enc63_bytes = enc6.encode(resp63, force_huffman: true)
+    assert_eq(bytes_to_hex(enc63_bytes), c63_hex, "c.6.3 encode matches rfc hex")
+  else
+    raise "c.6.3 decode failed"
+  end
+
+  puts "== security: dynamic table size updates and settings"
+  # Encoder changes table size: emits 001xxxxx update
+  enc_sec = Encoder.new(max_table_size: 4096)
+  enc_sec.set_max_table_size(512)
+  dummy_hdr = [HeaderField.new(":method", "GET")]
+  sec_bytes = enc_sec.encode(dummy_hdr)
+  # First byte should be 0x20 | 512 with 5-bit prefix -> 0x3f, followed by integer bytes
+  assert_bool((sec_bytes[0] & 0xe0_u8) == 0x20_u8, true, "table size update emitted with 001 prefix")
+  dec_sec = Decoder.new(max_table_size: 4096, protocol_max_table_size: 4096)
+  dec_sec_res = dec_sec.decode(sec_bytes)
+  assert_bool(dec_sec_res.is_a?(Array(HeaderField)), true, "table size update decoded successfully")
+  assert_int(dec_sec.dynamic_table.max_size, 512, "dynamic table max_size updated to 512")
+
+  # Table size update exceeding protocol SETTINGS_HEADER_TABLE_SIZE must fail
+  bad_table_update = Bytes.new(2)
+  # 0x3f with 5-bit prefix = 31, + 5000 continuation
+  buf_bad = [] of UInt8
+  Integer.encode(8192_u64, 5, 0x20_u8, buf_bad)
+  bad_bytes = Bytes.new(buf_bad.size) { |i| buf_bad[i] }
+  dec_strict = Decoder.new(max_table_size: 4096, protocol_max_table_size: 4096)
+  err_table_size = dec_strict.decode(bad_bytes)
+  assert_bool(err_table_size.is_a?(HpackError), true, "decoder rejects table size exceeding SETTINGS_HEADER_TABLE_SIZE")
+
+  puts "== security: decompression bomb defenses"
+  # 1. Header list total size limit
+  bomb_decoder = Decoder.new(max_header_list_size: 100) # strictly 100 bytes limit
+  bomb_enc = Encoder.new
+  # A header with 120 bytes value
+  big_val = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+  bomb_headers = [HeaderField.new("x-test", big_val)]
+  bomb_payload = bomb_enc.encode(bomb_headers)
+  bomb_res = bomb_decoder.decode(bomb_payload)
+  assert_bool(bomb_res.is_a?(HpackError), true, "decompression bomb: list size limit enforced")
+
+  # 2. Header count limit
+  count_decoder = Decoder.new(max_header_count: 5)
+  count_enc = Encoder.new
+  many_headers = [] of HeaderField
+  k = 0
+  while k < 10
+    many_headers << HeaderField.new("x-h-#{k}", "val")
+    k = k + 1
+  end
+  count_payload = count_enc.encode(many_headers)
+  count_res = count_decoder.decode(count_payload)
+  assert_bool(count_res.is_a?(HpackError), true, "decompression bomb: header count limit enforced")
+
+  puts "== security: invalid index and never-indexed persistence"
+  # Invalid index 0 in indexed field
+  zero_idx = Bytes.new(1, 0x80_u8) # indexed field with idx = 0
+  inv_dec = Decoder.new
+  err_zero = inv_dec.decode(zero_idx)
+  is_zero_err = false
+  if err_zero.is_a?(HpackError)
+    is_zero_err = err_zero.message.includes?("Invalid index 0")
+  end
+  assert_bool(is_zero_err, true, "index 0 in indexed field is rejected with invalid index message")
+
+  # Out of range index (> 61 when dynamic table empty)
+  out_of_range_idx = Bytes.new(1, 0x80_u8 | 62_u8) # index 62 when dynamic table has 0 entries
+  err_range = inv_dec.decode(out_of_range_idx)
+  assert_bool(err_range.is_a?(HpackError), true, "index > total table length is rejected")
+
+  # never_indexed persistence on re-encode
+  auth_header = HeaderField.new("authorization", "secret-token-12345", IndexingMode::NeverIndexed)
+  assert_bool(auth_header.never_indexed, true, "header created with never_indexed")
+  enc_auth = Encoder.new
+  auth_bytes = enc_auth.encode([auth_header])
+  # Ensure first byte starts with 0001 (0x10)
+  assert_bool((auth_bytes[0] & 0xf0_u8) == 0x10_u8, true, "never_indexed encoded with 0001 prefix")
+  # Dynamic table must be empty!
+  assert_int(enc_auth.dynamic_table.size, 0, "never_indexed not added to dynamic table on encode")
+  # Decode it
+  dec_auth_obj = Decoder.new
+  dec_auth_res = dec_auth_obj.decode(auth_bytes)
+  if dec_auth_res.is_a?(Array(HeaderField))
+    assert_bool(dec_auth_res[0].never_indexed, true, "never_indexed preserved through decoding")
+    assert_int(dec_auth_obj.dynamic_table.size, 0, "never_indexed not added to dynamic table on decode")
+  else
+    raise "failed to decode never_indexed header"
+  end
+
+  puts "all std/hpack checks passed"
+end
+
+main

@@ -1,0 +1,2097 @@
+# Standard regular expression library for iyi.
+#
+# Engine Architecture:
+# This engine implements a Thompson NFA simulation with a Pike VM and an
+# assertion pre-pass for lookaround, directly ported from iyi's compile-time
+# regex engine (`src/compiler/iyi/rx.cr`).
+#
+# Tradeoff and Decision:
+# A backtracking engine supports backreferences (\1, \2) and is simple, but is
+# subject to catastrophic exponential backtracking blowup on patterns with nested
+# quantifiers such as `(a+)+b` or `(a|aa)+b` against hostile input `aaaa...`.
+# In a web server, parser, or CLI tool handling untrusted user input, that
+# blowup produces an algorithmic denial of service (ReDoS).
+#
+# Following SPEC.md III.10, Appendix B decision 17, and RE2's guarantee, this
+# engine chooses the Thompson NFA simulation with Pike VM:
+#   - Strictly linear time: O(N * |prog|), where N is subject byte length and
+#     |prog| is instruction count.
+#   - State deduplication: a thread program counter joins a position at most
+#     once, capping work per character at |prog|.
+#   - Priority preservation: Split instruction explores the preferred branch
+#     first, producing exact leftmost-first match semantics matching PCRE2/Perl.
+#   - Full regular lookaround: `(?=...)`, `(?!...)`, `(?<=...)`, `(?<!...)`
+#     are evaluated as regular properties in a single pre-pass bitmap.
+#   - Deliberate omission: backreferences, recursion, and atomic groups are
+#     refused with a clear SyntaxError at pattern compilation time, because no
+#     simulation answers them in linear time.
+
+module std/regex
+
+import std/text
+
+pub class SyntaxError
+  getter message : String
+  getter position : Int32
+
+  def initialize(@message : String, @position : Int32 = 0)
+  end
+end
+
+def raise(error : SyntaxError) : NoReturn
+  raise error.message
+end
+
+alias LookMaps = Array(Array(Bool))
+
+# Built-in character sets
+enum Builtin : Int32
+  Digit
+  Word
+  Space
+  Horizontal
+  Vertical
+  Letter
+  Upper
+  Lower
+  Number
+  Mark
+
+  def ==(other : Builtin) : Bool
+    value == other.value
+  end
+
+  def ===(other : Builtin) : Bool
+    value == other.value
+  end
+end
+
+enum Anchor : Int32
+  LineStart
+  LineEnd
+  TextStart
+  TextEnd
+  TextEndNl
+  WordBorder
+  NotWordBorder
+
+  def ==(other : Anchor) : Bool
+    value == other.value
+  end
+
+  def ===(other : Anchor) : Bool
+    value == other.value
+  end
+end
+
+enum InstKind : Int32
+  Char
+  Class
+  Any
+  Split
+  Jmp
+  Again
+  Save
+  Match
+  Bol
+  Eol
+  Bot
+  Eot
+  EotNl
+  WordB
+  NotWordB
+  Look
+
+  def ==(other : InstKind) : Bool
+    value == other.value
+  end
+
+  def ===(other : InstKind) : Bool
+    value == other.value
+  end
+end
+
+struct Inst
+  getter kind : InstKind
+  property a : Int32
+  property b : Int32
+  getter fold : Bool
+
+  def initialize(@kind : InstKind, @a : Int32 = 0, @b : Int32 = 0, @fold : Bool = false)
+  end
+
+  def fold? : Bool
+    @fold
+  end
+end
+
+struct Member
+  getter lo : Char
+  getter hi : Char
+  getter builtin : Builtin?
+  getter negated : Bool
+
+  def initialize(@lo : Char, @hi : Char, @builtin : Builtin?, @negated : Bool)
+  end
+
+  def negated? : Bool
+    @negated
+  end
+
+  def self.range(lo : Char, hi : Char) : Member
+    Member.new(lo, hi, nil, false)
+  end
+
+  def self.builtin(kind : Builtin, negated : Bool) : Member
+    Member.new('\0', '\0', kind, negated)
+  end
+end
+
+class ClassData
+  getter members : Array(Member)
+  getter negated : Bool
+  getter fold : Bool
+  @non_ascii_members : Bool
+
+  def initialize(@members : Array(Member), @negated : Bool, @fold : Bool)
+    has_non_ascii = false
+    i = 0
+    while i < @members.size
+      m = @members[i]
+      if m.builtin.nil? && m.hi.ord > 127
+        has_non_ascii = true
+        break
+      end
+      i = i + 1
+    end
+    @non_ascii_members = has_non_ascii
+  end
+
+  def negated? : Bool
+    @negated
+  end
+
+  def fold? : Bool
+    @fold
+  end
+
+  def matches?(c : Char) : Bool
+    hit = false
+    i = 0
+    while i < @members.size
+      if hit?(members[i], c)
+        hit = true
+        break
+      end
+      i = i + 1
+    end
+    hit = fold_hit?(c) if !hit && @fold
+    hit != @negated
+  end
+
+  private def fold_hit?(c : Char) : Bool
+    if !@non_ascii_members && c.ord < 128
+      return false unless (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+      other = (c >= 'A' && c <= 'Z') ? (c.ord + 32).unsafe_chr : (c.ord - 32).unsafe_chr
+      i = 0
+      while i < @members.size
+        return true if hit?(@members[i], other)
+        i = i + 1
+      end
+      return false
+    end
+
+    folded = Regex.fold_char(c)
+    if candidate_hit?(c, folded)
+      return true
+    end
+    up = c.upcase
+    if up != c && candidate_hit?(c, up)
+      return true
+    end
+    down = c.downcase
+    if down != c && candidate_hit?(c, down)
+      return true
+    end
+    f_up = folded.upcase
+    if f_up != c && candidate_hit?(c, f_up)
+      return true
+    end
+
+    # Single character members: test fold against fold
+    i = 0
+    while i < @members.size
+      m = @members[i]
+      if m.builtin.nil? && m.lo == m.hi && Regex.fold_char(m.lo) == folded
+        return true
+      end
+      i = i + 1
+    end
+    false
+  end
+
+  private def candidate_hit?(c : Char, candidate : Char) : Bool
+    return false if candidate == c
+    return false unless Regex.fold_char(candidate) == Regex.fold_char(c)
+    i = 0
+    while i < @members.size
+      return true if hit?(@members[i], candidate)
+      i = i + 1
+    end
+    false
+  end
+
+  private def hit?(m : Member, c : Char) : Bool
+    if kind = m.builtin
+      inside = case kind
+               when Builtin::Digit
+                 c.digit?
+               when Builtin::Word
+                 Regex.word_char?(c)
+               when Builtin::Space
+                 Regex.space_char?(c)
+               when Builtin::Horizontal
+                 Regex.horizontal_space_char?(c)
+               when Builtin::Vertical
+                 Regex.vertical_space_char?(c)
+               when Builtin::Letter
+                 c.letter?
+               when Builtin::Upper
+                 c >= 'A' && c <= 'Z'
+               when Builtin::Lower
+                 c >= 'a' && c <= 'z'
+               when Builtin::Number
+                 c.digit?
+               when Builtin::Mark
+                 false
+               else
+                 false
+               end
+      inside != m.negated?
+    else
+      m.lo <= c && c <= m.hi
+    end
+  end
+end
+
+abstract class Node
+end
+
+class EmptyNode < Node
+end
+
+class CharNode < Node
+  getter char : Char
+  getter fold : Bool
+
+  def initialize(@char : Char, @fold : Bool)
+  end
+
+  def fold? : Bool
+    @fold
+  end
+end
+
+class AnyNode < Node
+end
+
+class ClassNode < Node
+  getter members : Array(Member)
+  getter negated : Bool
+  getter fold : Bool
+
+  def initialize(@members : Array(Member), @negated : Bool, @fold : Bool)
+  end
+
+  def negated? : Bool
+    @negated
+  end
+
+  def fold? : Bool
+    @fold
+  end
+end
+
+class AssertNode < Node
+  getter anchor : Anchor
+
+  def initialize(@anchor : Anchor)
+  end
+end
+
+class CatNode < Node
+  getter items : Array(Node)
+
+  def initialize(@items : Array(Node))
+  end
+end
+
+class AltNode < Node
+  getter alts : Array(Node)
+
+  def initialize(@alts : Array(Node))
+  end
+end
+
+class GroupNode < Node
+  getter body : Node
+  getter index : Int32?
+
+  def initialize(@body : Node, @index : Int32?)
+  end
+end
+
+class RepeatNode < Node
+  getter body : Node
+  getter min : Int32
+  getter max : Int32?
+  getter lazy : Bool
+  getter pos : Int32
+
+  def initialize(@body : Node, @min : Int32, @max : Int32?, @lazy : Bool, @pos : Int32)
+  end
+
+  def lazy? : Bool
+    @lazy
+  end
+end
+
+class LookNode < Node
+  getter index : Int32
+  getter negated : Bool
+
+  def initialize(@index : Int32, @negated : Bool)
+  end
+
+  def negated? : Bool
+    @negated
+  end
+end
+
+struct LookSpec
+  getter body : Node
+  getter ahead : Bool
+
+  def initialize(@body : Node, @ahead : Bool)
+  end
+
+  def ahead? : Bool
+    @ahead
+  end
+end
+
+class Budget
+  property spent : Int32
+
+  def initialize
+    @spent = 0
+  end
+end
+
+struct Assertion
+  getter prog : Array(Inst)
+  getter classes : Array(ClassData)
+  getter backward : Bool
+
+  def initialize(@prog : Array(Inst), @classes : Array(ClassData), @backward : Bool)
+  end
+
+  def backward? : Bool
+    @backward
+  end
+end
+
+# The compiled regular expression object.
+pub class Regex
+  MAX_REPEAT =    1000
+  MAX_PROG   = 200_000
+
+  getter source : String
+  getter ignore_case : Bool
+  @prog : Array(Inst)
+  @classes : Array(ClassData)
+  @group_count : Int32
+  @names : Hash(String, Int32)
+  @assertions : Array(Assertion)
+
+  def initialize(source : String, ignore_case : Bool = false)
+    @source = source
+    @ignore_case = ignore_case
+
+    parser = Parser.new(source, ignore_case)
+    root = parser.parse
+    budget = Budget.new
+    assertions = [] of Assertion
+    i = 0
+    while i < parser.looks.size
+      look = parser.looks[i]
+      body = look.ahead? ? Regex.reverse_node(look.body) : look.body
+      compiler = Compiler.new(budget)
+      res = compiler.compile_assertion(body)
+      assertions << Assertion.new(res[0], res[1], look.ahead?)
+      i = i + 1
+    end
+    compiler = Compiler.new(budget)
+    res = compiler.compile(root)
+    @prog = res[0]
+    @classes = res[1]
+    @group_count = parser.group_count
+    @names = parser.group_names
+    @assertions = assertions
+  end
+
+  def self.escape(str : String) : String
+    parts = [] of String
+    i = 0
+    size = str.bytesize
+    ptr = str.to_unsafe
+    while i < size
+      b = ptr[i]
+      case b
+      when 0x2E_u8, 0x5E_u8, 0x24_u8, 0x2A_u8, 0x2B_u8, 0x3F_u8, 0x28_u8, 0x29_u8, 0x5B_u8, 0x5D_u8, 0x7B_u8, 0x7D_u8, 0x7C_u8, 0x5C_u8
+        parts << "\\"
+        parts << b.unsafe_chr.to_s
+      else
+        parts << b.unsafe_chr.to_s
+      end
+      i = i + 1
+    end
+    parts.join("")
+  end
+
+  def match(subject : String, start : Int32 = 0) : MatchData?
+    return nil unless 0 <= start && start <= subject.bytesize
+    match_at(subject, start, look_maps(subject))
+  end
+
+  def match?(subject : String, start : Int32 = 0) : Bool
+    !match(subject, start).nil?
+  end
+
+  def =~(subject : String) : Int32?
+    m = match(subject)
+    m ? m.begin(0) : nil
+  end
+
+  def scan(subject : String) : Array(MatchData)
+    found = [] of MatchData
+    looks = look_maps(subject)
+    size = subject.bytesize
+    pos = 0
+    ptr = subject.to_unsafe
+    while pos <= size
+      m = match_at(subject, pos, looks)
+      break unless m
+      found << m
+      from_idx = m.begin(0)
+      to_idx = m.end(0)
+      from = from_idx ? from_idx : pos
+      to = to_idx ? to_idx : pos
+      if to > from
+        pos = to
+      elsif from < size
+        w = Regex.char_width(ptr, from, size)
+        pos = from + w
+      else
+        break
+      end
+    end
+    found
+  end
+
+  def scan(subject : String, & : MatchData -> Nil) : Nil
+    matches = scan(subject)
+    i = 0
+    while i < matches.size
+      yield matches[i]
+      i = i + 1
+    end
+  end
+
+  def split(subject : String) : Array(String)
+    parts = [] of String
+    looks = look_maps(subject)
+    size = subject.bytesize
+    ptr = subject.to_unsafe
+    field = 0
+    pos = 0
+    while pos < size
+      m = match_at(subject, pos, looks)
+      break unless m
+      from_idx = m.begin(0)
+      to_idx = m.end(0)
+      from = from_idx ? from_idx : pos
+      to = to_idx ? to_idx : pos
+
+      if to == field
+        pos = to + Regex.char_width(ptr, to, size)
+        next
+      end
+
+      parts << Regex.byte_slice(subject, field, from)
+      field = to
+      g = 1
+      while g <= m.group_count
+        text = m[g]
+        parts << text if text
+        g = g + 1
+      end
+      pos = to
+      pos = to + Regex.char_width(ptr, to, size) if to == from
+    end
+    parts << Regex.byte_slice(subject, field, size)
+    parts
+  end
+
+  def sub(subject : String, replacement : String) : String
+    sub(subject) { |m| Regex.expand_replacement(m, replacement) }
+  end
+
+  def sub(subject : String, &block : MatchData -> String) : String
+    m = match(subject, 0)
+    return subject unless m
+    parts = [] of String
+    from_idx = m.begin(0)
+    to_idx = m.end(0)
+    from = from_idx ? from_idx : 0
+    to = to_idx ? to_idx : 0
+    parts << Regex.byte_slice(subject, 0, from)
+    parts << block.call(m)
+    parts << Regex.byte_slice(subject, to, subject.bytesize)
+    parts.join("")
+  end
+
+  def gsub(subject : String, replacement : String) : String
+    gsub(subject) { |m| Regex.expand_replacement(m, replacement) }
+  end
+
+  def gsub(subject : String, &block : MatchData -> String) : String
+    parts = [] of String
+    looks = look_maps(subject)
+    size = subject.bytesize
+    ptr = subject.to_unsafe
+    pos = 0
+    while pos <= size
+      m = match_at(subject, pos, looks)
+      break unless m
+      from_idx = m.begin(0)
+      to_idx = m.end(0)
+      from = from_idx ? from_idx : pos
+      to = to_idx ? to_idx : pos
+      parts << Regex.byte_slice(subject, pos, from)
+      parts << block.call(m)
+      if to > from
+        pos = to
+      elsif from < size
+        w = Regex.char_width(ptr, from, size)
+        parts << Regex.byte_slice(subject, from, from + w)
+        pos = from + w
+      else
+        pos = to
+        break
+      end
+    end
+    parts << Regex.byte_slice(subject, pos, size)
+    parts.join("")
+  end
+
+  def look_maps(subject : String) : LookMaps
+    Regex.compute_look_maps(@assertions, subject)
+  end
+
+  def match_at(subject : String, start : Int32, looks : LookMaps) : MatchData?
+    return nil unless 0 <= start && start <= subject.bytesize
+    vm = VM.new(@prog, @classes, @group_count, looks)
+    slots = vm.run(subject, start)
+    return nil unless slots
+    MatchData.new(subject, slots, @group_count, @names)
+  end
+
+  def self.reverse_node(n : Node) : Node
+    case n
+    when CatNode
+      rev_items = [] of Node
+      i = n.items.size - 1
+      while i >= 0
+        rev_items << reverse_node(n.items[i])
+        i = i - 1
+      end
+      CatNode.new(rev_items)
+    when AltNode
+      rev_alts = [] of Node
+      i = 0
+      while i < n.alts.size
+        rev_alts << reverse_node(n.alts[i])
+        i = i + 1
+      end
+      AltNode.new(rev_alts)
+    when GroupNode
+      GroupNode.new(reverse_node(n.body), n.index)
+    when RepeatNode
+      RepeatNode.new(reverse_node(n.body), n.min, n.max, n.lazy?, n.pos)
+    else
+      n
+    end
+  end
+
+  def self.char_eq?(got : Char, want : Char, fold : Bool) : Bool
+    return true if got == want
+    return false unless fold
+    fold_char(got) == fold_char(want)
+  end
+
+  def self.fold_char(c : Char) : Char
+    code = c.ord
+    return (code | 0x20).unsafe_chr if 0x41 <= code && code <= 0x5A
+    return c if code < 0x80
+    c.downcase
+  end
+
+  def self.word_char?(c : Char) : Bool
+    c.alphanumeric? || c == '_'
+  end
+
+  def self.space_char?(c : Char) : Bool
+    c.whitespace? || c == '\u{0085}' || c == '\v' || c == '\f'
+  end
+
+  def self.horizontal_space_char?(c : Char) : Bool
+    c == '\t' || c == ' ' || c == '\u{00A0}' || c == '\u{1680}' || c == '\u{202F}' || c == '\u{205F}' || c == '\u{3000}' || (c >= '\u{2000}' && c <= '\u{200A}')
+  end
+
+  def self.vertical_space_char?(c : Char) : Bool
+    c == '\v' || c == '\n' || c == '\f' || c == '\r' || c == '\u{0085}' || c == '\u{2028}' || c == '\u{2029}'
+  end
+
+  def self.char_width(bytes : Pointer(UInt8), pos : Int32, size : Int32) : Int32
+    return 1 if pos >= size
+    res = decode(bytes, pos, size)
+    res[1]
+  end
+
+  def self.decode(bytes : Pointer(UInt8), pos : Int32, size : Int32) : {Char, Int32}
+    b0 = bytes[pos]
+    return {b0.unsafe_chr, 1} if b0 < 0x80_u8
+    if b0 >= 0xF0_u8
+      width = 4
+      mask = 0x07_u8
+    elsif b0 >= 0xE0_u8
+      width = 3
+      mask = 0x0F_u8
+    elsif b0 >= 0xC0_u8
+      width = 2
+      mask = 0x1F_u8
+    else
+      return {b0.unsafe_chr, 1}
+    end
+    return {b0.unsafe_chr, 1} if pos + width > size
+    codepoint = (b0 & mask).to_i
+    k = 1
+    while k < width
+      b = bytes[pos + k]
+      return {b0.unsafe_chr, 1} if (b & 0xC0_u8) != 0x80_u8
+      codepoint = (codepoint << 6) | (b & 0x3F_u8).to_i
+      k = k + 1
+    end
+    {codepoint.unsafe_chr, width}
+  end
+
+  def self.byte_slice(subject : String, from : Int32, to : Int32) : String
+    return "" if to <= from
+    subject[from, to - from]
+  end
+
+  def self.expand_replacement(m : MatchData, replacement : String) : String
+    parts = [] of String
+    size = replacement.bytesize
+    ptr = replacement.to_unsafe
+    i = 0
+    while i < size
+      b = ptr[i]
+      if b == 0x5C_u8 && i + 1 < size
+        n = ptr[i + 1]
+        if n >= 0x30_u8 && n <= 0x39_u8
+          group = (n - 0x30_u8).to_i
+          if group <= m.group_count
+            text = m[group]
+            parts << text if text
+          end
+          i = i + 2
+          next
+        elsif n == 0x5C_u8
+          parts << "\\"
+          i = i + 2
+          next
+        end
+      end
+      parts << b.unsafe_chr.to_s
+      i = i + 1
+    end
+    parts.join("")
+  end
+
+  def self.anchor_holds?(kind : InstKind, bytes : Pointer(UInt8), pos : Int32, size : Int32) : Bool
+    case kind
+    when InstKind::Bol, InstKind::Bot
+      pos == 0
+    when InstKind::Eol, InstKind::EotNl
+      pos == size || (pos + 1 == size && bytes[pos] == 0x0A_u8)
+    when InstKind::Eot
+      pos == size
+    when InstKind::WordB
+      word_before?(bytes, pos) != word_at?(bytes, pos, size)
+    when InstKind::NotWordB
+      word_before?(bytes, pos) == word_at?(bytes, pos, size)
+    else
+      false
+    end
+  end
+
+  def self.word_at?(bytes : Pointer(UInt8), pos : Int32, size : Int32) : Bool
+    return false unless pos < size
+    res = decode(bytes, pos, size)
+    word_char?(res[0])
+  end
+
+  def self.word_before?(bytes : Pointer(UInt8), pos : Int32) : Bool
+    return false unless pos > 0
+    i = pos - 1
+    while i > 0 && (bytes[i] & 0xC0_u8) == 0x80_u8
+      i = i - 1
+    end
+    res = decode(bytes, i, pos)
+    word_char?(res[0])
+  end
+
+  def self.look_holds?(looks : LookMaps, inst : Inst, pos : Int32) : Bool
+    held = looks[inst.a][pos]
+    inst.b == 1 ? !held : held
+  end
+
+  def self.compute_look_maps(assertions : Array(Assertion), subject : String) : LookMaps
+    maps = [] of Array(Bool)
+    return maps if assertions.empty?
+    size = subject.bytesize
+    bytes = subject.to_unsafe
+    bounds = char_bounds(bytes, size)
+    i = 0
+    while i < assertions.size
+      assertion = assertions[i]
+      runner = LookRunner.new(assertion.prog, assertion.classes)
+      maps << runner.run(bytes, size, bounds, assertion.backward?, maps)
+      i = i + 1
+    end
+    maps
+  end
+
+  private def self.char_bounds(bytes : Pointer(UInt8), size : Int32) : Array(Int32)
+    bounds = [] of Int32
+    pos = 0
+    while pos < size
+      bounds << pos
+      w = char_width(bytes, pos, size)
+      pos = pos + w
+    end
+    bounds << size
+    bounds
+  end
+end
+
+pub struct MatchData
+  getter subject : String
+  @slots : Array(Int32)
+  @group_count : Int32
+  @names : Hash(String, Int32)
+
+  def initialize(@subject : String, @slots : Array(Int32), @group_count : Int32, @names : Hash(String, Int32))
+  end
+
+  def group_count : Int32
+    @group_count
+  end
+
+  def size : Int32
+    @group_count + 1
+  end
+
+  def begin(group : Int32 = 0) : Int32?
+    return nil if group < 0 || group > @group_count
+    val = @slots[group * 2]
+    val < 0 ? nil : val
+  end
+
+  def begin(name : String) : Int32?
+    if idx = @names[name]?
+      self.begin(idx)
+    else
+      nil
+    end
+  end
+
+  def end(group : Int32 = 0) : Int32?
+    return nil if group < 0 || group > @group_count
+    val = @slots[group * 2 + 1]
+    val < 0 ? nil : val
+  end
+
+  def end(name : String) : Int32?
+    if idx = @names[name]?
+      self.end(idx)
+    else
+      nil
+    end
+  end
+
+  def [](group : Int32) : String?
+    b = self.begin(group)
+    e = self.end(group)
+    return nil unless b && e
+    Regex.byte_slice(@subject, b, e)
+  end
+
+  def [](name : String) : String?
+    idx = @names[name]?
+    return nil unless idx
+    self[idx]
+  end
+
+  def pre_match : String
+    b = self.begin(0)
+    return "" unless b && b > 0
+    @subject[0, b]
+  end
+
+  def post_match : String
+    e = self.end(0)
+    return "" unless e && e < @subject.bytesize
+    @subject[e, @subject.bytesize - e]
+  end
+
+  def to_s : String
+    self[0] || ""
+  end
+
+  def captures : Array(String?)
+    result = [] of String?
+    i = 1
+    while i <= @group_count
+      result << self[i]
+      i = i + 1
+    end
+    result
+  end
+end
+
+class ::Regex
+  def self.new(source : String, ignore_case : Bool = false) : Std::Regex::Regex
+    Std::Regex::Regex.new(source, ignore_case)
+  end
+
+  def self.escape(str : String) : String
+    Std::Regex::Regex.escape(str)
+  end
+end
+
+alias ::MatchData = Std::Regex::MatchData
+alias ::SyntaxError = Std::Regex::SyntaxError
+
+class ::String
+  def =~(pattern : Std::Regex::Regex) : Int32?
+    pattern =~ self
+  end
+
+  def match(pattern : Std::Regex::Regex) : Std::Regex::MatchData?
+    pattern.match(self)
+  end
+
+  def match?(pattern : Std::Regex::Regex) : Bool
+    pattern.match?(self)
+  end
+end
+
+class Parser
+  getter group_count : Int32
+  getter group_names : Hash(String, Int32)
+  getter looks : Array(LookSpec)
+
+  def initialize(@source : String, @ignore_case : Bool)
+    @size = @source.bytesize
+    @pos = 0
+    @group_count = 0
+    @group_names = {} of String => Int32
+    @looks = [] of LookSpec
+    @look_depth = 0
+  end
+
+  def parse : Node
+    root = parse_alternation
+    if @pos < @size
+      error("unbalanced parenthesis", @pos)
+    end
+    root
+  end
+
+  private def parse_alternation : Node
+    alts = [parse_concat]
+    while peek_byte == 0x7C_u8 # '|'
+      @pos = @pos + 1
+      alts << parse_concat
+    end
+    alts.size == 1 ? alts[0] : AltNode.new(alts)
+  end
+
+  private def parse_concat : Node
+    items = [] of Node
+    ptr = @source.to_unsafe
+    while @pos < @size
+      b = ptr[@pos]
+      break if b == 0x7C_u8 || b == 0x29_u8 # '|' or ')'
+      items << parse_quantified
+    end
+    items.size == 1 ? items[0] : CatNode.new(items)
+  end
+
+  private def parse_quantified : Node
+    atom = parse_atom
+    quant_pos = @pos
+    min = 0
+    max : Int32? = nil
+    b = peek_byte
+    if b == 0x2A_u8 # '*'
+      @pos = @pos + 1
+      min = 0
+      max = nil
+    elsif b == 0x2B_u8 # '+'
+      @pos = @pos + 1
+      min = 1
+      max = nil
+    elsif b == 0x3F_u8 # '?'
+      @pos = @pos + 1
+      min = 0
+      max = 1
+    elsif b == 0x7B_u8 # '{'
+      pair = try_braces
+      if pair
+        min = pair[0]
+        max = pair[1]
+      end
+    end
+
+    return atom if @pos == quant_pos
+
+    if atom.is_a?(EmptyNode)
+      error("quantifier does not follow a repeatable atom", quant_pos)
+    end
+
+    lazy = false
+    qb = peek_byte
+    if qb == 0x3F_u8 # '?'
+      @pos = @pos + 1
+      lazy = true
+    elsif qb == 0x2B_u8 # '+'
+      error("possessive quantifiers are not supported", @pos)
+    elsif qb == 0x2A_u8 # '*'
+      error("quantifier does not follow a repeatable atom", @pos)
+    end
+
+    RepeatNode.new(atom, min, max, lazy, quant_pos)
+  end
+
+  private def parse_atom : Node
+    b = peek_byte
+    case b
+    when 0x28_u8 # '('
+      @pos = @pos + 1
+      parse_group
+    when 0x5B_u8 # '['
+      parse_class
+    when 0x2E_u8 # '.'
+      @pos = @pos + 1
+      AnyNode.new
+    when 0x5E_u8 # '^'
+      @pos = @pos + 1
+      AssertNode.new(Anchor::LineStart)
+    when 0x24_u8 # '$'
+      @pos = @pos + 1
+      AssertNode.new(Anchor::LineEnd)
+    when 0x5C_u8 # '\'
+      parse_escape
+    when 0x2A_u8, 0x2B_u8, 0x3F_u8 # '*' '+' '?'
+      error("quantifier does not follow a repeatable atom", @pos)
+    when 0x7B_u8 # '{'
+      if quantifier_ahead?
+        error("quantifier does not follow a repeatable atom", @pos)
+      end
+      @pos = @pos + 1
+      CharNode.new('{', @ignore_case)
+    else
+      ptr = @source.to_unsafe
+      res = Regex.decode(ptr, @pos, @size)
+      @pos = @pos + res[1]
+      CharNode.new(res[0], @ignore_case)
+    end
+  end
+
+  private def parse_group : Node
+    open_pos = @pos - 1
+    if peek_byte == 0x3F_u8 # '?'
+      @pos = @pos + 1
+      b = peek_byte
+      case b
+      when 0x3A_u8 # ':'
+        @pos = @pos + 1
+        parse_group_body
+      when 0x69_u8 # 'i'
+        parse_inline_fold
+      when 0x3D_u8 # '='
+        @pos = @pos + 1
+        lookaround(true, false)
+      when 0x21_u8 # '!'
+        @pos = @pos + 1
+        lookaround(true, true)
+      when 0x3C_u8 # '<'
+        nb = peek_byte_at(1)
+        if nb == 0x3D_u8 # '='
+          @pos = @pos + 2
+          lookaround(false, false)
+        elsif nb == 0x21_u8 # '!'
+          @pos = @pos + 2
+          lookaround(false, true)
+        else
+          @pos = @pos + 1
+          named_group(0x3E_u8, open_pos) # '>'
+        end
+      when 0x27_u8 # '\''
+        @pos = @pos + 1
+        named_group(0x27_u8, open_pos)
+      when 0x50_u8 # 'P'
+        nb = peek_byte_at(1)
+        if nb == 0x3C_u8 # '<'
+          @pos = @pos + 2
+          named_group(0x3E_u8, open_pos)
+        elsif nb == 0x3D_u8
+          error("backreferences are not supported", @pos)
+        elsif nb == 0x3E_u8
+          error("recursion is not supported", @pos)
+        else
+          error("unsupported group construct after (?", @pos)
+        end
+      when 0x3E_u8 # '>'
+        error("atomic groups are not supported", @pos)
+      when 0x28_u8 # '('
+        error("conditionals are not supported", @pos)
+      when 0x52_u8, 0x26_u8, 0x2B_u8 # 'R' '&' '+'
+        error("recursion is not supported", @pos)
+      when 0x43_u8 # 'C'
+        error("callouts are not supported", @pos)
+      else
+        if b >= 0x30_u8 && b <= 0x39_u8
+          error("recursion is not supported", @pos)
+        end
+        error("unsupported group construct after (?", @pos)
+      end
+    else
+      capture_group(nil, open_pos)
+    end
+  end
+
+  private def lookaround(ahead : Bool, negated : Bool) : Node
+    @look_depth = @look_depth + 1
+    body = parse_group_body
+    @look_depth = @look_depth - 1
+    index = @looks.size
+    @looks << LookSpec.new(body, ahead)
+    LookNode.new(index, negated)
+  end
+
+  private def named_group(closer : UInt8, open_pos : Int32) : Node
+    start_pos = @pos
+    while (b = peek_byte) > 0_u8 && name_byte?(b)
+      @pos = @pos + 1
+    end
+    name = @source[start_pos, @pos - start_pos]
+    if name.empty? || peek_byte != closer || (0x30_u8 <= name.to_unsafe[0] && name.to_unsafe[0] <= 0x39_u8)
+      error("a group name must be letters, digits or underscores and cannot start with a digit", start_pos)
+    end
+    @pos = @pos + 1
+    capture_group(name, open_pos)
+  end
+
+  private def name_byte?(b : UInt8) : Bool
+    b == 0x5F_u8 || (0x30_u8 <= b && b <= 0x39_u8) || (0x41_u8 <= b && b <= 0x5A_u8) || (0x61_u8 <= b && b <= 0x7A_u8)
+  end
+
+  private def capture_group(name : String?, open_pos : Int32) : Node
+    if @look_depth > 0
+      error("a capturing group inside a lookaround assertion is not supported", open_pos)
+    end
+    @group_count = @group_count + 1
+    index = @group_count
+    if name
+      if @group_names.has_key?(name)
+        error("duplicate group name #{name.inspect}", open_pos)
+      end
+      @group_names[name] = index
+    end
+    GroupNode.new(parse_group_body, index)
+  end
+
+  private def parse_group_body : Node
+    saved = @ignore_case
+    body = parse_alternation
+    if peek_byte != 0x29_u8 # ')'
+      error("missing closing parenthesis", @pos)
+    end
+    @pos = @pos + 1
+    @ignore_case = saved
+    body
+  end
+
+  private def parse_inline_fold : Node
+    while peek_byte == 0x69_u8 # 'i'
+      @pos = @pos + 1
+    end
+    terminator = peek_byte
+    unless terminator == 0x29_u8 || terminator == 0x3A_u8 # ')' or ':'
+      error("unsupported inline flag", @pos)
+    end
+    @pos = @pos + 1
+    if terminator == 0x29_u8
+      @ignore_case = true
+      EmptyNode.new
+    else
+      saved = @ignore_case
+      @ignore_case = true
+      body = parse_alternation
+      if peek_byte != 0x29_u8
+        error("missing closing parenthesis", @pos)
+      end
+      @pos = @pos + 1
+      @ignore_case = saved
+      body
+    end
+  end
+
+  private def parse_class : Node
+    @pos = @pos + 1 # '['
+    negated = false
+    if peek_byte == 0x5E_u8 # '^'
+      negated = true
+      @pos = @pos + 1
+    end
+    members = [] of Member
+    first = true
+    while true
+      b = peek_byte
+      if b == 0_u8
+        error("unterminated character class", @pos)
+      end
+      if b == 0x5D_u8 && !first # ']'
+        @pos = @pos + 1
+        break
+      end
+      first = false
+      item = parse_class_item
+      if item.is_a?(Member)
+        members << item
+      else
+        # Literal character
+        lo = item.as(Char)
+        nxt = peek_byte_at(1)
+        if peek_byte == 0x2D_u8 && nxt > 0_u8 && nxt != 0x5D_u8 # '-'
+          @pos = @pos + 1                                       # '-'
+          rhs = parse_class_item
+          if rhs.is_a?(Char)
+            hi = rhs.as(Char)
+            if lo > hi
+              error("range out of order in character class", @pos)
+            end
+            members << Member.range(lo, hi)
+          else
+            error("invalid range in character class", @pos)
+          end
+        else
+          members << Member.range(lo, lo)
+        end
+      end
+    end
+    ClassNode.new(members, negated, @ignore_case)
+  end
+
+  private def parse_class_item : Member | Char
+    if peek_byte == 0x5C_u8 # '\'
+      @pos = @pos + 1
+      b = peek_byte
+      if b == 0_u8
+        error("trailing backslash in character class", @pos)
+      end
+      case b
+      when 0x6E_u8 # 'n'
+        @pos = @pos + 1
+        '\n'
+      when 0x74_u8 # 't'
+        @pos = @pos + 1
+        '\t'
+      when 0x72_u8 # 'r'
+        @pos = @pos + 1
+        '\r'
+      when 0x66_u8 # 'f'
+        @pos = @pos + 1
+        '\f'
+      when 0x76_u8 # 'v'
+        @pos = @pos + 1
+        Member.builtin(Builtin::Vertical, false)
+      when 0x56_u8 # 'V'
+        @pos = @pos + 1
+        Member.builtin(Builtin::Vertical, true)
+      when 0x30_u8 # '0'
+        octal_escape
+      when 0x78_u8 # 'x'
+        @pos = @pos + 1
+        hex_escape
+      when 0x62_u8 # 'b' inside class is backspace (0x08)
+        @pos = @pos + 1
+        0x08.unsafe_chr
+      when 0x64_u8 # 'd'
+        @pos = @pos + 1
+        Member.builtin(Builtin::Digit, false)
+      when 0x44_u8 # 'D'
+        @pos = @pos + 1
+        Member.builtin(Builtin::Digit, true)
+      when 0x77_u8 # 'w'
+        @pos = @pos + 1
+        Member.builtin(Builtin::Word, false)
+      when 0x57_u8 # 'W'
+        @pos = @pos + 1
+        Member.builtin(Builtin::Word, true)
+      when 0x73_u8 # 's'
+        @pos = @pos + 1
+        Member.builtin(Builtin::Space, false)
+      when 0x53_u8 # 'S'
+        @pos = @pos + 1
+        Member.builtin(Builtin::Space, true)
+      when 0x68_u8 # 'h'
+        @pos = @pos + 1
+        Member.builtin(Builtin::Horizontal, false)
+      when 0x48_u8 # 'H'
+        @pos = @pos + 1
+        Member.builtin(Builtin::Horizontal, true)
+      when 0x70_u8 # 'p'
+        @pos = @pos + 1
+        Member.builtin(property_kind, false)
+      when 0x50_u8 # 'P'
+        @pos = @pos + 1
+        Member.builtin(property_kind, true)
+      else
+        c = b.unsafe_chr
+        if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+          error("unsupported escape \\#{c} in character class", @pos)
+        end
+        ptr = @source.to_unsafe
+        res = Regex.decode(ptr, @pos, @size)
+        @pos = @pos + res[1]
+        res[0]
+      end
+    else
+      ptr = @source.to_unsafe
+      res = Regex.decode(ptr, @pos, @size)
+      @pos = @pos + res[1]
+      res[0]
+    end
+  end
+
+  private def parse_escape : Node
+    @pos = @pos + 1 # '\'
+    b = peek_byte
+    if b == 0_u8
+      error("trailing backslash", @pos)
+    end
+    case b
+    when 0x6E_u8 # 'n'
+      @pos = @pos + 1
+      CharNode.new('\n', @ignore_case)
+    when 0x74_u8 # 't'
+      @pos = @pos + 1
+      CharNode.new('\t', @ignore_case)
+    when 0x72_u8 # 'r'
+      @pos = @pos + 1
+      CharNode.new('\r', @ignore_case)
+    when 0x66_u8 # 'f'
+      @pos = @pos + 1
+      CharNode.new('\f', @ignore_case)
+    when 0x76_u8 # 'v'
+      @pos = @pos + 1
+      builtin_class(Builtin::Vertical, false)
+    when 0x56_u8 # 'V'
+      @pos = @pos + 1
+      builtin_class(Builtin::Vertical, true)
+    when 0x30_u8 # '0'
+      @pos = @pos + 1
+      CharNode.new(octal_escape, @ignore_case)
+    when 0x78_u8 # 'x'
+      @pos = @pos + 1
+      CharNode.new(hex_escape, @ignore_case)
+    when 0x62_u8 # 'b'
+      @pos = @pos + 1
+      AssertNode.new(Anchor::WordBorder)
+    when 0x42_u8 # 'B'
+      @pos = @pos + 1
+      AssertNode.new(Anchor::NotWordBorder)
+    when 0x41_u8 # 'A'
+      @pos = @pos + 1
+      AssertNode.new(Anchor::TextStart)
+    when 0x7A_u8 # 'z'
+      @pos = @pos + 1
+      AssertNode.new(Anchor::TextEnd)
+    when 0x5A_u8 # 'Z'
+      @pos = @pos + 1
+      AssertNode.new(Anchor::TextEndNl)
+    when 0x64_u8 # 'd'
+      @pos = @pos + 1
+      builtin_class(Builtin::Digit, false)
+    when 0x44_u8 # 'D'
+      @pos = @pos + 1
+      builtin_class(Builtin::Digit, true)
+    when 0x77_u8 # 'w'
+      @pos = @pos + 1
+      builtin_class(Builtin::Word, false)
+    when 0x57_u8 # 'W'
+      @pos = @pos + 1
+      builtin_class(Builtin::Word, true)
+    when 0x73_u8 # 's'
+      @pos = @pos + 1
+      builtin_class(Builtin::Space, false)
+    when 0x53_u8 # 'S'
+      @pos = @pos + 1
+      builtin_class(Builtin::Space, true)
+    when 0x68_u8 # 'h'
+      @pos = @pos + 1
+      builtin_class(Builtin::Horizontal, false)
+    when 0x48_u8 # 'H'
+      @pos = @pos + 1
+      builtin_class(Builtin::Horizontal, true)
+    when 0x31_u8, 0x32_u8, 0x33_u8, 0x34_u8, 0x35_u8, 0x36_u8, 0x37_u8, 0x38_u8, 0x39_u8
+      error("backreferences are not supported", @pos)
+    when 0x70_u8 # 'p'
+      @pos = @pos + 1
+      builtin_class(property_kind, false)
+    when 0x50_u8 # 'P'
+      @pos = @pos + 1
+      builtin_class(property_kind, true)
+    when 0x47_u8 # 'G'
+      error("\\G is not supported", @pos)
+    when 0x4B_u8 # 'K'
+      error("\\K is not supported", @pos)
+    else
+      c = b.unsafe_chr
+      if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+        error("unsupported escape \\#{c}", @pos)
+      end
+      ptr = @source.to_unsafe
+      res = Regex.decode(ptr, @pos, @size)
+      @pos = @pos + res[1]
+      CharNode.new(res[0], @ignore_case)
+    end
+  end
+
+  private def builtin_class(kind : Builtin, negated : Bool) : Node
+    members = [Member.builtin(kind, negated)]
+    ClassNode.new(members, false, @ignore_case)
+  end
+
+  private def octal_escape : Char
+    val = 0
+    i = 0
+    while i < 2
+      b = peek_byte
+      break if b < 0x30_u8 || b > 0x37_u8
+      val = val * 8 + (b - 0x30_u8).to_i
+      @pos = @pos + 1
+      i = i + 1
+    end
+    val.unsafe_chr
+  end
+
+  private def hex_escape : Char
+    if peek_byte == 0x7B_u8 # '{'
+      braced_hex_escape
+    else
+      val = 0
+      count = 0
+      while count < 2
+        d = hex_value(peek_byte)
+        break if d < 0
+        val = val * 16 + d
+        @pos = @pos + 1
+        count = count + 1
+      end
+      if count == 0
+        error("malformed \\x escape, expected \\xHH or \\x{...}", @pos)
+      end
+      val.unsafe_chr
+    end
+  end
+
+  private def braced_hex_escape : Char
+    open_pos = @pos
+    @pos = @pos + 1 # '{'
+    val = 0
+    count = 0
+    while (d = hex_value(peek_byte)) >= 0
+      val = val * 16 + d
+      if val > 0x10FFFF
+        error("codepoint in \\x{...} is above U+10FFFF", open_pos)
+      end
+      @pos = @pos + 1
+      count = count + 1
+    end
+    if count == 0
+      error("no digits in \\x{...}", open_pos)
+    end
+    if peek_byte != 0x7D_u8 # '}'
+      error("missing closing brace in \\x{...}", open_pos)
+    end
+    @pos = @pos + 1
+    if 0xD800 <= val && val <= 0xDFFF
+      error("codepoint in \\x{...} is a surrogate", open_pos)
+    end
+    val.unsafe_chr
+  end
+
+  private def property_kind : Builtin
+    open_pos = @pos
+    if peek_byte == 0x7B_u8 # '{'
+      @pos = @pos + 1
+      from = @pos
+      while (b = peek_byte) > 0_u8 && b != 0x7D_u8 # '}'
+        @pos = @pos + 1
+      end
+      if peek_byte != 0x7D_u8
+        error("missing closing brace in \\p{...}", open_pos)
+      end
+      name = @source[from, @pos - from]
+      @pos = @pos + 1
+      case name
+      when "L"
+        Builtin::Letter
+      when "Lu"
+        Builtin::Upper
+      when "Ll"
+        Builtin::Lower
+      when "N"
+        Builtin::Number
+      when "M"
+        Builtin::Mark
+      else
+        error("unsupported unicode property \\p{#{name}}, only L, Lu, Ll, N and M are supported", open_pos)
+      end
+    else
+      b = peek_byte
+      if (b >= 0x41_u8 && b <= 0x5A_u8) || (b >= 0x61_u8 && b <= 0x7A_u8)
+        @pos = @pos + 1
+        case b.unsafe_chr
+        when 'L'
+          Builtin::Letter
+        when 'N'
+          Builtin::Number
+        when 'M'
+          Builtin::Mark
+        else
+          error("unsupported unicode property \\p#{b.unsafe_chr}", open_pos)
+        end
+      else
+        error("malformed \\p escape, expected \\p{Name} or \\pN", open_pos)
+      end
+    end
+  end
+
+  private def hex_value(b : UInt8) : Int32
+    if 0x30_u8 <= b && b <= 0x39_u8
+      (b - 0x30_u8).to_i
+    elsif 0x41_u8 <= b && b <= 0x46_u8
+      (b - 0x41_u8).to_i + 10
+    elsif 0x61_u8 <= b && b <= 0x66_u8
+      (b - 0x61_u8).to_i + 10
+    else
+      -1
+    end
+  end
+
+  private def try_braces : {Int32, Int32?}?
+    saved = @pos
+    @pos = @pos + 1 # '{'
+    lower = parse_digits
+    if peek_byte == 0x2C_u8 # ','
+      @pos = @pos + 1
+      upper = parse_digits
+      if peek_byte == 0x7D_u8 && (lower >= 0 || upper >= 0) # '}'
+        @pos = @pos + 1
+        if lower < 0
+          lower = 0
+        end
+        mx : Int32? = upper < 0 ? nil : upper
+        if mx && mx < lower
+          error("numbers out of order in {} quantifier", saved)
+        end
+        check_repeat_cap(lower)
+        check_repeat_cap(mx) if mx
+        return {lower, mx}
+      end
+    elsif lower >= 0 && peek_byte == 0x7D_u8 # '}'
+      @pos = @pos + 1
+      check_repeat_cap(lower)
+      return {lower, lower.as(Int32?)}
+    end
+    @pos = saved
+    nil
+  end
+
+  private def quantifier_ahead? : Bool
+    i = skip_digits(@pos + 1)
+    saw_lower = i > @pos + 1
+    ptr = @source.to_unsafe
+    saw_upper = false
+    if i < @size && ptr[i] == 0x2C_u8 # ','
+      j = skip_digits(i + 1)
+      saw_upper = j > i + 1
+      i = j
+    end
+    (saw_lower || saw_upper) && i < @size && ptr[i] == 0x7D_u8 # '}'
+  end
+
+  private def skip_digits(start_pos : Int32) : Int32
+    i = start_pos
+    ptr = @source.to_unsafe
+    while i < @size && 0x30_u8 <= ptr[i] && ptr[i] <= 0x39_u8
+      i = i + 1
+    end
+    i
+  end
+
+  private def parse_digits : Int32
+    val = 0
+    count = 0
+    ptr = @source.to_unsafe
+    while @pos < @size && 0x30_u8 <= ptr[@pos] && ptr[@pos] <= 0x39_u8
+      b = ptr[@pos]
+      val = val * 10 + (b - 0x30_u8).to_i
+      if val > 1_000_000
+        val = 1_000_000
+      end
+      count = count + 1
+      @pos = @pos + 1
+    end
+    count == 0 ? -1 : val
+  end
+
+  private def check_repeat_cap(count : Int32) : Nil
+    if count > Regex::MAX_REPEAT
+      error("repeat count #{count} exceeds the #{Regex::MAX_REPEAT} limit", @pos)
+    end
+  end
+
+  private def peek_byte : UInt8
+    @pos < @size ? @source.to_unsafe[@pos] : 0_u8
+  end
+
+  private def peek_byte_at(offset : Int32) : UInt8
+    idx = @pos + offset
+    idx < @size ? @source.to_unsafe[idx] : 0_u8
+  end
+
+  private def error(message : String, pos : Int32 = -1) : NoReturn
+    err_pos = pos < 0 ? @pos : pos
+    raise SyntaxError.new(message, err_pos)
+  end
+end
+
+class Compiler
+  def initialize(@budget : Budget)
+    @prog = [] of Inst
+    @classes = [] of ClassData
+    @repeat_pos = 0
+  end
+
+  def compile(root : Node) : {Array(Inst), Array(ClassData)}
+    emit(InstKind::Save, 0)
+    node(root)
+    emit(InstKind::Save, 1)
+    emit(InstKind::Match)
+    {@prog, @classes}
+  end
+
+  def compile_assertion(root : Node) : {Array(Inst), Array(ClassData)}
+    node(root)
+    emit(InstKind::Match)
+    {@prog, @classes}
+  end
+
+  private def node(n : Node) : Nil
+    case n
+    when CatNode
+      i = 0
+      while i < n.items.size
+        node(n.items[i])
+        i = i + 1
+      end
+    when CharNode
+      emit(InstKind::Char, n.char.ord, fold: n.fold?)
+    when AnyNode
+      emit(InstKind::Any)
+    when ClassNode
+      index = @classes.size
+      @classes << ClassData.new(n.members, n.negated?, n.fold?)
+      emit(InstKind::Class, index)
+    when AssertNode
+      emit(anchor_kind(n.anchor))
+    when LookNode
+      emit(InstKind::Look, n.index, n.negated? ? 1 : 0)
+    when GroupNode
+      if index = n.index
+        emit(InstKind::Save, index * 2)
+        node(n.body)
+        emit(InstKind::Save, index * 2 + 1)
+      else
+        node(n.body)
+      end
+    when AltNode
+      alternation(n.alts)
+    when RepeatNode
+      repeat(n)
+    else
+      # EmptyNode
+    end
+  end
+
+  private def alternation(branches : Array(Node)) : Nil
+    jumps = [] of Int32
+    last = branches.size - 1
+    i = 0
+    while i <= last
+      branch = branches[i]
+      if i < last
+        split = emit(InstKind::Split)
+        set_a(split, @prog.size)
+        node(branch)
+        jumps << emit(InstKind::Jmp)
+        set_b(split, @prog.size)
+      else
+        node(branch)
+      end
+      i = i + 1
+    end
+    k = 0
+    while k < jumps.size
+      set_a(jumps[k], @prog.size)
+      k = k + 1
+    end
+  end
+
+  private def nullable?(n : Node) : Bool
+    case n
+    when CharNode, AnyNode, ClassNode
+      false
+    when CatNode
+      all_null = true
+      i = 0
+      while i < n.items.size
+        unless nullable?(n.items[i])
+          all_null = false
+          break
+        end
+        i = i + 1
+      end
+      all_null
+    when AltNode
+      any_null = false
+      i = 0
+      while i < n.alts.size
+        if nullable?(n.alts[i])
+          any_null = true
+          break
+        end
+        i = i + 1
+      end
+      any_null
+    when GroupNode
+      nullable?(n.body)
+    when RepeatNode
+      n.min == 0 || nullable?(n.body)
+    else
+      true
+    end
+  end
+
+  private def epsilon(n : Node) : Nil
+    case n
+    when CatNode
+      i = 0
+      while i < n.items.size
+        epsilon(n.items[i])
+        i = i + 1
+      end
+    when AltNode
+      nullables = [] of Node
+      i = 0
+      while i < n.alts.size
+        nullables << n.alts[i] if nullable?(n.alts[i])
+        i = i + 1
+      end
+      alternation(nullables)
+    when GroupNode
+      if index = n.index
+        emit(InstKind::Save, index * 2)
+        epsilon(n.body)
+        emit(InstKind::Save, index * 2 + 1)
+      else
+        epsilon(n.body)
+      end
+    when RepeatNode
+      if n.min == 0
+        epsilon(n.body) if nullable?(n.body)
+      else
+        k = 0
+        while k < n.min
+          epsilon(n.body)
+          k = k + 1
+        end
+      end
+    when AssertNode
+      emit(anchor_kind(n.anchor))
+    when LookNode
+      emit(InstKind::Look, n.index, n.negated? ? 1 : 0)
+    else
+      # EmptyNode
+    end
+  end
+
+  private def empty_tail_round(n : RepeatNode) : Nil
+    split = emit(InstKind::Split)
+    if n.lazy?
+      set_b(split, @prog.size)
+      epsilon(n.body)
+      set_a(split, @prog.size)
+    else
+      set_a(split, @prog.size)
+      epsilon(n.body)
+      set_b(split, @prog.size)
+    end
+  end
+
+  private def repeat(n : RepeatNode) : Nil
+    saved_pos = @repeat_pos
+    @repeat_pos = n.pos
+    min = n.min
+    max = n.max
+    if max && max == min
+      k = 0
+      while k < min
+        node(n.body)
+        k = k + 1
+      end
+    elsif max.nil?
+      if min == 1
+        plus(n)
+      else
+        k = 0
+        while k < min
+          node(n.body)
+          k = k + 1
+        end
+        star(n)
+      end
+      empty_tail_round(n) if nullable?(n.body)
+    else
+      k = 0
+      while k < min
+        node(n.body)
+        k = k + 1
+      end
+      bounded(n, max - min)
+    end
+    @repeat_pos = saved_pos
+  end
+
+  private def star(n : RepeatNode) : Nil
+    split = emit(InstKind::Split)
+    if n.lazy?
+      set_b(split, @prog.size)
+      node(n.body)
+      back = emit(InstKind::Again, split)
+      set_a(split, @prog.size)
+    else
+      set_a(split, @prog.size)
+      node(n.body)
+      back = emit(InstKind::Again, split)
+      set_b(split, @prog.size)
+    end
+    set_b(back, @prog.size)
+  end
+
+  private def plus(n : RepeatNode) : Nil
+    body_idx = @prog.size
+    node(n.body)
+    split = emit(InstKind::Split)
+    if n.lazy?
+      set_a(split, @prog.size)
+      set_b(split, body_idx)
+    else
+      set_a(split, body_idx)
+      set_b(split, @prog.size)
+    end
+  end
+
+  private def bounded(n : RepeatNode, count : Int32) : Nil
+    return if count <= 0
+    split = emit(InstKind::Split)
+    if n.lazy?
+      set_b(split, @prog.size)
+      node(n.body)
+      bounded(n, count - 1)
+      set_a(split, @prog.size)
+    else
+      set_a(split, @prog.size)
+      node(n.body)
+      bounded(n, count - 1)
+      set_b(split, @prog.size)
+    end
+  end
+
+  private def anchor_kind(anchor : Anchor) : InstKind
+    case anchor
+    when Anchor::LineStart
+      InstKind::Bol
+    when Anchor::LineEnd
+      InstKind::Eol
+    when Anchor::TextStart
+      InstKind::Bot
+    when Anchor::TextEnd
+      InstKind::Eot
+    when Anchor::TextEndNl
+      InstKind::EotNl
+    when Anchor::WordBorder
+      InstKind::WordB
+    else
+      InstKind::NotWordB
+    end
+  end
+
+  private def emit(kind : InstKind, a : Int32 = 0, b : Int32 = 0, fold : Bool = false) : Int32
+    if @budget.spent >= Regex::MAX_PROG
+      raise SyntaxError.new("compiled pattern exceeds #{Regex::MAX_PROG} instructions", @repeat_pos)
+    end
+    @budget.spent = @budget.spent + 1
+    @prog << Inst.new(kind, a, b, fold)
+    @prog.size - 1
+  end
+
+  private def set_a(i : Int32, v : Int32) : Nil
+    inst = @prog[i]
+    inst.a = v
+    @prog[i] = inst
+  end
+
+  private def set_b(i : Int32, v : Int32) : Nil
+    inst = @prog[i]
+    inst.b = v
+    @prog[i] = inst
+  end
+end
+
+struct Thread
+  getter pc : Int32
+  getter slots : Array(Int32)
+
+  def initialize(@pc : Int32, @slots : Array(Int32))
+  end
+end
+
+class VM
+  def initialize(@prog : Array(Inst), @classes : Array(ClassData), @group_count : Int32, @looks : LookMaps)
+    @marks = Array(Int32).new(@prog.size) { 0 }
+    @stamp = 0
+    @stack = [] of Tuple(Int32, Array(Int32))
+  end
+
+  def run(subject : String, start : Int32) : Array(Int32)?
+    size = subject.bytesize
+    ptr = subject.to_unsafe
+    initial = Array(Int32).new((@group_count + 1) * 2) { -1 }
+
+    clist = [] of Thread
+    nlist = [] of Thread
+    best : Array(Int32)? = nil
+
+    @stamp = @stamp + 1
+    pos = start
+    while pos <= size
+      add_thread(clist, 0, initial, pos, ptr, size) unless best
+      break if clist.empty? && best
+
+      c : Char? = nil
+      width = 1
+      if pos < size
+        res = Regex.decode(ptr, pos, size)
+        c = res[0]
+        width = res[1]
+      end
+
+      nlist.unsafe_set_size(0)
+      @stamp = @stamp + 1
+      cut = false
+      i = 0
+      while i < clist.size && !cut
+        th = clist[i]
+        inst = @prog[th.pc]
+        case inst.kind
+        when InstKind::Char
+          if c && Regex.char_eq?(c, inst.a.unsafe_chr, inst.fold?)
+            add_thread(nlist, th.pc + 1, th.slots, pos + width, ptr, size)
+          end
+        when InstKind::Class
+          if c && @classes[inst.a].matches?(c)
+            add_thread(nlist, th.pc + 1, th.slots, pos + width, ptr, size)
+          end
+        when InstKind::Any
+          if c && c != '\n'
+            add_thread(nlist, th.pc + 1, th.slots, pos + width, ptr, size)
+          end
+        else
+          # Match accepted
+          best = th.slots.dup
+          cut = true
+        end
+        i = i + 1
+      end
+
+      clist, nlist = nlist, clist
+      pos = pos + width
+    end
+    best
+  end
+
+  private def add_thread(list : Array(Thread), pc : Int32, slots : Array(Int32), pos : Int32, bytes : Pointer(UInt8), size : Int32) : Nil
+    @stack.unsafe_set_size(0)
+    @stack << {pc, slots}
+    while !@stack.empty?
+      entry = @stack.pop
+      curr_pc = entry[0]
+      curr_slots = entry[1]
+      next if @marks[curr_pc] == @stamp
+      @marks[curr_pc] = @stamp
+      inst = @prog[curr_pc]
+      case inst.kind
+      when InstKind::Jmp
+        @stack << {inst.a, curr_slots}
+      when InstKind::Again
+        target = @marks[inst.a] == @stamp ? inst.b : inst.a
+        @stack << {target, curr_slots}
+      when InstKind::Split
+        @stack << {inst.b, curr_slots}
+        @stack << {inst.a, curr_slots}
+      when InstKind::Save
+        new_slots = curr_slots.dup
+        new_slots[inst.a] = pos
+        @stack << {curr_pc + 1, new_slots}
+      when InstKind::Bol, InstKind::Bot, InstKind::Eol, InstKind::EotNl, InstKind::Eot, InstKind::WordB, InstKind::NotWordB
+        if Regex.anchor_holds?(inst.kind, bytes, pos, size)
+          @stack << {curr_pc + 1, curr_slots}
+        end
+      when InstKind::Look
+        if Regex.look_holds?(@looks, inst, pos)
+          @stack << {curr_pc + 1, curr_slots}
+        end
+      else
+        list << Thread.new(curr_pc, curr_slots)
+      end
+    end
+  end
+end
+
+class LookRunner
+  def initialize(@prog : Array(Inst), @classes : Array(ClassData))
+    @marks = Array(Int32).new(@prog.size) { 0 }
+    @stamp = 0
+    @stack = [] of Int32
+    @matched = false
+  end
+
+  def run(bytes : Pointer(UInt8), size : Int32, bounds : Array(Int32), backward : Bool, looks : LookMaps) : Array(Bool)
+    holds = Array(Bool).new(size + 1) { false }
+    live = [] of Int32
+    spare = [] of Int32
+    last = bounds.size - 1
+    index = backward ? last : 0
+
+    @stamp = @stamp + 1
+    @matched = false
+    add(live, bounds[index], bytes, size, looks)
+    holds[bounds[index]] = @matched
+
+    while backward ? index > 0 : index < last
+      char_pos = backward ? bounds[index - 1] : bounds[index]
+      res = Regex.decode(bytes, char_pos, size)
+      c = res[0]
+      index = index + (backward ? -1 : 1)
+      target = bounds[index]
+
+      spare.unsafe_set_size(0)
+      @stamp = @stamp + 1
+      @matched = false
+      i = 0
+      while i < live.size
+        pc = live[i]
+        inst = @prog[pc]
+        consumed = case inst.kind
+                   when InstKind::Char
+                     Regex.char_eq?(c, inst.a.unsafe_chr, inst.fold?)
+                   when InstKind::Class
+                     @classes[inst.a].matches?(c)
+                   else
+                     c != '\n'
+                   end
+        follow(spare, pc + 1, target, bytes, size, looks) if consumed
+        i = i + 1
+      end
+      add(spare, target, bytes, size, looks)
+      holds[target] = @matched
+      live, spare = spare, live
+    end
+    holds
+  end
+
+  private def add(list : Array(Int32), pos : Int32, bytes : Pointer(UInt8), size : Int32, looks : LookMaps) : Nil
+    follow(list, 0, pos, bytes, size, looks)
+  end
+
+  private def follow(list : Array(Int32), pc : Int32, pos : Int32, bytes : Pointer(UInt8), size : Int32, looks : LookMaps) : Nil
+    @stack.unsafe_set_size(0)
+    @stack << pc
+    while !@stack.empty?
+      at = @stack.pop
+      next if @marks[at] == @stamp
+      @marks[at] = @stamp
+      inst = @prog[at]
+      case inst.kind
+      when InstKind::Jmp
+        @stack << inst.a
+      when InstKind::Again
+        target = @marks[inst.a] == @stamp ? inst.b : inst.a
+        @stack << target
+      when InstKind::Split
+        @stack << inst.b
+        @stack << inst.a
+      when InstKind::Save
+        @stack << at + 1
+      when InstKind::Match
+        @matched = true
+      when InstKind::Look
+        @stack << at + 1 if Regex.look_holds?(looks, inst, pos)
+      when InstKind::Char, InstKind::Class, InstKind::Any
+        list << at
+      else
+        @stack << at + 1 if Regex.anchor_holds?(inst.kind, bytes, pos, size)
+      end
+    end
+  end
+end

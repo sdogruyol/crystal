@@ -1,0 +1,1278 @@
+# Native cryptography: constant-time comparison, OS CSPRNG, HMAC, HKDF,
+# AES-128-GCM, AES-256-GCM, and ChaCha20-Poly1305.
+#
+# Notice: this implementation has not undergone independent cryptographic review.
+#
+# Standard ciphers and MACs for TLS 1.3, QUIC, and WebSocket protocol stacks.
+# Pure native iyi implementation without OpenSSL or libcrypto.
+
+module std/crypto
+
+pub import std/slice
+using std/slice::{Slice}
+pub alias Bytes = Std::Slice::Bytes
+
+pub import std/digest
+using std/digest::{MD5, SHA1, SHA256, SHA384, SHA512}
+
+# -----------------------------------------------------------------------------
+# Constant-Time Comparison
+# -----------------------------------------------------------------------------
+# Compares two byte slices in constant time to prevent timing side-channel attacks.
+# Tag and MAC verifications throughout this module use this comparison.
+pub def constant_time_compare(a : Bytes, b : Bytes) : Bool
+  return false if a.size != b.size
+  diff = 0_u8
+  i = 0
+  while i < a.size
+    diff = diff | (a[i] ^ b[i])
+    i = i + 1
+  end
+  diff == 0_u8
+end
+
+pub def constant_time_compare(a : String, b : String) : Bool
+  constant_time_compare(Bytes.new(a.to_unsafe, a.bytesize), Bytes.new(b.to_unsafe, b.bytesize))
+end
+
+# -----------------------------------------------------------------------------
+# CSPRNG (Cryptographically Secure Pseudo-Random Number Generator)
+# -----------------------------------------------------------------------------
+# Obtains high-entropy random bytes directly from the host operating system:
+#   * Darwin: LibSystem getentropy (chunked <= 256 bytes)
+#   * Linux: direct SYS_getrandom syscall (318 on x86_64, 278 on aarch64), 0 libc symbols
+#   * Windows: LibBcrypt BCryptGenRandom (BCRYPT_USE_SYSTEM_PREFERRED_RNG)
+#   * wasm32: WASI __wasi_random_get
+{% if flag?(:darwin) %}
+  lib LibSystem
+    fun getentropy(buf : Void*, buflen : UInt64) : Int32
+  end
+
+  pub def random_bytes(buffer : Bytes) : Nil
+    offset = 0
+    remaining = buffer.size
+    ptr = buffer.to_unsafe
+    while remaining > 0
+      chunk = remaining > 256 ? 256 : remaining
+      res = LibSystem.getentropy((ptr + offset.to_i64).as(Void*), chunk.to_u64)
+      raise "getentropy failed" if res != 0
+      offset = offset + chunk
+      remaining = remaining - chunk
+    end
+  end
+{% elsif flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64)) %}
+  pub def random_bytes(buffer : Bytes) : Nil
+    offset = 0
+    remaining = buffer.size
+    ptr = buffer.to_unsafe
+    while remaining > 0
+      chunk = remaining > 256 ? 256 : remaining
+      ret = uninitialized Int64
+      {% if flag?(:x86_64) %}
+        asm("syscall" : "={rax}"(ret)
+                      : "{rax}"(318_i64), "{rdi}"((ptr + offset.to_i64).as(Void*)), "{rsi}"(chunk.to_u64), "{rdx}"(0_u64)
+                      : "rcx", "r11", "memory"
+                      : "volatile")
+      {% else %}
+        asm("svc #0" : "={x0}"(ret)
+                     : "{x8}"(278_i64), "{x0}"((ptr + offset.to_i64).as(Void*)), "{x1}"(chunk.to_u64), "{x2}"(0_u64)
+                     : "memory"
+                     : "volatile")
+      {% end %}
+      if ret > 0_i64
+        offset = offset + ret.to_i32
+        remaining = remaining - ret.to_i32
+      elsif ret < 0_i64
+        raise "getrandom syscall failed" unless ret == -4_i64
+      end
+    end
+  end
+{% elsif flag?(:windows) || flag?(:win32) %}
+  lib LibBcrypt
+    fun BCryptGenRandom(hAlgorithm : Void*, pbBuffer : UInt8*, cbBuffer : UInt64, dwFlags : UInt64) : Int32
+  end
+
+  pub def random_bytes(buffer : Bytes) : Nil
+    return if buffer.empty?
+    status = LibBcrypt.BCryptGenRandom(Pointer(Void).new(0_u64), buffer.to_unsafe, buffer.size.to_u64, 2_u64)
+    raise "BCryptGenRandom failed" if status != 0
+  end
+{% elsif flag?(:wasm32) %}
+  lib LibWasi
+    fun random_get = __wasi_random_get(buf : UInt8*, buf_len : UInt64) : Int32
+  end
+
+  pub def random_bytes(buffer : Bytes) : Nil
+    return if buffer.empty?
+    ret = LibWasi.random_get(buffer.to_unsafe, buffer.size.to_u64)
+    raise "WASI random_get failed" if ret != 0
+  end
+{% end %}
+
+pub def random_bytes(size : Int32) : Bytes
+  buf = Bytes.new(size)
+  random_bytes(buf)
+  buf
+end
+
+# -----------------------------------------------------------------------------
+# HMAC (Keyed-Hash Message Authentication Code, RFC 2104)
+# -----------------------------------------------------------------------------
+pub class HMAC
+  @algorithm : Symbol
+  @k_opad : Bytes
+  @inner_hasher : (MD5 | SHA1 | SHA256 | SHA384 | SHA512)
+  @block_size : Int32
+  @digest_size : Int32
+
+  def initialize(algorithm : Symbol, key : Bytes)
+    @algorithm = algorithm
+    bs = 64
+    ds = 32
+    case algorithm
+    when :md5
+      bs = 64; ds = 16
+    when :sha1
+      bs = 64; ds = 20
+    when :sha256
+      bs = 64; ds = 32
+    when :sha384
+      bs = 128; ds = 48
+    when :sha512
+      bs = 128; ds = 64
+    else
+      raise "HMAC: unsupported algorithm #{algorithm}"
+    end
+    @block_size = bs
+    @digest_size = ds
+
+    actual_key = Bytes.new(bs, 0_u8)
+    if key.size > bs
+      # Hash key first
+      hashed = case algorithm
+               when :md5    then MD5.digest(key)
+               when :sha1   then SHA1.digest(key)
+               when :sha256 then SHA256.digest(key)
+               when :sha384 then SHA384.digest(key)
+               else              SHA512.digest(key)
+               end
+      i = 0
+      while i < hashed.size
+        actual_key[i] = hashed[i]
+        i = i + 1
+      end
+    else
+      i = 0
+      while i < key.size
+        actual_key[i] = key[i]
+        i = i + 1
+      end
+    end
+
+    k_ipad = Bytes.new(bs)
+    @k_opad = Bytes.new(bs)
+    i = 0
+    while i < bs
+      k_ipad[i] = actual_key[i] ^ 0x36_u8
+      @k_opad[i] = actual_key[i] ^ 0x5c_u8
+      i = i + 1
+    end
+
+    hasher = case algorithm
+             when :md5    then (MD5.new.update(k_ipad)).as(MD5 | SHA1 | SHA256 | SHA384 | SHA512)
+             when :sha1   then (SHA1.new.update(k_ipad)).as(MD5 | SHA1 | SHA256 | SHA384 | SHA512)
+             when :sha256 then (SHA256.new.update(k_ipad)).as(MD5 | SHA1 | SHA256 | SHA384 | SHA512)
+             when :sha384 then (SHA384.new.update(k_ipad)).as(MD5 | SHA1 | SHA256 | SHA384 | SHA512)
+             else              (SHA512.new.update(k_ipad)).as(MD5 | SHA1 | SHA256 | SHA384 | SHA512)
+             end
+    @inner_hasher = hasher
+  end
+
+  def initialize(algorithm : Symbol, key : String)
+    initialize(algorithm, Bytes.new(key.to_unsafe, key.bytesize))
+  end
+
+  def update(data : Bytes) : self
+    case h = @inner_hasher
+    when MD5    then h.update(data)
+    when SHA1   then h.update(data)
+    when SHA256 then h.update(data)
+    when SHA384 then h.update(data)
+    when SHA512 then h.update(data)
+    end
+    self
+  end
+
+  def update(data : String) : self
+    update(Bytes.new(data.to_unsafe, data.bytesize))
+  end
+
+  def final : Bytes
+    inner_hash = case h = @inner_hasher
+                 when MD5    then h.final
+                 when SHA1   then h.final
+                 when SHA256 then h.final
+                 when SHA384 then h.final
+                 when SHA512 then h.final
+                 else             raise "unreachable"
+                 end
+
+    case @algorithm
+    when :md5
+      MD5.new.update(@k_opad).update(inner_hash).final
+    when :sha1
+      SHA1.new.update(@k_opad).update(inner_hash).final
+    when :sha256
+      SHA256.new.update(@k_opad).update(inner_hash).final
+    when :sha384
+      SHA384.new.update(@k_opad).update(inner_hash).final
+    else
+      SHA512.new.update(@k_opad).update(inner_hash).final
+    end
+  end
+
+  def hexdigest : String
+    final.hexstring
+  end
+
+  def self.digest(algorithm : Symbol, key : Bytes, data : Bytes) : Bytes
+    new(algorithm, key).update(data).final
+  end
+
+  def self.digest(algorithm : Symbol, key : String, data : String) : Bytes
+    new(algorithm, Bytes.new(key.to_unsafe, key.bytesize)).update(data).final
+  end
+
+  def self.hexdigest(algorithm : Symbol, key : Bytes, data : Bytes) : String
+    new(algorithm, key).update(data).hexdigest
+  end
+
+  def self.hexdigest(algorithm : Symbol, key : String, data : String) : String
+    new(algorithm, Bytes.new(key.to_unsafe, key.bytesize)).update(data).hexdigest
+  end
+
+  def self.sha256(key : Bytes, data : Bytes) : Bytes
+    digest(:sha256, key, data)
+  end
+
+  def self.sha384(key : Bytes, data : Bytes) : Bytes
+    digest(:sha384, key, data)
+  end
+
+  def self.sha512(key : Bytes, data : Bytes) : Bytes
+    digest(:sha512, key, data)
+  end
+
+  def self.sha1(key : Bytes, data : Bytes) : Bytes
+    digest(:sha1, key, data)
+  end
+
+  def self.md5(key : Bytes, data : Bytes) : Bytes
+    digest(:md5, key, data)
+  end
+
+  # Constant-time tag verification
+  def self.verify(algorithm : Symbol, key : Bytes, data : Bytes, expected_tag : Bytes) : Bool
+    actual = digest(algorithm, key, data)
+    Std::Crypto.constant_time_compare(actual, expected_tag)
+  end
+end
+
+# -----------------------------------------------------------------------------
+# HKDF (HMAC-based Extract-and-Expand Key Derivation Function, RFC 5869)
+# -----------------------------------------------------------------------------
+pub struct HKDF
+  def self.hash_len(hash_type : Symbol) : Int32
+    case hash_type
+    when :sha256 then 32
+    when :sha384 then 48
+    when :sha512 then 64
+    when :sha1   then 20
+    when :md5    then 16
+    else              raise "HKDF: unsupported hash type #{hash_type}"
+    end
+  end
+
+  # HKDF-Extract(salt, IKM) -> PRK
+  def self.extract(hash_type : Symbol, ikm : Bytes, salt : Bytes = Bytes.empty) : Bytes
+    actual_salt = if salt.empty?
+                    Bytes.new(hash_len(hash_type), 0_u8)
+                  else
+                    salt
+                  end
+    HMAC.digest(hash_type, actual_salt, ikm)
+  end
+
+  # HKDF-Expand(PRK, info, L) -> OKM
+  def self.expand(hash_type : Symbol, prk : Bytes, info : Bytes, length : Int32) : Bytes
+    hlen = hash_len(hash_type)
+    n = (length + hlen - 1) // hlen
+    raise "HKDF-Expand: length too large (#{length} bytes for #{hash_type})" if n > 255
+
+    okm = Bytes.new(length)
+    t = Bytes.empty
+    offset = 0
+
+    step = 1
+    while step <= n
+      # Build input: T(step - 1) || info || step.to_u8
+      step_input_size = t.size + info.size + 1
+      step_input = Bytes.new(step_input_size)
+      idx = 0
+      i = 0
+      while i < t.size
+        step_input[idx] = t[i]
+        idx = idx + 1
+        i = i + 1
+      end
+      i = 0
+      while i < info.size
+        step_input[idx] = info[i]
+        idx = idx + 1
+        i = i + 1
+      end
+      step_input[idx] = step.to_u8
+
+      t = HMAC.digest(hash_type, prk, step_input)
+
+      to_copy = length - offset
+      to_copy = hlen if to_copy > hlen
+      i = 0
+      while i < to_copy
+        okm[offset + i] = t[i]
+        i = i + 1
+      end
+      offset = offset + to_copy
+      step = step + 1
+    end
+
+    okm
+  end
+
+  # HKDF full derive: Extract then Expand
+  def self.derive(hash_type : Symbol, ikm : Bytes, salt : Bytes, info : Bytes, length : Int32) : Bytes
+    prk = extract(hash_type, ikm, salt)
+    expand(hash_type, prk, info, length)
+  end
+end
+
+# -----------------------------------------------------------------------------
+# ChaCha20 Stream Cipher (RFC 8439)
+# -----------------------------------------------------------------------------
+module ChaCha20
+  def self.rotl32(x : UInt64, n : Int32) : UInt64
+    ((x.unsafe_shl(n.to_u64)) | (x.unsafe_shr((32 - n).to_u64))) & 0xffffffff_u64
+  end
+
+  def self.quarter_round(s : Pointer(UInt64), a : Int32, b : Int32, c : Int32, d : Int32) : Nil
+    s[a] = (s[a] &+ s[b]) & 0xffffffff_u64
+    s[d] = s[d] ^ s[a]; s[d] = rotl32(s[d], 16)
+    s[c] = (s[c] &+ s[d]) & 0xffffffff_u64
+    s[b] = s[b] ^ s[c]; s[b] = rotl32(s[b], 12)
+    s[a] = (s[a] &+ s[b]) & 0xffffffff_u64
+    s[d] = s[d] ^ s[a]; s[d] = rotl32(s[d], 8)
+    s[c] = (s[c] &+ s[d]) & 0xffffffff_u64
+    s[b] = s[b] ^ s[c]; s[b] = rotl32(s[b], 7)
+  end
+
+  def self.block(key : Bytes, counter : UInt64, nonce : Bytes, out_ptr : Pointer(UInt8)) : Nil
+    # 16-word state
+    state = Pointer(UInt64).malloc(16_u64)
+    orig = Pointer(UInt64).malloc(16_u64)
+
+    # Constants: "expand 32-byte k"
+    state[0] = 0x61707865_u64
+    state[1] = 0x3320646e_u64
+    state[2] = 0x79622d32_u64
+    state[3] = 0x6b206574_u64
+
+    # 8 key words
+    i = 0
+    while i < 8
+      state[4 + i] = (key[4*i].to_u64) |
+                     (key[4*i + 1].to_u64.unsafe_shl(8_u64)) |
+                     (key[4*i + 2].to_u64.unsafe_shl(16_u64)) |
+                     (key[4*i + 3].to_u64.unsafe_shl(24_u64))
+      i = i + 1
+    end
+
+    # Counter (32-bit word)
+    state[12] = counter & 0xffffffff_u64
+
+    # Nonce (3 32-bit words)
+    i = 0
+    while i < 3
+      state[13 + i] = (nonce[4*i].to_u64) |
+                      (nonce[4*i + 1].to_u64.unsafe_shl(8_u64)) |
+                      (nonce[4*i + 2].to_u64.unsafe_shl(16_u64)) |
+                      (nonce[4*i + 3].to_u64.unsafe_shl(24_u64))
+      i = i + 1
+    end
+
+    i = 0
+    while i < 16
+      orig[i] = state[i]
+      i = i + 1
+    end
+
+    # 20 rounds: 10 column rounds + 10 diagonal rounds
+    round = 0
+    while round < 10
+      quarter_round(state, 0, 4, 8, 12)
+      quarter_round(state, 1, 5, 9, 13)
+      quarter_round(state, 2, 6, 10, 14)
+      quarter_round(state, 3, 7, 11, 15)
+
+      quarter_round(state, 0, 5, 10, 15)
+      quarter_round(state, 1, 6, 11, 12)
+      quarter_round(state, 2, 7, 8, 13)
+      quarter_round(state, 3, 4, 9, 14)
+      round = round + 1
+    end
+
+    # Add initial state and write little-endian 64 bytes
+    i = 0
+    while i < 16
+      w = (state[i] &+ orig[i]) & 0xffffffff_u64
+      out_ptr[4*i] = (w & 0xff_u64).to_u8
+      out_ptr[4*i + 1] = ((w.unsafe_shr(8_u64)) & 0xff_u64).to_u8
+      out_ptr[4*i + 2] = ((w.unsafe_shr(16_u64)) & 0xff_u64).to_u8
+      out_ptr[4*i + 3] = ((w.unsafe_shr(24_u64)) & 0xff_u64).to_u8
+      i = i + 1
+    end
+  end
+
+  def self.xor_stream(key : Bytes, counter : UInt64, nonce : Bytes, input : Bytes) : Bytes
+    output = Bytes.new(input.size)
+    ks = Pointer(UInt8).malloc(64_u64)
+    curr_counter = counter
+    offset = 0
+    remaining = input.size
+
+    while remaining > 0
+      block(key, curr_counter, nonce, ks)
+      chunk = remaining > 64 ? 64 : remaining
+      i = 0
+      while i < chunk
+        output[offset + i] = input[offset + i] ^ ks[i]
+        i = i + 1
+      end
+      offset = offset + chunk
+      remaining = remaining - chunk
+      curr_counter = curr_counter &+ 1_u64
+    end
+
+    output
+  end
+end
+
+# -----------------------------------------------------------------------------
+# Poly1305 MAC (RFC 8439)
+# -----------------------------------------------------------------------------
+module Poly1305
+  def self.mac(key : Bytes, msg : Bytes) : Bytes
+    raise "Poly1305: key must be 32 bytes" if key.size != 32
+
+    # Clamp r
+    r_bytes = Bytes.new(16)
+    i = 0
+    while i < 16
+      r_bytes[i] = key[i]
+      i = i + 1
+    end
+    r_bytes[3] = r_bytes[3] & 15_u8
+    r_bytes[7] = r_bytes[7] & 15_u8
+    r_bytes[11] = r_bytes[11] & 15_u8
+    r_bytes[15] = r_bytes[15] & 15_u8
+    r_bytes[4] = r_bytes[4] & 252_u8
+    r_bytes[8] = r_bytes[8] & 252_u8
+    r_bytes[12] = r_bytes[12] & 252_u8
+
+    # 26-bit limbs of r
+    r0 = (r_bytes[0].to_u64 | (r_bytes[1].to_u64.unsafe_shl(8_u64)) | (r_bytes[2].to_u64.unsafe_shl(16_u64)) | (r_bytes[3].to_u64.unsafe_shl(24_u64))) & 0x3ffffff_u64
+    r1 = ((r_bytes[3].to_u64 | (r_bytes[4].to_u64.unsafe_shl(8_u64)) | (r_bytes[5].to_u64.unsafe_shl(16_u64)) | (r_bytes[6].to_u64.unsafe_shl(24_u64))).unsafe_shr(2_u64)) & 0x3ffffff_u64
+    r2 = ((r_bytes[6].to_u64 | (r_bytes[7].to_u64.unsafe_shl(8_u64)) | (r_bytes[8].to_u64.unsafe_shl(16_u64)) | (r_bytes[9].to_u64.unsafe_shl(24_u64))).unsafe_shr(4_u64)) & 0x3ffffff_u64
+    r3 = ((r_bytes[9].to_u64 | (r_bytes[10].to_u64.unsafe_shl(8_u64)) | (r_bytes[11].to_u64.unsafe_shl(16_u64)) | (r_bytes[12].to_u64.unsafe_shl(24_u64))).unsafe_shr(6_u64)) & 0x3ffffff_u64
+    r4 = ((r_bytes[12].to_u64 | (r_bytes[13].to_u64.unsafe_shl(8_u64)) | (r_bytes[14].to_u64.unsafe_shl(16_u64)) | (r_bytes[15].to_u64.unsafe_shl(24_u64))).unsafe_shr(8_u64)) & 0x3ffffff_u64
+
+    s1 = r1 * 5_u64
+    s2 = r2 * 5_u64
+    s3 = r3 * 5_u64
+    s4 = r4 * 5_u64
+
+    h0 = 0_u64
+    h1 = 0_u64
+    h2 = 0_u64
+    h3 = 0_u64
+    h4 = 0_u64
+
+    chunk_buf = Pointer(UInt8).malloc(17_u64)
+    offset = 0
+    remaining = msg.size
+
+    while remaining > 0
+      chunk_len = remaining > 16 ? 16 : remaining
+      i = 0
+      while i < chunk_len
+        chunk_buf[i] = msg[offset + i]
+        i = i + 1
+      end
+      chunk_buf[chunk_len] = 0x01_u8
+      i = chunk_len + 1
+      while i < 17
+        chunk_buf[i] = 0_u8
+        i = i + 1
+      end
+
+      m0 = (chunk_buf[0].to_u64 | (chunk_buf[1].to_u64.unsafe_shl(8_u64)) | (chunk_buf[2].to_u64.unsafe_shl(16_u64)) | (chunk_buf[3].to_u64.unsafe_shl(24_u64))) & 0x3ffffff_u64
+      m1 = ((chunk_buf[3].to_u64 | (chunk_buf[4].to_u64.unsafe_shl(8_u64)) | (chunk_buf[5].to_u64.unsafe_shl(16_u64)) | (chunk_buf[6].to_u64.unsafe_shl(24_u64))).unsafe_shr(2_u64)) & 0x3ffffff_u64
+      m2 = ((chunk_buf[6].to_u64 | (chunk_buf[7].to_u64.unsafe_shl(8_u64)) | (chunk_buf[8].to_u64.unsafe_shl(16_u64)) | (chunk_buf[9].to_u64.unsafe_shl(24_u64))).unsafe_shr(4_u64)) & 0x3ffffff_u64
+      m3 = ((chunk_buf[9].to_u64 | (chunk_buf[10].to_u64.unsafe_shl(8_u64)) | (chunk_buf[11].to_u64.unsafe_shl(16_u64)) | (chunk_buf[12].to_u64.unsafe_shl(24_u64))).unsafe_shr(6_u64)) & 0x3ffffff_u64
+      m4 = (((chunk_buf[12].to_u64 | (chunk_buf[13].to_u64.unsafe_shl(8_u64)) | (chunk_buf[14].to_u64.unsafe_shl(16_u64)) | (chunk_buf[15].to_u64.unsafe_shl(24_u64))).unsafe_shr(8_u64)) | (chunk_buf[16].to_u64.unsafe_shl(24_u64))) & 0x3ffffff_u64
+
+      h0 = h0 &+ m0
+      h1 = h1 &+ m1
+      h2 = h2 &+ m2
+      h3 = h3 &+ m3
+      h4 = h4 &+ m4
+
+      d0 = h0 * r0 &+ h1 * s4 &+ h2 * s3 &+ h3 * s2 &+ h4 * s1
+      d1 = h0 * r1 &+ h1 * r0 &+ h2 * s4 &+ h3 * s3 &+ h4 * s2
+      d2 = h0 * r2 &+ h1 * r1 &+ h2 * r0 &+ h3 * s4 &+ h4 * s3
+      d3 = h0 * r3 &+ h1 * r2 &+ h2 * r1 &+ h3 * r0 &+ h4 * s4
+      d4 = h0 * r4 &+ h1 * r3 &+ h2 * r2 &+ h3 * r1 &+ h4 * r0
+
+      c = d0.unsafe_shr(26_u64); h0 = d0 & 0x3ffffff_u64
+      d1 = d1 &+ c; c = d1.unsafe_shr(26_u64); h1 = d1 & 0x3ffffff_u64
+      d2 = d2 &+ c; c = d2.unsafe_shr(26_u64); h2 = d2 & 0x3ffffff_u64
+      d3 = d3 &+ c; c = d3.unsafe_shr(26_u64); h3 = d3 & 0x3ffffff_u64
+      d4 = d4 &+ c; c = d4.unsafe_shr(26_u64); h4 = d4 & 0x3ffffff_u64
+      h0 = h0 &+ c * 5_u64
+      c = h0.unsafe_shr(26_u64); h0 = h0 & 0x3ffffff_u64; h1 = h1 &+ c
+
+      offset = offset + chunk_len
+      remaining = remaining - chunk_len
+    end
+
+    c = h1.unsafe_shr(26_u64); h1 = h1 & 0x3ffffff_u64; h2 = h2 &+ c
+    c = h2.unsafe_shr(26_u64); h2 = h2 & 0x3ffffff_u64; h3 = h3 &+ c
+    c = h3.unsafe_shr(26_u64); h3 = h3 & 0x3ffffff_u64; h4 = h4 &+ c
+    c = h4.unsafe_shr(26_u64); h4 = h4 & 0x3ffffff_u64; h0 = h0 &+ c * 5_u64
+    c = h0.unsafe_shr(26_u64); h0 = h0 & 0x3ffffff_u64; h1 = h1 &+ c
+
+    # Compute h - p (p = 2^130 - 5)
+    g0 = h0 &+ 5_u64
+    c = g0.unsafe_shr(26_u64); g0 = g0 & 0x3ffffff_u64
+    g1 = h1 &+ c; c = g1.unsafe_shr(26_u64); g1 = g1 & 0x3ffffff_u64
+    g2 = h2 &+ c; c = g2.unsafe_shr(26_u64); g2 = g2 & 0x3ffffff_u64
+    g3 = h3 &+ c; c = g3.unsafe_shr(26_u64); g3 = g3 & 0x3ffffff_u64
+    g4 = (h4 &+ c) &- (1_u64.unsafe_shl(26_u64))
+
+    # If g4 does not borrow (< 2^63), select g, else h
+    if g4 < 0x8000000000000000_u64
+      h0 = g0; h1 = g1; h2 = g2; h3 = g3; h4 = g4 & 0x3ffffff_u64
+    end
+
+    # Reconstruct 128-bit integer in two 64-bit halves
+    # low 64 bits = h0 | (h1 << 26) | (h2 << 52)
+    # high 64 bits = (h2 >> 12) | (h3 << 14) | (h4 << 40)
+    low_h = h0 | (h1.unsafe_shl(26_u64)) | (h2.unsafe_shl(52_u64))
+    high_h = (h2.unsafe_shr(12_u64)) | (h3.unsafe_shl(14_u64)) | (h4.unsafe_shl(40_u64))
+
+    # s is 128 bits from key[16..31]
+    low_s = key[16].to_u64 | (key[17].to_u64.unsafe_shl(8_u64)) | (key[18].to_u64.unsafe_shl(16_u64)) | (key[19].to_u64.unsafe_shl(24_u64)) |
+            (key[20].to_u64.unsafe_shl(32_u64)) | (key[21].to_u64.unsafe_shl(40_u64)) | (key[22].to_u64.unsafe_shl(48_u64)) | (key[23].to_u64.unsafe_shl(56_u64))
+    high_s = key[24].to_u64 | (key[25].to_u64.unsafe_shl(8_u64)) | (key[26].to_u64.unsafe_shl(16_u64)) | (key[27].to_u64.unsafe_shl(24_u64)) |
+             (key[28].to_u64.unsafe_shl(32_u64)) | (key[29].to_u64.unsafe_shl(40_u64)) | (key[30].to_u64.unsafe_shl(48_u64)) | (key[31].to_u64.unsafe_shl(56_u64))
+
+    # Tag = (h + s) mod 2^128
+    tot_low = low_h &+ low_s
+    carry = tot_low < low_h ? 1_u64 : 0_u64
+    tot_high = high_h &+ high_s &+ carry
+
+    out = Bytes.new(16)
+    ptr = out.to_unsafe
+    i = 0
+    while i < 8
+      ptr[i] = ((tot_low.unsafe_shr((i * 8).to_u64)) & 0xff_u64).to_u8
+      ptr[8 + i] = ((tot_high.unsafe_shr((i * 8).to_u64)) & 0xff_u64).to_u8
+      i = i + 1
+    end
+
+    out
+  end
+end
+
+# -----------------------------------------------------------------------------
+# ChaCha20-Poly1305 AEAD (RFC 8439 Section 2.8)
+# -----------------------------------------------------------------------------
+pub class ChaCha20Poly1305
+  def self.encrypt_detached(key : Bytes, nonce : Bytes, plaintext : Bytes, ad : Bytes = Bytes.empty) : {Bytes, Bytes}
+    raise "ChaCha20Poly1305: key must be 32 bytes" if key.size != 32
+    raise "ChaCha20Poly1305: nonce must be 12 bytes" if nonce.size != 12
+
+    # Step 1: Generate Poly1305 key with counter = 0
+    otk_block = Pointer(UInt8).malloc(64_u64)
+    ChaCha20.block(key, 0_u64, nonce, otk_block)
+    poly_key = Bytes.new(32)
+    i = 0
+    while i < 32
+      poly_key[i] = otk_block[i]
+      i = i + 1
+    end
+
+    # Step 2: Encrypt plaintext with ChaCha20 starting at counter = 1
+    ciphertext = ChaCha20.xor_stream(key, 1_u64, nonce, plaintext)
+
+    # Step 3: Construct Poly1305 input:
+    # pad16(ad) || pad16(ciphertext) || len(ad) as 64-bit LE || len(ciphertext) as 64-bit LE
+    ad_padded_len = (ad.size + 15) // 16 * 16
+    ct_padded_len = (ciphertext.size + 15) // 16 * 16
+    mac_data_size = ad_padded_len + ct_padded_len + 16
+    mac_data = Bytes.new(mac_data_size, 0_u8)
+
+    # Copy ad
+    i = 0
+    while i < ad.size
+      mac_data[i] = ad[i]
+      i = i + 1
+    end
+
+    # Copy ciphertext
+    i = 0
+    while i < ciphertext.size
+      mac_data[ad_padded_len + i] = ciphertext[i]
+      i = i + 1
+    end
+
+    # 64-bit LE ad len
+    ad_bits = ad.size.to_u64
+    i = 0
+    while i < 8
+      mac_data[ad_padded_len + ct_padded_len + i] = ((ad_bits.unsafe_shr((i * 8).to_u64)) & 0xff_u64).to_u8
+      i = i + 1
+    end
+
+    # 64-bit LE ciphertext len
+    ct_bits = ciphertext.size.to_u64
+    i = 0
+    while i < 8
+      mac_data[ad_padded_len + ct_padded_len + 8 + i] = ((ct_bits.unsafe_shr((i * 8).to_u64)) & 0xff_u64).to_u8
+      i = i + 1
+    end
+
+    tag = Poly1305.mac(poly_key, mac_data)
+    {ciphertext, tag}
+  end
+
+  def self.encrypt(key : Bytes, nonce : Bytes, plaintext : Bytes, ad : Bytes = Bytes.empty) : Bytes
+    ct, tag = encrypt_detached(key, nonce, plaintext, ad)
+    out = Bytes.new(ct.size + 16)
+    i = 0
+    while i < ct.size
+      out[i] = ct[i]
+      i = i + 1
+    end
+    i = 0
+    while i < 16
+      out[ct.size + i] = tag[i]
+      i = i + 1
+    end
+    out
+  end
+
+  def self.decrypt_detached(key : Bytes, nonce : Bytes, ciphertext : Bytes, tag : Bytes, ad : Bytes = Bytes.empty) : Bytes?
+    raise "ChaCha20Poly1305: key must be 32 bytes" if key.size != 32
+    raise "ChaCha20Poly1305: nonce must be 12 bytes" if nonce.size != 12
+    return nil if tag.size != 16
+
+    otk_block = Pointer(UInt8).malloc(64_u64)
+    ChaCha20.block(key, 0_u64, nonce, otk_block)
+    poly_key = Bytes.new(32)
+    i = 0
+    while i < 32
+      poly_key[i] = otk_block[i]
+      i = i + 1
+    end
+
+    ad_padded_len = (ad.size + 15) // 16 * 16
+    ct_padded_len = (ciphertext.size + 15) // 16 * 16
+    mac_data_size = ad_padded_len + ct_padded_len + 16
+    mac_data = Bytes.new(mac_data_size, 0_u8)
+
+    i = 0
+    while i < ad.size
+      mac_data[i] = ad[i]
+      i = i + 1
+    end
+    i = 0
+    while i < ciphertext.size
+      mac_data[ad_padded_len + i] = ciphertext[i]
+      i = i + 1
+    end
+    ad_bits = ad.size.to_u64
+    i = 0
+    while i < 8
+      mac_data[ad_padded_len + ct_padded_len + i] = ((ad_bits.unsafe_shr((i * 8).to_u64)) & 0xff_u64).to_u8
+      i = i + 1
+    end
+    ct_bits = ciphertext.size.to_u64
+    i = 0
+    while i < 8
+      mac_data[ad_padded_len + ct_padded_len + 8 + i] = ((ct_bits.unsafe_shr((i * 8).to_u64)) & 0xff_u64).to_u8
+      i = i + 1
+    end
+
+    expected_tag = Poly1305.mac(poly_key, mac_data)
+    # Constant-time comparison
+    return nil unless Std::Crypto.constant_time_compare(tag, expected_tag)
+
+    # Decrypt only after successful authentication
+    ChaCha20.xor_stream(key, 1_u64, nonce, ciphertext)
+  end
+
+  def self.decrypt(key : Bytes, nonce : Bytes, ciphertext_and_tag : Bytes, ad : Bytes = Bytes.empty) : Bytes?
+    return nil if ciphertext_and_tag.size < 16
+    ct_len = ciphertext_and_tag.size - 16
+    ct = ciphertext_and_tag[0, ct_len]
+    tag = ciphertext_and_tag[ct_len, 16]
+    decrypt_detached(key, nonce, ct, tag, ad)
+  end
+end
+
+# -----------------------------------------------------------------------------
+# AES Block Cipher (FIPS 197) and Galois/Counter Mode (NIST SP 800-38D)
+# -----------------------------------------------------------------------------
+module AES
+  SBOX = [
+    0x63_u8, 0x7c_u8, 0x77_u8, 0x7b_u8, 0xf2_u8, 0x6b_u8, 0x6f_u8, 0xc5_u8, 0x30_u8, 0x01_u8, 0x67_u8, 0x2b_u8, 0xfe_u8, 0xd7_u8, 0xab_u8, 0x76_u8,
+    0xca_u8, 0x82_u8, 0xc9_u8, 0x7d_u8, 0xfa_u8, 0x59_u8, 0x47_u8, 0xf0_u8, 0xad_u8, 0xd4_u8, 0xa2_u8, 0xaf_u8, 0x9c_u8, 0xa4_u8, 0x72_u8, 0xc0_u8,
+    0xb7_u8, 0xfd_u8, 0x93_u8, 0x26_u8, 0x36_u8, 0x3f_u8, 0xf7_u8, 0xcc_u8, 0x34_u8, 0xa5_u8, 0xe5_u8, 0xf1_u8, 0x71_u8, 0xd8_u8, 0x31_u8, 0x15_u8,
+    0x04_u8, 0xc7_u8, 0x23_u8, 0xc3_u8, 0x18_u8, 0x96_u8, 0x05_u8, 0x9a_u8, 0x07_u8, 0x12_u8, 0x80_u8, 0xe2_u8, 0xeb_u8, 0x27_u8, 0xb2_u8, 0x75_u8,
+    0x09_u8, 0x83_u8, 0x2c_u8, 0x1a_u8, 0x1b_u8, 0x6e_u8, 0x5a_u8, 0xa0_u8, 0x52_u8, 0x3b_u8, 0xd6_u8, 0xb3_u8, 0x29_u8, 0xe3_u8, 0x2f_u8, 0x84_u8,
+    0x53_u8, 0xd1_u8, 0x00_u8, 0xed_u8, 0x20_u8, 0xfc_u8, 0xb1_u8, 0x5b_u8, 0x6a_u8, 0xcb_u8, 0xbe_u8, 0x39_u8, 0x4a_u8, 0x4c_u8, 0x58_u8, 0xcf_u8,
+    0xd0_u8, 0xef_u8, 0xaa_u8, 0xfb_u8, 0x43_u8, 0x4d_u8, 0x33_u8, 0x85_u8, 0x45_u8, 0xf9_u8, 0x02_u8, 0x7f_u8, 0x50_u8, 0x3c_u8, 0x9f_u8, 0xa8_u8,
+    0x51_u8, 0xa3_u8, 0x40_u8, 0x8f_u8, 0x92_u8, 0x9d_u8, 0x38_u8, 0xf5_u8, 0xbc_u8, 0xb6_u8, 0xda_u8, 0x21_u8, 0x10_u8, 0xff_u8, 0xf3_u8, 0xd2_u8,
+    0xcd_u8, 0x0c_u8, 0x13_u8, 0xec_u8, 0x5f_u8, 0x97_u8, 0x44_u8, 0x17_u8, 0xc4_u8, 0xa7_u8, 0x7e_u8, 0x3d_u8, 0x64_u8, 0x5d_u8, 0x19_u8, 0x73_u8,
+    0x60_u8, 0x81_u8, 0x4f_u8, 0xdc_u8, 0x22_u8, 0x2a_u8, 0x90_u8, 0x88_u8, 0x46_u8, 0xee_u8, 0xb8_u8, 0x14_u8, 0xde_u8, 0x5e_u8, 0x0b_u8, 0xdb_u8,
+    0xe0_u8, 0x32_u8, 0x3a_u8, 0x0a_u8, 0x49_u8, 0x06_u8, 0x24_u8, 0x5c_u8, 0xc2_u8, 0xd3_u8, 0xac_u8, 0x62_u8, 0x91_u8, 0x95_u8, 0xe4_u8, 0x79_u8,
+    0xe7_u8, 0xc8_u8, 0x37_u8, 0x6d_u8, 0x8d_u8, 0xd5_u8, 0x4e_u8, 0xa9_u8, 0x6c_u8, 0x56_u8, 0xf4_u8, 0xea_u8, 0x65_u8, 0x7a_u8, 0xae_u8, 0x08_u8,
+    0xba_u8, 0x78_u8, 0x25_u8, 0x2e_u8, 0x1c_u8, 0xa6_u8, 0xb4_u8, 0xc6_u8, 0xe8_u8, 0xdd_u8, 0x74_u8, 0x1f_u8, 0x4b_u8, 0xbd_u8, 0x8b_u8, 0x8a_u8,
+    0x70_u8, 0x3e_u8, 0xb5_u8, 0x66_u8, 0x48_u8, 0x03_u8, 0xf6_u8, 0x0e_u8, 0x61_u8, 0x35_u8, 0x57_u8, 0xb9_u8, 0x86_u8, 0xc1_u8, 0x1d_u8, 0x9e_u8,
+    0xe1_u8, 0xf8_u8, 0x98_u8, 0x11_u8, 0x69_u8, 0xd9_u8, 0x8e_u8, 0x94_u8, 0x9b_u8, 0x1e_u8, 0x87_u8, 0xe9_u8, 0xce_u8, 0x55_u8, 0x28_u8, 0xdf_u8,
+    0x8c_u8, 0xa1_u8, 0x89_u8, 0x0d_u8, 0xbf_u8, 0xe6_u8, 0x42_u8, 0x68_u8, 0x41_u8, 0x99_u8, 0x2d_u8, 0x0f_u8, 0xb0_u8, 0x54_u8, 0xbb_u8, 0x16_u8,
+  ]
+
+  RCON = [0x01_u64, 0x02_u64, 0x04_u64, 0x08_u64, 0x10_u64, 0x20_u64, 0x40_u64, 0x80_u64, 0x1b_u64, 0x36_u64]
+
+  def self.sub_word(w : UInt64) : UInt64
+    (SBOX[((w.unsafe_shr(24_u64)) & 0xff_u64).to_i32].to_u64.unsafe_shl(24_u64)) |
+      (SBOX[((w.unsafe_shr(16_u64)) & 0xff_u64).to_i32].to_u64.unsafe_shl(16_u64)) |
+      (SBOX[((w.unsafe_shr(8_u64)) & 0xff_u64).to_i32].to_u64.unsafe_shl(8_u64)) |
+      SBOX[(w & 0xff_u64).to_i32].to_u64
+  end
+
+  def self.rot_word(w : UInt64) : UInt64
+    ((w.unsafe_shl(8_u64)) & 0xffffffff_u64) | ((w.unsafe_shr(24_u64)) & 0xff_u64)
+  end
+
+  def self.expand_key(key : Bytes) : {Int32, Pointer(UInt64)}
+    nk = key.size // 4
+    nr = nk == 4 ? 10 : 14
+    total_words = 4 * (nr + 1)
+    w = Pointer(UInt64).malloc(total_words.to_u64)
+
+    i = 0
+    while i < nk
+      w[i] = (key[4 * i].to_u64.unsafe_shl(24_u64)) |
+             (key[4 * i + 1].to_u64.unsafe_shl(16_u64)) |
+             (key[4 * i + 2].to_u64.unsafe_shl(8_u64)) |
+             key[4 * i + 3].to_u64
+      i = i + 1
+    end
+
+    i = nk
+    while i < total_words
+      temp = w[i - 1]
+      if i % nk == 0
+        temp = sub_word(rot_word(temp)) ^ (RCON[(i // nk) - 1].unsafe_shl(24_u64))
+      elsif nk > 6 && (i % nk == 4)
+        temp = sub_word(temp)
+      end
+      w[i] = w[i - nk] ^ temp
+      i = i + 1
+    end
+
+    {nr, w}
+  end
+
+  def self.xtime(a : UInt8) : UInt8
+    v = a.to_i32
+    sh = (v << 1) & 0xff
+    ((v & 0x80) != 0 ? sh ^ 0x1b : sh).to_u8
+  end
+
+  def self.encrypt_block(nr : Int32, rk : Pointer(UInt64), input : Pointer(UInt8), output : Pointer(UInt8)) : Nil
+    state = Pointer(UInt8).malloc(16_u64)
+    i = 0
+    while i < 16
+      state[i] = input[i]
+      i = i + 1
+    end
+
+    # AddRoundKey 0
+    c = 0
+    while c < 4
+      k = rk[c]
+      state[4 * c] = state[4 * c] ^ ((k.unsafe_shr(24_u64)) & 0xff_u64).to_u8
+      state[4 * c + 1] = state[4 * c + 1] ^ ((k.unsafe_shr(16_u64)) & 0xff_u64).to_u8
+      state[4 * c + 2] = state[4 * c + 2] ^ ((k.unsafe_shr(8_u64)) & 0xff_u64).to_u8
+      state[4 * c + 3] = state[4 * c + 3] ^ (k & 0xff_u64).to_u8
+      c = c + 1
+    end
+
+    r = 1
+    while r < nr
+      # SubBytes
+      i = 0
+      while i < 16
+        state[i] = SBOX[state[i].to_i32]
+        i = i + 1
+      end
+
+      # ShiftRows
+      t1 = state[5]; t5 = state[9]; t9 = state[13]; t13 = state[1]
+      state[1] = t1; state[5] = t5; state[9] = t9; state[13] = t13
+      t2 = state[10]; t6 = state[14]; t10 = state[2]; t14 = state[6]
+      state[2] = t2; state[6] = t6; state[10] = t10; state[14] = t14
+      t3 = state[15]; t7 = state[3]; t11 = state[7]; t15 = state[11]
+      state[3] = t3; state[7] = t7; state[11] = t11; state[15] = t15
+
+      # MixColumns
+      c = 0
+      while c < 4
+        s0 = state[4 * c]
+        s1 = state[4 * c + 1]
+        s2 = state[4 * c + 2]
+        s3 = state[4 * c + 3]
+        state[4 * c] = xtime(s0) ^ (xtime(s1) ^ s1) ^ s2 ^ s3
+        state[4 * c + 1] = s0 ^ xtime(s1) ^ (xtime(s2) ^ s2) ^ s3
+        state[4 * c + 2] = s0 ^ s1 ^ xtime(s2) ^ (xtime(s3) ^ s3)
+        state[4 * c + 3] = (xtime(s0) ^ s0) ^ s1 ^ s2 ^ xtime(s3)
+        c = c + 1
+      end
+
+      # AddRoundKey
+      c = 0
+      while c < 4
+        k = rk[4 * r + c]
+        state[4 * c] = state[4 * c] ^ ((k.unsafe_shr(24_u64)) & 0xff_u64).to_u8
+        state[4 * c + 1] = state[4 * c + 1] ^ ((k.unsafe_shr(16_u64)) & 0xff_u64).to_u8
+        state[4 * c + 2] = state[4 * c + 2] ^ ((k.unsafe_shr(8_u64)) & 0xff_u64).to_u8
+        state[4 * c + 3] = state[4 * c + 3] ^ (k & 0xff_u64).to_u8
+        c = c + 1
+      end
+      r = r + 1
+    end
+
+    # Final round
+    i = 0
+    while i < 16
+      state[i] = SBOX[state[i].to_i32]
+      i = i + 1
+    end
+    t1 = state[5]; t5 = state[9]; t9 = state[13]; t13 = state[1]
+    state[1] = t1; state[5] = t5; state[9] = t9; state[13] = t13
+    t2 = state[10]; t6 = state[14]; t10 = state[2]; t14 = state[6]
+    state[2] = t2; state[6] = t6; state[10] = t10; state[14] = t14
+    t3 = state[15]; t7 = state[3]; t11 = state[7]; t15 = state[11]
+    state[3] = t3; state[7] = t7; state[11] = t11; state[15] = t15
+
+    c = 0
+    while c < 4
+      k = rk[4 * nr + c]
+      output[4 * c] = state[4 * c] ^ ((k.unsafe_shr(24_u64)) & 0xff_u64).to_u8
+      output[4 * c + 1] = state[4 * c + 1] ^ ((k.unsafe_shr(16_u64)) & 0xff_u64).to_u8
+      output[4 * c + 2] = state[4 * c + 2] ^ ((k.unsafe_shr(8_u64)) & 0xff_u64).to_u8
+      output[4 * c + 3] = state[4 * c + 3] ^ (k & 0xff_u64).to_u8
+      c = c + 1
+    end
+  end
+
+  # GHASH multiplication in GF(2^128)
+  def self.ghash_mult(x : Pointer(UInt8), y_hi : UInt64, y_lo : UInt64, out_hi : Pointer(UInt64), out_lo : Pointer(UInt64)) : Nil
+    v_hi = y_hi
+    v_lo = y_lo
+    z_hi = 0_u64
+    z_lo = 0_u64
+
+    i = 0
+    while i < 16
+      byte = x[i].to_i32
+      bit = 7
+      while bit >= 0
+        if ((byte >> bit) & 1) != 0
+          z_hi = z_hi ^ v_hi
+          z_lo = z_lo ^ v_lo
+        end
+        low_bit = v_lo & 1_u64
+        carry = (v_hi & 1_u64).unsafe_shl(63_u64)
+        v_lo = (v_lo.unsafe_shr(1_u64)) | carry
+        v_hi = v_hi.unsafe_shr(1_u64)
+        if low_bit != 0_u64
+          v_hi = v_hi ^ 0xe100000000000000_u64
+        end
+        bit = bit - 1
+      end
+      i = i + 1
+    end
+
+    out_hi[0] = z_hi
+    out_lo[0] = z_lo
+  end
+
+  def self.ghash(h_bytes : Bytes, aad : Bytes, ct : Bytes) : Bytes
+    h_hi = (h_bytes[0].to_u64.unsafe_shl(56_u64)) | (h_bytes[1].to_u64.unsafe_shl(48_u64)) | (h_bytes[2].to_u64.unsafe_shl(40_u64)) | (h_bytes[3].to_u64.unsafe_shl(32_u64)) |
+           (h_bytes[4].to_u64.unsafe_shl(24_u64)) | (h_bytes[5].to_u64.unsafe_shl(16_u64)) | (h_bytes[6].to_u64.unsafe_shl(8_u64)) | h_bytes[7].to_u64
+    h_lo = (h_bytes[8].to_u64.unsafe_shl(56_u64)) | (h_bytes[9].to_u64.unsafe_shl(48_u64)) | (h_bytes[10].to_u64.unsafe_shl(40_u64)) | (h_bytes[11].to_u64.unsafe_shl(32_u64)) |
+           (h_bytes[12].to_u64.unsafe_shl(24_u64)) | (h_bytes[13].to_u64.unsafe_shl(16_u64)) | (h_bytes[14].to_u64.unsafe_shl(8_u64)) | h_bytes[15].to_u64
+
+    y_buf = Pointer(UInt8).malloc(16_u64)
+    i = 0
+    while i < 16
+      y_buf[i] = 0_u8; i = i + 1
+    end
+
+    block = Pointer(UInt8).malloc(16_u64)
+    res_hi = Pointer(UInt64).malloc(1_u64)
+    res_lo = Pointer(UInt64).malloc(1_u64)
+
+    # Process AAD
+    offset = 0
+    remaining = aad.size
+    while remaining > 0
+      chunk = remaining > 16 ? 16 : remaining
+      i = 0
+      while i < chunk
+        block[i] = y_buf[i] ^ aad[offset + i]; i = i + 1
+      end
+      while i < 16
+        block[i] = y_buf[i]; i = i + 1
+      end
+      ghash_mult(block, h_hi, h_lo, res_hi, res_lo)
+      # Put into y_buf
+      j = 0
+      while j < 8
+        y_buf[j] = ((res_hi[0].unsafe_shr(((7 - j) * 8).to_u64)) & 0xff_u64).to_u8
+        y_buf[8 + j] = ((res_lo[0].unsafe_shr(((7 - j) * 8).to_u64)) & 0xff_u64).to_u8
+        j = j + 1
+      end
+      offset = offset + chunk
+      remaining = remaining - chunk
+    end
+
+    # Process CT
+    offset = 0
+    remaining = ct.size
+    while remaining > 0
+      chunk = remaining > 16 ? 16 : remaining
+      i = 0
+      while i < chunk
+        block[i] = y_buf[i] ^ ct[offset + i]; i = i + 1
+      end
+      while i < 16
+        block[i] = y_buf[i]; i = i + 1
+      end
+      ghash_mult(block, h_hi, h_lo, res_hi, res_lo)
+      j = 0
+      while j < 8
+        y_buf[j] = ((res_hi[0].unsafe_shr(((7 - j) * 8).to_u64)) & 0xff_u64).to_u8
+        y_buf[8 + j] = ((res_lo[0].unsafe_shr(((7 - j) * 8).to_u64)) & 0xff_u64).to_u8
+        j = j + 1
+      end
+      offset = offset + chunk
+      remaining = remaining - chunk
+    end
+
+    # Process lengths: len(AAD) in bits as 64-bit BE || len(CT) in bits as 64-bit BE
+    aad_bits = aad.size.to_u64.unsafe_shl(3_u64)
+    ct_bits = ct.size.to_u64.unsafe_shl(3_u64)
+    j = 0
+    while j < 8
+      block[j] = y_buf[j] ^ (((aad_bits.unsafe_shr(((7 - j) * 8).to_u64)) & 0xff_u64).to_u8)
+      block[8 + j] = y_buf[8 + j] ^ (((ct_bits.unsafe_shr(((7 - j) * 8).to_u64)) & 0xff_u64).to_u8)
+      j = j + 1
+    end
+    ghash_mult(block, h_hi, h_lo, res_hi, res_lo)
+    out = Bytes.new(16)
+    ptr = out.to_unsafe
+    j = 0
+    while j < 8
+      ptr[j] = ((res_hi[0].unsafe_shr(((7 - j) * 8).to_u64)) & 0xff_u64).to_u8
+      ptr[8 + j] = ((res_lo[0].unsafe_shr(((7 - j) * 8).to_u64)) & 0xff_u64).to_u8
+      j = j + 1
+    end
+    out
+  end
+
+  # Core AES-GCM engine
+  def self.gcm_encrypt_detached(key : Bytes, nonce : Bytes, plaintext : Bytes, ad : Bytes) : {Bytes, Bytes}
+    raise "AES-GCM: key must be 16 or 32 bytes" if key.size != 16 && key.size != 32
+    raise "AES-GCM: nonce must be 12 bytes" if nonce.size != 12
+
+    nr, rk = expand_key(key)
+
+    # Compute H = AES_K(0^16)
+    zero_block = Pointer(UInt8).malloc(16_u64)
+    h_ptr = Pointer(UInt8).malloc(16_u64)
+    i = 0; while i < 16
+      zero_block[i] = 0_u8; i = i + 1
+    end
+    encrypt_block(nr, rk, zero_block, h_ptr)
+    h_bytes = Bytes.new(h_ptr, 16)
+
+    # J0 = nonce || 0x00000001
+    j0_ptr = Pointer(UInt8).malloc(16_u64)
+    i = 0; while i < 12
+      j0_ptr[i] = nonce[i]; i = i + 1
+    end
+    j0_ptr[12] = 0_u8; j0_ptr[13] = 0_u8; j0_ptr[14] = 0_u8; j0_ptr[15] = 1_u8
+
+    # CTR encryption of plaintext with J1, J2, ...
+    ciphertext = Bytes.new(plaintext.size)
+    ct_ptr = ciphertext.to_unsafe
+    cb = Pointer(UInt8).malloc(16_u64)
+    ks = Pointer(UInt8).malloc(16_u64)
+    i = 0; while i < 12
+      cb[i] = nonce[i]; i = i + 1
+    end
+
+    num_blocks = (plaintext.size + 15) // 16
+    blk = 0
+    while blk < num_blocks
+      ctr_val = (blk + 2).to_u64
+      cb[12] = ((ctr_val.unsafe_shr(24_u64)) & 0xff_u64).to_u8
+      cb[13] = ((ctr_val.unsafe_shr(16_u64)) & 0xff_u64).to_u8
+      cb[14] = ((ctr_val.unsafe_shr(8_u64)) & 0xff_u64).to_u8
+      cb[15] = (ctr_val & 0xff_u64).to_u8
+      encrypt_block(nr, rk, cb, ks)
+
+      chunk = plaintext.size - blk * 16
+      chunk = 16 if chunk > 16
+      j = 0
+      while j < chunk
+        ct_ptr[blk * 16 + j] = plaintext[blk * 16 + j] ^ ks[j]
+        j = j + 1
+      end
+      blk = blk + 1
+    end
+
+    # S = GHASH(H, AAD, CT)
+    s = ghash(h_bytes, ad, ciphertext)
+
+    # Tag = S ^ AES_K(J0)
+    e_j0 = Pointer(UInt8).malloc(16_u64)
+    encrypt_block(nr, rk, j0_ptr, e_j0)
+    tag = Bytes.new(16)
+    t_ptr = tag.to_unsafe
+    i = 0
+    while i < 16
+      t_ptr[i] = s[i] ^ e_j0[i]
+      i = i + 1
+    end
+
+    {ciphertext, tag}
+  end
+
+  def self.gcm_decrypt_detached(key : Bytes, nonce : Bytes, ciphertext : Bytes, tag : Bytes, ad : Bytes) : Bytes?
+    raise "AES-GCM: key must be 16 or 32 bytes" if key.size != 16 && key.size != 32
+    raise "AES-GCM: nonce must be 12 bytes" if nonce.size != 12
+    return nil if tag.size != 16
+
+    nr, rk = expand_key(key)
+
+    # Compute H = AES_K(0^16)
+    zero_block = Pointer(UInt8).malloc(16_u64)
+    h_ptr = Pointer(UInt8).malloc(16_u64)
+    i = 0; while i < 16
+      zero_block[i] = 0_u8; i = i + 1
+    end
+    encrypt_block(nr, rk, zero_block, h_ptr)
+    h_bytes = Bytes.new(h_ptr, 16)
+
+    # S = GHASH(H, AAD, CT)
+    s = ghash(h_bytes, ad, ciphertext)
+
+    # Expected Tag = S ^ AES_K(J0)
+    j0_ptr = Pointer(UInt8).malloc(16_u64)
+    i = 0; while i < 12
+      j0_ptr[i] = nonce[i]; i = i + 1
+    end
+    j0_ptr[12] = 0_u8; j0_ptr[13] = 0_u8; j0_ptr[14] = 0_u8; j0_ptr[15] = 1_u8
+    e_j0 = Pointer(UInt8).malloc(16_u64)
+    encrypt_block(nr, rk, j0_ptr, e_j0)
+
+    expected_tag = Bytes.new(16)
+    t_ptr = expected_tag.to_unsafe
+    i = 0
+    while i < 16
+      t_ptr[i] = s[i] ^ e_j0[i]
+      i = i + 1
+    end
+
+    # Constant-time comparison
+    return nil unless Std::Crypto.constant_time_compare(tag, expected_tag)
+
+    # Decrypt ciphertext
+    plaintext = Bytes.new(ciphertext.size)
+    pt_ptr = plaintext.to_unsafe
+    cb = Pointer(UInt8).malloc(16_u64)
+    ks = Pointer(UInt8).malloc(16_u64)
+    i = 0; while i < 12
+      cb[i] = nonce[i]; i = i + 1
+    end
+
+    num_blocks = (ciphertext.size + 15) // 16
+    blk = 0
+    while blk < num_blocks
+      ctr_val = (blk + 2).to_u64
+      cb[12] = ((ctr_val.unsafe_shr(24_u64)) & 0xff_u64).to_u8
+      cb[13] = ((ctr_val.unsafe_shr(16_u64)) & 0xff_u64).to_u8
+      cb[14] = ((ctr_val.unsafe_shr(8_u64)) & 0xff_u64).to_u8
+      cb[15] = (ctr_val & 0xff_u64).to_u8
+      encrypt_block(nr, rk, cb, ks)
+
+      chunk = ciphertext.size - blk * 16
+      chunk = 16 if chunk > 16
+      j = 0
+      while j < chunk
+        pt_ptr[blk * 16 + j] = ciphertext[blk * 16 + j] ^ ks[j]
+        j = j + 1
+      end
+      blk = blk + 1
+    end
+
+    plaintext
+  end
+end
+
+# -----------------------------------------------------------------------------
+# AES-128-GCM and AES-256-GCM AEAD Ciphers
+# -----------------------------------------------------------------------------
+pub class AES128GCM
+  def self.encrypt_detached(key : Bytes, nonce : Bytes, plaintext : Bytes, ad : Bytes = Bytes.empty) : {Bytes, Bytes}
+    raise "AES128GCM: key must be 16 bytes" if key.size != 16
+    AES.gcm_encrypt_detached(key, nonce, plaintext, ad)
+  end
+
+  def self.encrypt(key : Bytes, nonce : Bytes, plaintext : Bytes, ad : Bytes = Bytes.empty) : Bytes
+    ct, tag = encrypt_detached(key, nonce, plaintext, ad)
+    out = Bytes.new(ct.size + 16)
+    i = 0; while i < ct.size
+      out[i] = ct[i]; i = i + 1
+    end
+    i = 0; while i < 16
+      out[ct.size + i] = tag[i]; i = i + 1
+    end
+    out
+  end
+
+  def self.decrypt_detached(key : Bytes, nonce : Bytes, ciphertext : Bytes, tag : Bytes, ad : Bytes = Bytes.empty) : Bytes?
+    raise "AES128GCM: key must be 16 bytes" if key.size != 16
+    AES.gcm_decrypt_detached(key, nonce, ciphertext, tag, ad)
+  end
+
+  def self.decrypt(key : Bytes, nonce : Bytes, ciphertext_and_tag : Bytes, ad : Bytes = Bytes.empty) : Bytes?
+    return nil if ciphertext_and_tag.size < 16
+    ct_len = ciphertext_and_tag.size - 16
+    ct = ciphertext_and_tag[0, ct_len]
+    tag = ciphertext_and_tag[ct_len, 16]
+    decrypt_detached(key, nonce, ct, tag, ad)
+  end
+end
+
+pub class AES256GCM
+  def self.encrypt_detached(key : Bytes, nonce : Bytes, plaintext : Bytes, ad : Bytes = Bytes.empty) : {Bytes, Bytes}
+    raise "AES256GCM: key must be 32 bytes" if key.size != 32
+    AES.gcm_encrypt_detached(key, nonce, plaintext, ad)
+  end
+
+  def self.encrypt(key : Bytes, nonce : Bytes, plaintext : Bytes, ad : Bytes = Bytes.empty) : Bytes
+    ct, tag = encrypt_detached(key, nonce, plaintext, ad)
+    out = Bytes.new(ct.size + 16)
+    i = 0; while i < ct.size
+      out[i] = ct[i]; i = i + 1
+    end
+    i = 0; while i < 16
+      out[ct.size + i] = tag[i]; i = i + 1
+    end
+    out
+  end
+
+  def self.decrypt_detached(key : Bytes, nonce : Bytes, ciphertext : Bytes, tag : Bytes, ad : Bytes = Bytes.empty) : Bytes?
+    raise "AES256GCM: key must be 32 bytes" if key.size != 32
+    AES.gcm_decrypt_detached(key, nonce, ciphertext, tag, ad)
+  end
+
+  def self.decrypt(key : Bytes, nonce : Bytes, ciphertext_and_tag : Bytes, ad : Bytes = Bytes.empty) : Bytes?
+    return nil if ciphertext_and_tag.size < 16
+    ct_len = ciphertext_and_tag.size - 16
+    ct = ciphertext_and_tag[0, ct_len]
+    tag = ciphertext_and_tag[ct_len, 16]
+    decrypt_detached(key, nonce, ct, tag, ad)
+  end
+end
+
+# -----------------------------------------------------------------------------
+# QUIC Header Protection (RFC 9001 sections 5.4.3 and 5.4.4)
+# -----------------------------------------------------------------------------
+# QUIC masks the packet number and the low header bits with five keystream
+# bytes derived from a sample of the packet's ciphertext. The AES form is a
+# single ECB block encryption of the sample, and the ChaCha20 form is one
+# block with the counter and nonce read out of the sample.
+#
+# This lives here rather than in `std/quic` because it is a use of the block
+# cipher this module already implements, and a second AES in another module
+# would be a second thing to get right, review and keep correct. The raw key
+# schedule stays private: a caller gets the mask, not a pointer.
+pub class HeaderProtection
+  # RFC 9001 section 5.4.3: mask = AES-ECB(hp_key, sample)[0..4]
+  def self.aes_mask(hp_key : Bytes, sample : Bytes) : Bytes
+    raise "HeaderProtection: AES key must be 16 or 32 bytes" if hp_key.size != 16 && hp_key.size != 32
+    raise "HeaderProtection: sample must be 16 bytes" if sample.size != 16
+    nr, rk = AES.expand_key(hp_key)
+    block = Pointer(UInt8).malloc(16_u64)
+    AES.encrypt_block(nr, rk, sample.to_unsafe, block)
+    mask = Bytes.new(5)
+    i = 0
+    while i < 5
+      mask[i] = block[i]
+      i = i + 1
+    end
+    mask
+  end
+
+  # RFC 9001 section 5.4.4: the counter is the first four bytes of the sample
+  # read little-endian, the nonce is the remaining twelve, and the mask is the
+  # first five bytes of that ChaCha20 block.
+  def self.chacha_mask(hp_key : Bytes, sample : Bytes) : Bytes
+    raise "HeaderProtection: ChaCha20 key must be 32 bytes" if hp_key.size != 32
+    raise "HeaderProtection: sample must be 16 bytes" if sample.size != 16
+    counter = 0_u64
+    i = 0
+    while i < 4
+      counter = counter | sample[i].to_u64.unsafe_shl((8 * i).to_u64)
+      i = i + 1
+    end
+    nonce = sample[4, 12]
+    block = Pointer(UInt8).malloc(64_u64)
+    ChaCha20.block(hp_key, counter, nonce, block)
+    mask = Bytes.new(5)
+    j = 0
+    while j < 5
+      mask[j] = block[j]
+      j = j + 1
+    end
+    mask
+  end
+end

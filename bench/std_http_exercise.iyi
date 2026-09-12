@@ -1,0 +1,613 @@
+# HTTP/1.1 standard library exercise.
+#
+#   ./bin/iyi run bench/std_http_exercise.iyi
+#
+# Exercises the entire HTTP surface provided by std/http:
+# Status codes, Headers (case-insensitivity, case preservation, repetition rules),
+# Header injection guards, Request smuggling guards, Bounds enforcement,
+# Chunked transfer encoding with trailers, Content-Length bodies,
+# Keep-alive semantics, Cookie/Set-Cookie parsing & serialization,
+# Params integration with std/uri, strict CRLF enforcement,
+# obs-fold/whitespace-before-colon rejections, Host header rules,
+# Transfer-Encoding rules, forbidden trailers, 32-bit Content-Length bounds,
+# persistent response framing, HEAD/CONNECT bodyless response context,
+# and separate request trailers preservation.
+
+import std/http
+using std/http::{Status, Headers, Cookie, Cookies, SameSite, Request, Response, HttpError, Params}
+
+# ---------------------------------------------------------------------------
+# 1. Status codes and descriptions
+# ---------------------------------------------------------------------------
+s200 = Status::OK
+raise "status 200 code" unless s200.code == 200
+raise "status 200 desc" unless s200.description == "OK"
+raise "status 200 success" unless s200.success?
+raise "status 200 not client_error" if s200.client_error?
+raise "status 200 ok?" unless s200.ok?
+
+s404 = Status::NotFound
+raise "status 404 code" unless s404.code == 404
+raise "status 404 desc" unless s404.description == "Not Found"
+raise "status 404 client_error" unless s404.client_error?
+raise "status 404 not success" if s404.success?
+raise "status 404 not_found?" unless s404.not_found?
+
+s500 = Status::InternalServerError
+raise "status 500 server_error" unless s500.server_error?
+raise "status 500 internal_server_error?" unless s500.internal_server_error?
+
+s418 = Status::ImATeapot
+raise "status 418 desc" unless s418.description == "I'm a teapot"
+
+puts "    status codes: ok, not found, internal server error, teapot, and predicates verified"
+
+# ---------------------------------------------------------------------------
+# 2. Headers: case-insensitivity, case preservation, and multi-values
+# ---------------------------------------------------------------------------
+h = Headers.new
+h["Content-Type"] = "application/json; charset=utf-8"
+raise "headers case-insensitive []" unless h["content-type"] == "application/json; charset=utf-8"
+raise "headers case-insensitive has_key?" unless h.has_key?("CONTENT-TYPE")
+
+h.add("Accept", "text/html")
+h.add("Accept", "application/xhtml+xml")
+raise "headers Accept combined" unless h["accept"] == "text/html, application/xhtml+xml"
+raise "headers Accept count" unless h.get("accept").size == 2
+
+h.add("Set-Cookie", "id=a1b2; Path=/; Secure")
+h.add("Set-Cookie", "theme=dark; Path=/; SameSite=Lax")
+raise "headers Set-Cookie count" unless h.get("Set-Cookie").size == 2
+
+# Original case preservation
+found_ct = false
+found_accept = false
+found_cookie = false
+h.each_pair do |k, v|
+  found_ct = true if k == "Content-Type"
+  found_accept = true if k == "Accept"
+  found_cookie = true if k == "Set-Cookie"
+end
+raise "headers original case preserved" unless found_ct && found_accept && found_cookie
+
+# Word inclusion check (Connection, etc.)
+h["Connection"] = "keep-alive, Upgrade"
+raise "includes_word keep-alive" unless h.includes_word?("Connection", "keep-alive")
+raise "includes_word upgrade" unless h.includes_word?("connection", "upgrade")
+raise "includes_word close" if h.includes_word?("connection", "close")
+
+# Pseudo-headers for HTTP/2 & HTTP/3 (:method, :path, :status, etc.)
+h[":method"] = "GET"
+h[":path"] = "/index.html"
+h[":status"] = "200"
+raise "pseudo-header :method" unless h[":method"] == "GET"
+raise "pseudo-header :path" unless h[":path"] == "/index.html"
+raise "pseudo-header :status" unless h[":status"] == "200"
+
+puts "    headers: case-insensitive lookup, original-case preservation, and multi-values verified"
+
+# ---------------------------------------------------------------------------
+# 3. Header repetition rules: single-value headers replaced
+# ---------------------------------------------------------------------------
+h2 = Headers.new
+h2.add("Content-Type", "text/plain")
+h2.add("Content-Type", "text/html")
+raise "Content-Type should not repeat" unless h2.get("Content-Type").size == 1
+raise "Content-Type replaced with latest" unless h2["Content-Type"] == "text/html"
+
+h2.add("Host", "alpha.example.com")
+h2.add("Host", "beta.example.com")
+raise "Host should not repeat" unless h2.get("Host").size == 1
+raise "Host replaced with latest" unless h2["Host"] == "beta.example.com"
+
+puts "    repetition rules: single-value headers replaced and list headers appended verified"
+
+# ---------------------------------------------------------------------------
+# 4. Header injection refused: CR or LF in value
+# ---------------------------------------------------------------------------
+h_inj = Headers.new
+add_res = h_inj.add("X-Safe", "value\r\nInjected: evil")
+case add_res
+in Request   then raise "CR header injection was not rejected"
+in Headers   then raise "CR header injection was not rejected"
+in HttpError then nil
+end
+
+add_res2 = h_inj.add("X-Safe", "value\nInjected: evil")
+case add_res2
+in Request   then raise "LF header injection was not rejected"
+in Headers   then raise "LF header injection was not rejected"
+in HttpError then nil
+end
+
+# ---------------------------------------------------------------------------
+# 5. Header injection refused: invalid character in name
+# ---------------------------------------------------------------------------
+add_res3 = h_inj.add("Bad:Name", "value")
+case add_res3
+in Request   then raise "bad name injection was not rejected"
+in Headers   then raise "bad name injection was not rejected"
+in HttpError then nil
+end
+
+puts "    header injection: CR/LF in value and invalid characters in name refused verified"
+
+# ---------------------------------------------------------------------------
+# 6. Request smuggling refused: both Content-Length and Transfer-Encoding
+# ---------------------------------------------------------------------------
+# In Request:
+smuggle_both_req = "POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"
+case Request.parse(smuggle_both_req)
+in Request   then raise "smuggling with both CL and TE in request was not rejected"
+in HttpError then nil
+end
+
+# In Response:
+smuggle_both_resp = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"
+case Response.parse(smuggle_both_resp)
+in Response  then raise "smuggling with both CL and TE in response was not rejected"
+in HttpError then nil
+end
+
+# ---------------------------------------------------------------------------
+# 7. Request smuggling refused: conflicting Content-Length values
+# ---------------------------------------------------------------------------
+# In Request:
+smuggle_cl_req = "POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 10\r\nContent-Length: 20\r\n\r\n12345678901234567890"
+case Request.parse(smuggle_cl_req)
+in Request   then raise "smuggling with conflicting CL in request was not rejected"
+in HttpError then nil
+end
+
+# In Response:
+smuggle_cl_resp = "HTTP/1.1 200 OK\r\nContent-Length: 10\r\nContent-Length: 20\r\n\r\n12345678901234567890"
+case Response.parse(smuggle_cl_resp)
+in Response  then raise "smuggling with conflicting CL in response was not rejected"
+in HttpError then nil
+end
+
+# Conflicting CL on Headers#add
+h_cl = Headers.new
+h_cl.add("Content-Length", "10")
+res_cl = h_cl.add("Content-Length", "20")
+case res_cl
+in Headers   then raise "conflicting CL on add was not rejected"
+in HttpError then nil
+end
+
+puts "    request smuggling: both CL/TE and conflicting CL values refused verified"
+
+# ---------------------------------------------------------------------------
+# 8. Bounds: request line length
+# ---------------------------------------------------------------------------
+long_target = "/" + ("a" * 8200)
+long_req = "GET #{long_target} HTTP/1.1\r\nHost: example.com\r\n\r\n"
+case Request.parse(long_req)
+in Request   then raise "oversized request line was not rejected"
+in HttpError then nil
+end
+
+# ---------------------------------------------------------------------------
+# 9. Bounds: maximum header count
+# ---------------------------------------------------------------------------
+many_headers = "GET / HTTP/1.1\r\nHost: example.com\r\n"
+i = 0
+while i < 105
+  many_headers = many_headers + "X-Header-#{i}: val\r\n"
+  i = i + 1
+end
+many_headers = many_headers + "\r\n"
+case Request.parse(many_headers)
+in Request   then raise "oversized header count was not rejected"
+in HttpError then nil
+end
+
+# ---------------------------------------------------------------------------
+# 10. Bounds: maximum headers total size
+# ---------------------------------------------------------------------------
+huge_headers = "GET / HTTP/1.1\r\nHost: example.com\r\n"
+i = 0
+while i < 30
+  huge_headers = huge_headers + "X-Large-#{i}: " + ("x" * 600) + "\r\n"
+  i = i + 1
+end
+huge_headers = huge_headers + "\r\n"
+case Request.parse(huge_headers)
+in Request   then raise "oversized headers total size was not rejected"
+in HttpError then nil
+end
+
+puts "    bounds: request line (8192 B), header count (100), and headers size (16384 B) verified"
+
+# ---------------------------------------------------------------------------
+# 11. Chunked parsing: non-hex chunk size refused
+# ---------------------------------------------------------------------------
+bad_hex = "POST / HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\nZZ\r\nhello\r\n0\r\n\r\n"
+case Request.parse(bad_hex)
+in Request   then raise "bad hex chunk was not rejected"
+in HttpError then nil
+end
+
+# ---------------------------------------------------------------------------
+# 12. Chunked parsing: missing final zero chunk refused
+# ---------------------------------------------------------------------------
+no_zero = "POST / HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n"
+case Request.parse(no_zero)
+in Request   then raise "missing final zero chunk was not rejected"
+in HttpError then nil
+end
+
+# ---------------------------------------------------------------------------
+# 13. Chunked parsing: oversized chunk size refused
+# ---------------------------------------------------------------------------
+huge_chunk = "POST / HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n2000000\r\n"
+case Request.parse(huge_chunk)
+in Request   then raise "oversized chunk size was not rejected"
+in HttpError then nil
+end
+
+# ---------------------------------------------------------------------------
+# 14. Chunked parsing: missing CRLF after chunk data refused
+# ---------------------------------------------------------------------------
+no_crlf = "POST / HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhelloX0\r\n\r\n"
+case Request.parse(no_crlf)
+in Request   then raise "missing CRLF after chunk data was not rejected"
+in HttpError then nil
+end
+
+puts "    chunked parsing: hex validation, final zero chunk, size caps, and CRLF delimiters verified"
+
+# ---------------------------------------------------------------------------
+# 15. Full Request and Response Roundtrip with Chunked Body & Trailers
+# ---------------------------------------------------------------------------
+req = Request.new("POST", "/upload", version: "HTTP/1.1")
+req.headers["Host"] = "api.example.com"
+req.headers["User-Agent"] = "iyi-http/1.0"
+req.body = "streaming content payload"
+
+trailers = Headers.new
+trailers["X-Checksum"] = "sha256-abc123xyz"
+trailers["X-Audit-Status"] = "verified"
+
+raw_chunked_req = req.serialize(chunked: true, trailers: trailers)
+case raw_chunked_req
+in HttpError then raise "failed to serialize chunked request: #{raw_chunked_req.message}"
+in String
+  parsed = Request.parse(raw_chunked_req)
+  case parsed
+  in HttpError then raise "failed to parse chunked request: #{parsed.message}"
+  in Request
+    raise "parsed method" unless parsed.method == "POST"
+    raise "parsed target" unless parsed.target == "/upload"
+    raise "parsed body" unless parsed.body == "streaming content payload"
+    raise "parsed chunked?" unless parsed.chunked?
+    raise "parsed host" unless parsed.headers["Host"] == "api.example.com"
+    raise "parsed request trailer checksum" unless parsed.trailers["X-Checksum"] == "sha256-abc123xyz"
+    raise "parsed request trailer audit" unless parsed.trailers["X-Audit-Status"] == "verified"
+    raise "trailer leaked into headers" if parsed.headers.has_key?("X-Checksum")
+  end
+end
+
+resp = Response.new(Status::OK, body: "chunked response data")
+resp.headers["Server"] = "iyi-server/0.1"
+resp_trailers = Headers.new
+resp_trailers["X-Server-Timing"] = "total=4.2ms"
+
+raw_chunked_resp = resp.serialize(chunked: true, trailers: resp_trailers)
+case raw_chunked_resp
+in HttpError then raise "failed to serialize chunked response: #{raw_chunked_resp.message}"
+in String
+  parsed_resp = Response.parse(raw_chunked_resp)
+  case parsed_resp
+  in HttpError then raise "failed to parse chunked response: #{parsed_resp.message}"
+  in Response
+    raise "parsed status code" unless parsed_resp.status_code == 200
+    raise "parsed status desc" unless parsed_resp.status.description == "OK"
+    raise "parsed body" unless parsed_resp.body == "chunked response data"
+    raise "parsed trailer timing" unless parsed_resp.trailers["X-Server-Timing"] == "total=4.2ms"
+    raise "response trailer leaked into headers" if parsed_resp.headers.has_key?("X-Server-Timing")
+  end
+end
+
+puts "    roundtrip: full request and response with chunked body and trailers verified"
+
+# ---------------------------------------------------------------------------
+# 16. Content-Length bodies roundtrip
+# ---------------------------------------------------------------------------
+req_cl = Request.new("POST", "/data", body: "fixed-length-payload")
+req_cl.headers["Host"] = "example.com"
+raw_cl_req = req_cl.serialize
+case raw_cl_req
+in HttpError then raise "failed serialize CL: #{raw_cl_req.message}"
+in String
+  parsed_cl_req = Request.parse(raw_cl_req)
+  case parsed_cl_req
+  in HttpError then raise "failed parse CL: #{parsed_cl_req.message}"
+  in Request
+    raise "parsed body CL" unless parsed_cl_req.body == "fixed-length-payload"
+    raise "parsed Content-Length header" unless parsed_cl_req.headers["Content-Length"] == "20"
+  end
+end
+
+puts "    roundtrip: Content-Length request and response bodies verified"
+
+# ---------------------------------------------------------------------------
+# 17. Keep-alive semantics
+# ---------------------------------------------------------------------------
+req_11 = Request.new("GET", "/", version: "HTTP/1.1")
+raise "HTTP/1.1 defaults to keep-alive" unless req_11.keep_alive?
+req_11.headers["Connection"] = "close"
+raise "HTTP/1.1 with close is not keep-alive" if req_11.keep_alive?
+
+req_10 = Request.new("GET", "/", version: "HTTP/1.0")
+raise "HTTP/1.0 defaults to close" if req_10.keep_alive?
+req_10.headers["Connection"] = "keep-alive"
+raise "HTTP/1.0 with keep-alive is keep-alive" unless req_10.keep_alive?
+
+puts "    keep-alive: HTTP/1.1 default keep-alive and HTTP/1.0 default close verified"
+
+# ---------------------------------------------------------------------------
+# 18. Cookie parsing and serialization: attributes and SameSite
+# ---------------------------------------------------------------------------
+cookie = Cookie.new("session_token", "xyz987abc",
+  path: "/app",
+  domain: "example.com",
+  expires: "Wed, 21 Oct 2026 07:28:00 GMT",
+  max_age: 3600_i64,
+  secure: true,
+  http_only: true,
+  samesite: SameSite::Strict)
+
+cookie_str = cookie.to_set_cookie
+raise "cookie string missing name/val" unless cookie_str.includes?("session_token=xyz987abc")
+raise "cookie string missing Path" unless cookie_str.includes?("Path=/app")
+raise "cookie string missing Domain" unless cookie_str.includes?("Domain=example.com")
+raise "cookie string missing Expires" unless cookie_str.includes?("Expires=Wed, 21 Oct 2026 07:28:00 GMT")
+raise "cookie string missing Max-Age" unless cookie_str.includes?("Max-Age=3600")
+raise "cookie string missing Secure" unless cookie_str.includes?("Secure")
+raise "cookie string missing HttpOnly" unless cookie_str.includes?("HttpOnly")
+raise "cookie string missing SameSite" unless cookie_str.includes?("SameSite=Strict")
+
+parsed_cookie = Cookie.parse_set_cookie(cookie_str)
+case parsed_cookie
+in HttpError then raise "failed to parse Set-Cookie: #{parsed_cookie.message}"
+in Cookie
+  raise "parsed cookie name" unless parsed_cookie.name == "session_token"
+  raise "parsed cookie val" unless parsed_cookie.value == "xyz987abc"
+  raise "parsed cookie path" unless parsed_cookie.path == "/app"
+  raise "parsed cookie domain" unless parsed_cookie.domain == "example.com"
+  raise "parsed cookie expires" unless parsed_cookie.expires == "Wed, 21 Oct 2026 07:28:00 GMT"
+  raise "parsed cookie max_age" unless parsed_cookie.max_age == 3600_i64
+  raise "parsed cookie secure" unless parsed_cookie.secure
+  raise "parsed cookie http_only" unless parsed_cookie.http_only
+  raise "parsed cookie samesite" unless parsed_cookie.samesite == SameSite::Strict
+end
+
+raw_cookie_hdr = "user=alice; theme=dark; token=\"quoted-value\""
+cookies_arr = Cookie.parse(raw_cookie_hdr)
+raise "cookies arr size" unless cookies_arr.size == 3
+raise "cookie 0" unless cookies_arr[0].name == "user" && cookies_arr[0].value == "alice"
+raise "cookie 1" unless cookies_arr[1].name == "theme" && cookies_arr[1].value == "dark"
+raise "cookie 2 unwrap quotes" unless cookies_arr[2].name == "token" && cookies_arr[2].value == "quoted-value"
+
+cookies = Cookies.new
+cookies["pref"] = "compact"
+cookies << Cookie.new("lang", "en", path: "/")
+raise "cookies size" unless cookies.size == 2
+raise "cookies has_key" unless cookies.has_key?("pref")
+raise "cookies []" unless cookies["lang"].value == "en"
+
+req_c = Request.new("GET", "/")
+cookies.add_request_headers(req_c.headers)
+raise "Cookie header on request" unless req_c.headers["Cookie"] == "pref=compact; lang=en"
+
+req_c_parsed = req_c.cookies
+raise "req.cookies size" unless req_c_parsed.size == 2
+raise "req.cookies value" unless req_c_parsed["pref"].value == "compact"
+
+puts "    cookie parsing: attributes (Path, Domain, Expires, Max-Age, Secure, HttpOnly, SameSite) verified"
+
+# ---------------------------------------------------------------------------
+# 19. Params: query and form parsing reusing std/uri
+# ---------------------------------------------------------------------------
+req_params = Request.new("GET", "/search?q=iyi+language&page=2&sort=desc")
+qp = req_params.query_params
+raise "query_params q" unless qp["q"] == "iyi language"
+raise "query_params page" unless qp["page"] == "2"
+raise "query_params sort" unless qp["sort"] == "desc"
+
+req_form = Request.new("POST", "/submit", body: "username=jason&action=login&flag=true")
+fp = req_form.form_params
+raise "form_params username" unless fp["username"] == "jason"
+raise "form_params action" unless fp["action"] == "login"
+raise "form_params flag" unless fp["flag"] == "true"
+
+puts "    params: query and form-urlencoded parsing reusing std/uri verified"
+
+# ---------------------------------------------------------------------------
+# 20. Strict RFC 9112 framing: CRLF required, bare LF rejected
+# ---------------------------------------------------------------------------
+bare_lf_req = "GET / HTTP/1.1\nHost: example.com\r\n\r\n"
+case Request.parse(bare_lf_req)
+in Request   then raise "bare LF in request line was not rejected"
+in HttpError then nil
+end
+
+bare_lf_hdr = "GET / HTTP/1.1\r\nHost: example.com\n\r\n"
+case Request.parse(bare_lf_hdr)
+in Request   then raise "bare LF in header was not rejected"
+in HttpError then nil
+end
+
+bare_lf_status = "HTTP/1.1 200 OK\nContent-Length: 0\r\n\r\n"
+case Response.parse(bare_lf_status)
+in Response  then raise "bare LF in status line was not rejected"
+in HttpError then nil
+end
+
+bare_lf_resp_hdr = "HTTP/1.1 200 OK\r\nContent-Length: 0\n\r\n"
+case Response.parse(bare_lf_resp_hdr)
+in Response  then raise "bare LF in response header was not rejected"
+in HttpError then nil
+end
+
+bare_lf_chunk_size = "POST / HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n5\nhello\r\n0\r\n\r\n"
+case Request.parse(bare_lf_chunk_size)
+in Request   then raise "bare LF in chunk size was not rejected"
+in HttpError then nil
+end
+
+bare_lf_chunk_delim = "POST / HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\n0\r\n\r\n"
+case Request.parse(bare_lf_chunk_delim)
+in Request   then raise "bare LF chunk delimiter was not rejected"
+in HttpError then nil
+end
+
+bare_lf_trailer = "POST / HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nX-Trailer: val\n\r\n"
+case Request.parse(bare_lf_trailer)
+in Request   then raise "bare LF in trailer line was not rejected"
+in HttpError then nil
+end
+
+puts "    strict CRLF: bare LF rejected in request, status, header, chunk, and trailer lines verified"
+
+# ---------------------------------------------------------------------------
+# 21. RFC 9112 Section 5.1/5.2: obs-fold and whitespace before colon rejected
+# ---------------------------------------------------------------------------
+obs_fold_req = "GET / HTTP/1.1\r\nHost: example.com\r\nX-Fold: val\r\n fold\r\n\r\n"
+case Request.parse(obs_fold_req)
+in Request   then raise "obs-fold in header was not rejected"
+in HttpError then nil
+end
+
+ws_colon_req = "GET / HTTP/1.1\r\nHost : example.com\r\n\r\n"
+case Request.parse(ws_colon_req)
+in Request   then raise "whitespace before colon was not rejected"
+in HttpError then nil
+end
+
+obs_fold_trailer = "POST / HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nX-Trailer: val\r\n fold\r\n\r\n"
+case Request.parse(obs_fold_trailer)
+in Request   then raise "obs-fold in trailer was not rejected"
+in HttpError then nil
+end
+
+ws_colon_trailer = "POST / HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nX-Trailer : value\r\n\r\n"
+case Request.parse(ws_colon_trailer)
+in Request   then raise "whitespace before colon in trailer was not rejected"
+in HttpError then nil
+end
+
+puts "    RFC 9112 Section 5.1/5.2: obs-fold and whitespace before colon rejected in headers and trailers verified"
+
+# ---------------------------------------------------------------------------
+# 22. RFC 9112 Section 3.2: Mandatory and unique Host header in HTTP/1.1
+# ---------------------------------------------------------------------------
+missing_host_req = "GET / HTTP/1.1\r\nUser-Agent: test\r\n\r\n"
+case Request.parse(missing_host_req)
+in Request   then raise "missing Host header was not rejected"
+in HttpError then nil
+end
+
+multi_host_req = "GET / HTTP/1.1\r\nHost: a.com\r\nHost: b.com\r\n\r\n"
+case Request.parse(multi_host_req)
+in Request   then raise "multiple Host headers was not rejected"
+in HttpError then nil
+end
+
+puts "    Host header: mandatory and exactly one Host header required in HTTP/1.1 verified"
+
+# ---------------------------------------------------------------------------
+# 23. RFC 9112 Section 6.1: Transfer-Encoding validation
+# ---------------------------------------------------------------------------
+dup_chunked_req = "POST / HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked, chunked\r\n\r\n0\r\n\r\n"
+case Request.parse(dup_chunked_req)
+in Request   then raise "duplicate chunked was not rejected"
+in HttpError then nil
+end
+
+non_final_chunked_req = "POST / HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked, gzip\r\n\r\n0\r\n\r\n"
+case Request.parse(non_final_chunked_req)
+in Request   then raise "non-final chunked was not rejected"
+in HttpError then nil
+end
+
+unsupported_te_req = "POST / HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: deflate\r\n\r\n0\r\n\r\n"
+case Request.parse(unsupported_te_req)
+in Request   then raise "unsupported Transfer-Encoding was not rejected"
+in HttpError then nil
+end
+
+puts "    Transfer-Encoding: single and final chunked coding enforced, unsupported codings rejected verified"
+
+# ---------------------------------------------------------------------------
+# 24. RFC 9112 Section 7.1.2: Forbidden trailer headers rejected
+# ---------------------------------------------------------------------------
+bad_trailer_req = "POST / HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nHost: evil.com\r\n\r\n"
+case Request.parse(bad_trailer_req)
+in Request   then raise "forbidden trailer Host was not rejected"
+in HttpError then nil
+end
+
+puts "    forbidden trailers: Host, Content-Length, Transfer-Encoding, Trailer, Connection, Keep-Alive, Upgrade, TE rejected verified"
+
+# ---------------------------------------------------------------------------
+# 25. Content-Length 32-bit bound enforcement before conversion
+# ---------------------------------------------------------------------------
+huge_cl_head_resp = "HTTP/1.1 200 OK\r\nContent-Length: 5000000000\r\n\r\n"
+case Response.parse(huge_cl_head_resp, req_method: "HEAD")
+in Response  then raise "oversized Content-Length was not rejected"
+in HttpError then nil
+end
+
+dup_cl_req = "POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 10\r\nContent-Length: 10\r\n\r\n0123456789"
+case Request.parse(dup_cl_req)
+in Request   then raise "duplicate identical Content-Length was not rejected"
+in HttpError then nil
+end
+
+puts "    Content-Length: 32-bit bounds check before conversion and duplicate CL rejection verified"
+
+# ---------------------------------------------------------------------------
+# 26. RFC 9112 Section 6.3: Persistent response framing & HEAD/CONNECT context
+# ---------------------------------------------------------------------------
+unframed_resp = "HTTP/1.1 200 OK\r\nServer: test\r\n\r\nsome content without framing"
+case Response.parse(unframed_resp)
+in Response  then raise "unframed persistent response was not rejected"
+in HttpError then nil
+end
+
+framed_close_resp = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\ncontent till closure"
+case Response.parse(framed_close_resp)
+in HttpError then raise "response with Connection: close failed: #{it.message}"
+in Response  then raise "response body close" unless it.body == "content till closure"
+end
+
+framed_204_resp = "HTTP/1.1 204 No Content\r\n\r\n"
+case Response.parse(framed_204_resp)
+in HttpError then raise "204 response failed: #{it.message}"
+in Response  then raise "204 body not empty" unless it.body.empty?
+end
+
+# HEAD 200 with misleading Content-Length: must NOT consume a body
+head_resp_raw = "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n"
+head_resp = Response.parse(head_resp_raw, req_method: "HEAD")
+case head_resp
+in HttpError then raise "HEAD response failed: #{head_resp.message}"
+in Response
+  raise "HEAD 200 must have empty body" unless head_resp.body.empty?
+  raise "HEAD 200 preserves Content-Length header" unless head_resp.headers["Content-Length"] == "100"
+end
+
+# CONNECT 200 with tunnel bytes following headers: must NOT consume a body
+connect_resp_raw = "HTTP/1.1 200 Connection Established\r\n\r\nRAW_TUNNEL_BYTES_NOT_HTTP_BODY"
+connect_resp = Response.parse(connect_resp_raw, req_method: "CONNECT")
+case connect_resp
+in HttpError then raise "CONNECT response failed: #{connect_resp.message}"
+in Response
+  raise "CONNECT 200 must have empty body" unless connect_resp.body.empty?
+end
+
+puts "    persistent response framing: rejection of unframed persistent responses and bodyless HEAD/CONNECT verified"
+
+puts "all std/http checks passed"

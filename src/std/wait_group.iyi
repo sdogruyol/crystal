@@ -1,0 +1,69 @@
+# Crystal-compatible WaitGroup API — declarative barrier for collections of fibers.
+
+module std/wait_group
+
+pub import std/fiber
+pub import std/atomic
+using std/fiber::{Fiber}
+using std/atomic::{Atomic}
+
+pub class WaitGroup
+  @counter : Atomic(Int32)
+  @waiting : Array(IyiFiber)
+
+  def self.wait(&) : Nil
+    instance = new
+    yield instance
+    instance.wait
+  end
+
+  def initialize(n : Int32 = 0)
+    @counter = Atomic(Int32).new(n)
+    @waiting = Array(IyiFiber).new
+  end
+
+  def add(n : Int32 = 1) : Nil
+    loop do
+      cur = @counter.get
+      raise "Negative WaitGroup counter" if cur + n < 0
+      val, ok = @counter.compare_and_set(cur, cur + n)
+      if ok
+        new_val = cur + n
+        if new_val == 0
+          while !@waiting.empty?
+            w = @waiting.shift
+            w.enqueue
+          end
+        end
+        return
+      end
+    end
+  end
+
+  def done : Nil
+    add(-1)
+  end
+
+  def wait : Nil
+    return if @counter.get == 0
+    @waiting << IyiScheduler.current
+    IyiScheduler.reschedule
+  end
+
+  def spawn(*, name : String? = nil, &block : ->) : Fiber
+    add(1)
+    f = Fiber.new(name) do
+      begin
+        block.call
+      ensure
+        done
+      end
+    end
+    f.enqueue
+    f
+  end
+
+  def done? : Bool
+    @counter.get == 0
+  end
+end

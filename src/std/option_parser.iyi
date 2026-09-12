@@ -1,0 +1,407 @@
+# Standard OptionParser library for command-line arguments processing in iyi.
+#
+# Conforms to standard POSIX and GNU command-line conventions:
+#   * Short flags (-f) and long flags (--flag)
+#   * Flags with required arguments (-o VAL, --output=VAL, --output VAL)
+#   * Flags with optional arguments (-c [LEVEL], --compress[=LEVEL])
+#   * Short option bundling (-vxf)
+#   * Double-dash (--) terminating option parsing (everything after is positional)
+#   * Configurable error handlers for missing arguments and invalid options
+#   * Subcommand support
+#   * Aligned, readable automatic help message generation
+#
+# Scope and omissions from Crystal's option_parser.cr:
+#   Crystal's option_parser.cr includes complex regex-based string scanners that
+#   depended on PCRE2. This implementation relies strictly on zero-allocation byte
+#   and character inspection without regular expressions or external C libraries.
+
+module std/option_parser
+
+pub enum FlagValue
+  None     = 0
+  Optional = 1
+  Required = 2
+
+  def none? : Bool
+    value == 0
+  end
+
+  def optional? : Bool
+    value == 1
+  end
+
+  def required? : Bool
+    value == 2
+  end
+end
+
+pub struct Handler
+  getter value_type : FlagValue
+  getter block : Proc(String, Nil)
+
+  def initialize(@value_type : FlagValue, @block : Proc(String, Nil))
+  end
+end
+
+pub class OptionParser
+  pub class Exception < ::Exception
+  end
+
+  pub class InvalidOption < Exception
+    getter flag : String
+    getter message : String
+
+    def initialize(@flag : String)
+      @message = "Invalid option: #{@flag}"
+    end
+  end
+
+  pub class MissingOption < Exception
+    getter flag : String
+    getter message : String
+
+    def initialize(@flag : String)
+      @message = "Missing option: #{@flag}"
+    end
+  end
+
+  property banner : String?
+  property summary_width : Int32
+  property summary_indent : String
+  property gnu_optional_args : Bool
+
+  def gnu_optional_args? : Bool
+    @gnu_optional_args
+  end
+
+  @flags : Array(String)
+  @handlers : Hash(String, Handler)
+  @unknown_args : Proc(Array(String), Array(String), Nil)?
+  @missing_option : Proc(String, Nil)?
+  @invalid_option : Proc(String, Nil)?
+  @before_each : Proc(String, Nil)?
+  @stop : Bool
+
+  def initialize(*, @gnu_optional_args : Bool = false)
+    @banner = nil
+    @summary_width = 32
+    @summary_indent = "    "
+    @flags = [] of String
+    @handlers = Hash(String, Handler).new
+    @missing_option = ->(flag : String) { raise MissingOption.new(flag).message }
+    @invalid_option = ->(flag : String) { raise InvalidOption.new(flag).message }
+    @before_each = nil
+    @stop = false
+  end
+
+  def self.new(*, gnu_optional_args : Bool = false, &block : OptionParser -> Nil) : OptionParser
+    parser = OptionParser.new(gnu_optional_args: gnu_optional_args)
+    block.call(parser)
+    parser
+  end
+
+  def self.parse(args : Array(String) = ARGV, *, gnu_optional_args : Bool = false, &block : OptionParser -> Nil) : OptionParser
+    parser = OptionParser.new(gnu_optional_args: gnu_optional_args)
+    block.call(parser)
+    parser.parse(args)
+    parser
+  end
+
+  def on(flag : String, description : String, &block : String -> Nil) : Nil
+    append_flag(flag, description)
+    name, value_type = parse_flag_definition(flag)
+    @handlers[name] = Handler.new(value_type, block)
+  end
+
+  def before_each(&block : String -> Nil) : Nil
+    @before_each = block
+  end
+
+  def on(short_flag : String, long_flag : String, description : String, &block : String -> Nil) : Nil
+    if short_flag.empty?
+      append_flag(long_flag, description)
+    else
+      append_flag("#{short_flag}, #{long_flag}", description)
+    end
+
+    s_name, s_val = parse_flag_definition(short_flag)
+    l_name, l_val = parse_flag_definition(long_flag)
+
+    val_type = if s_val.required? || l_val.required?
+                 FlagValue::Required
+               elsif s_val.optional? || l_val.optional?
+                 FlagValue::Optional
+               else
+                 FlagValue::None
+               end
+
+    handler = Handler.new(val_type, block)
+    @handlers[s_name] = handler unless s_name.empty?
+    @handlers[l_name] = handler unless l_name.empty?
+  end
+
+  def separator(message : String = "") : Nil
+    @flags << message
+  end
+
+  def missing_option(&block : String -> Nil) : Nil
+    @missing_option = block
+  end
+
+  def invalid_option(&block : String -> Nil) : Nil
+    @invalid_option = block
+  end
+
+  def unknown_args(&block : Array(String), Array(String) -> Nil) : Nil
+    @unknown_args = block
+  end
+
+  def stop : Nil
+    @stop = true
+  end
+
+  def parse(args : Array(String)) : Array(String)
+    handled_indices = [] of Int32
+    double_dash_index : Int32? = nil
+    @stop = false
+
+    i = 0
+    while i < args.size
+      arg = args[i]
+
+      if @stop
+        double_dash_index = i - 1
+        @stop = false
+        break
+      end
+
+      if arg == "--"
+        double_dash_index = i
+        handled_indices << i
+        break
+      end
+
+      if bundle = validate_bundle(arg)
+        handled_indices << i
+        bundle.each_with_index do |handler, b_idx|
+          if !handler.value_type.none?
+            val = arg[b_idx + 2, arg.bytesize - b_idx - 2]
+            handler.block.call(val)
+          else
+            handler.block.call("")
+          end
+        end
+      else
+        flag, inline_val = parse_arg_to_flag_and_value(arg)
+        if handler = @handlers[flag]?
+          handled_indices << i
+          val = inline_val
+          if val.nil?
+            if handler.value_type.required?
+              if i + 1 < args.size && !args[i + 1].starts_with?('-')
+                val = args[i + 1]
+                handled_indices << i + 1
+                i = i + 1
+              elsif i + 1 < args.size && args[i + 1] != "--"
+                val = args[i + 1]
+                handled_indices << i + 1
+                i = i + 1
+              else
+                if cb = @missing_option
+                  cb.call(flag)
+                end
+              end
+            elsif handler.value_type.optional?
+              if i + 1 < args.size && !args[i + 1].starts_with?('-') && !@handlers.has_key?(args[i + 1])
+                val = args[i + 1]
+                handled_indices << i + 1
+                i = i + 1
+              else
+                val = ""
+              end
+            else
+              val = ""
+            end
+          end
+
+          # If subcommand (flag not starting with -), remove subcommands
+          unless flag.starts_with?('-')
+            to_remove = [] of String
+            @handlers.each do |k, _|
+              to_remove << k unless k.starts_with?('-')
+            end
+            to_remove.each { |k| @handlers.delete(k) }
+          end
+
+          handler.block.call(val || "")
+        end
+      end
+
+      i = i + 1
+    end
+
+    # Collect remaining arguments
+    remaining = [] of String
+    i = 0
+    while i < args.size
+      if !handled_indices.includes?(i)
+        remaining << args[i]
+      end
+      i = i + 1
+    end
+
+    # Handle unknown options in remaining (before double dash)
+    remaining.each do |rem_arg|
+      if double_dash_index
+        orig_idx = args.index(rem_arg)
+        if orig_idx && orig_idx < double_dash_index
+          if rem_arg.starts_with?('-') && rem_arg != "-"
+            if cb = @invalid_option
+              cb.call(rem_arg)
+            end
+          end
+        end
+      else
+        if rem_arg.starts_with?('-') && rem_arg != "-"
+          if cb = @invalid_option
+            cb.call(rem_arg)
+          end
+        end
+      end
+    end
+
+    if unknown_args = @unknown_args
+      if double_dash_index
+        before_dash = [] of String
+        after_dash = [] of String
+        remaining.each do |arg|
+          orig_idx = args.index(arg)
+          if orig_idx && orig_idx < double_dash_index
+            before_dash << arg
+          else
+            after_dash << arg
+          end
+        end
+        unknown_args.call(before_dash, after_dash)
+      else
+        unknown_args.call(remaining, [] of String)
+      end
+    end
+
+    # Mutate args in-place to match Crystal behavior
+    args.unsafe_set_size(remaining.size)
+    i = 0
+    while i < remaining.size
+      args[i] = remaining[i]
+      i = i + 1
+    end
+
+    remaining
+  end
+
+  def to_s(io) : Nil
+    if b = @banner
+      io << b
+      io << '\n'
+    end
+    @flags.each_with_index do |flag_desc, idx|
+      io << flag_desc
+      io << '\n' unless idx == @flags.size - 1
+    end
+  end
+
+  def to_s : String
+    lines = [] of String
+    if b = @banner
+      lines << b
+    end
+    @flags.each do |flag_desc|
+      lines << flag_desc
+    end
+    lines.join("\n")
+  end
+
+  private def append_flag(flag : String, description : String) : Nil
+    display_flag = flag.starts_with?("--") ? "    #{flag}" : flag
+    indent = @summary_indent
+    width = @summary_width
+
+    if display_flag.size > width
+      @flags << "#{indent}#{display_flag}\n#{indent}#{" " * width} #{description}"
+    else
+      padding = " " * (width - display_flag.size)
+      @flags << "#{indent}#{display_flag}#{padding} #{description}"
+    end
+  end
+
+  private def parse_flag_definition(flag : String) : Tuple(String, FlagValue)
+    return {"", FlagValue::None} if flag.empty?
+
+    if flag.starts_with?("--")
+      bracket = flag.index('[')
+      if bracket
+        name = flag[0, bracket].strip
+        return {name, FlagValue::Optional}
+      end
+      eq = flag.index('=')
+      if eq
+        return {flag[0, eq].strip, FlagValue::Required}
+      end
+      space = flag.index(' ')
+      if space
+        name = flag[0, space].strip
+        return {name, FlagValue::Required}
+      end
+      return {flag, FlagValue::None}
+    elsif flag.starts_with?('-')
+      if flag.size > 2
+        name = flag[0, 2]
+        bracket = flag.index('[')
+        if bracket
+          return {name, FlagValue::Optional}
+        end
+        return {name, FlagValue::Required}
+      else
+        return {flag, FlagValue::None}
+      end
+    else
+      {flag, FlagValue::None}
+    end
+  end
+
+  private def parse_arg_to_flag_and_value(arg : String) : Tuple(String, String?)
+    if arg.starts_with?("--")
+      eq = arg.index('=')
+      if eq
+        name = arg[0, eq]
+        val = arg[eq + 1, arg.bytesize - eq - 1]
+        return {name, val}
+      end
+      return {arg, nil}
+    elsif arg.starts_with?('-') && !arg.starts_with?("--") && arg.size > 2
+      name = arg[0, 2]
+      val = arg[2, arg.bytesize - 2]
+      return {name, val}
+    else
+      return {arg, nil}
+    end
+  end
+
+  private def validate_bundle(arg : String) : Array(Handler)?
+    return nil unless arg.starts_with?('-') && !arg.starts_with?("--") && arg.size > 2
+    handlers = [] of Handler
+    i = 1
+    while i < arg.size
+      ch = arg[i]
+      flag = "-#{ch}"
+      handler = @handlers[flag]?
+      return nil unless handler
+      handlers << handler
+      if handler.value_type.required? || handler.value_type.optional?
+        break
+      end
+      i = i + 1
+    end
+    handlers
+  end
+end

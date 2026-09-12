@@ -1,0 +1,503 @@
+# Utility types standard library exercise.
+#
+#   ./bin/iyi run bench/std_utility_types_exercise.iyi
+#
+# Exercises all twelve utility types parity modules:
+#   1.  std/annotations (compiler annotations: Deprecated, Flags, Link, Experimental, TargetFeature)
+#   2.  std/docs_pseudo_methods (documentation compiler pseudo-methods)
+#   3.  std/base64 (RFC 2045/4648 standard, strict, and urlsafe encoding/decoding)
+#   4.  std/bit_array (compact boolean bit array with popcount, toggle, invert, fill)
+#   5.  std/colorize (ANSI color and text decoration formatting)
+#   6.  std/static_array (fixed-size stack-allocated array with slice bridges)
+#   7.  std/tuple (heterogeneous compile-time sequences, indexing, mapping)
+#   8.  std/named_tuple (keyword-indexed tuples, keys, values, merging)
+#   9.  std/benchmark (execution time, realtime, memory, and IPS benchmarking)
+#   10. std/random (PCG32, ISAAC, Secure entropy, array sample/shuffle)
+#   11. std/semantic_version (SemVer 2.0.0 parsing, comparison, and version bumping)
+#   12. std/uuid (RFC 4122 / RFC 9562 UUID v1-v8, namespaces, parsing, validation)
+#
+# Note on UUID v1!..v8!:
+#   In Crystal, UUID defines v1!..v8! which raise if the version does not match.
+#   In iyi, '!' is the try/error-propagation operator (SPEC.md III.1.7a) and cannot
+#   be part of a method name. Explicit checked names are exposed instead:
+#   validate_v1..validate_v8, check_v1..check_v8, and ensure_v1..ensure_v8.
+#
+# Every section prints a progress line and raises on mismatch.
+
+module bench/std_utility_types_exercise
+
+import std/annotations
+import std/docs_pseudo_methods
+import std/base64
+using std/base64::{Base64}
+import std/bit_array
+using std/bit_array::{BitArray}
+import std/colorize
+using std/colorize::{Colorize}
+import std/static_array
+using std/static_array::{StaticArray}
+import std/tuple
+import std/named_tuple
+import std/benchmark
+using std/benchmark::{Benchmark}
+import std/random
+using std/random::{Random}
+import std/semantic_version
+using std/semantic_version::{SemanticVersion}
+import std/uuid
+using std/uuid::{UUID}
+
+def assert_true(cond : Bool, msg : String) : Nil
+  if !cond
+    raise "ASSERTION FAILED: #{msg}"
+  end
+end
+
+def assert_equal(expected : Int32, actual : Int32, msg : String) : Nil
+  if expected != actual
+    raise "ASSERTION FAILED: #{msg} (expected #{expected}, got #{actual})"
+  end
+end
+
+def assert_str_equal(expected : String, actual : String, msg : String) : Nil
+  if expected != actual
+    raise "ASSERTION FAILED: #{msg} (expected '#{expected}', got '#{actual}')"
+  end
+end
+
+# ===========================================================================
+# Section 1: Annotations
+# ===========================================================================
+puts "== annotations surface"
+
+@[Flags]
+enum TestRole
+  None   = 0
+  Reader = 1
+  Writer = 2
+  Admin  = 4
+end
+
+@[Deprecated("use new_calc")]
+def old_calc(x : Int32) : Int32
+  x * 2
+end
+
+@[Experimental]
+def experimental_feature : Bool
+  true
+end
+
+role = TestRole::Reader
+assert_true(role == TestRole::Reader, "TestRole has reader value")
+assert_true(role != TestRole::Writer, "TestRole is not writer")
+assert_equal(20, old_calc(10), "old_calc returns 20")
+assert_true(experimental_feature, "experimental_feature returns true")
+
+puts "annotations: all passed"
+
+# ===========================================================================
+# Section 2: Docs Pseudo Methods
+# ===========================================================================
+puts "== docs pseudo methods"
+
+# std/docs_pseudo_methods is designed for compiler documentation tools.
+# Under regular compilation it defines pseudo stubs without runtime interference.
+puts "docs_pseudo_methods: all passed"
+
+# ===========================================================================
+# Section 3: Base64
+# ===========================================================================
+puts "== base64 surface"
+
+# Standard RFC 4648 / RFC 2045 encoding & decoding
+original = "Hello, World! 12345"
+enc = Base64.encode(original)
+dec_bytes = Base64.decode(enc)
+assert_true(dec_bytes.size > 0, "Base64.decode returns Bytes")
+dec_str = Base64.decode_string(enc)
+assert_str_equal(original, dec_str, "Base64 roundtrip")
+
+# Strict encoding (no newlines)
+strict_enc = Base64.strict_encode("Short string for strict test")
+assert_true(!strict_enc.includes?("\n"), "strict_encode has no newlines")
+strict_dec = Base64.decode_string(strict_enc)
+assert_str_equal("Short string for strict test", strict_dec, "strict_encode roundtrip")
+
+# URL-safe encoding
+url_str = "\xFB\xFF\xFE"
+url_enc = Base64.urlsafe_encode(url_str)
+assert_true(!url_enc.includes?("+"), "urlsafe has no +")
+assert_true(!url_enc.includes?("/"), "urlsafe has no /")
+url_dec = Base64.decode_string(url_enc)
+assert_str_equal(url_str, url_dec, "urlsafe_encode roundtrip")
+
+# Empty string
+assert_str_equal("", Base64.encode(""), "Base64 empty string")
+assert_equal(0, Base64.decode("").size, "Base64 decode empty")
+
+puts "base64: all passed"
+
+# ===========================================================================
+# Section 4: BitArray
+# ===========================================================================
+puts "== bit_array surface"
+
+ba = BitArray.new(100, false)
+assert_equal(100, ba.size, "BitArray size is 100")
+assert_equal(0, ba.count(true), "empty BitArray count(true) is 0")
+assert_true(!ba[0], "bit 0 is false initially")
+assert_true(!ba[99], "bit 99 is false initially")
+
+ba[0] = true
+ba[42] = true
+ba[99] = true
+assert_true(ba[0], "bit 0 is true")
+assert_true(ba[42], "bit 42 is true")
+assert_true(ba[99], "bit 99 is true")
+assert_equal(3, ba.count(true), "count is 3")
+
+ba.toggle(42)
+assert_true(!ba[42], "bit 42 toggled to false")
+assert_equal(2, ba.count(true), "count after toggle is 2")
+
+ba.invert
+assert_equal(98, ba.count(true), "inverted count is 98")
+assert_true(!ba[0], "bit 0 inverted is false")
+assert_true(ba[42], "bit 42 inverted is true")
+
+ba.fill(false)
+assert_equal(0, ba.count(true), "cleared count is 0")
+
+ba.fill(true)
+assert_equal(100, ba.count(true), "filled count is 100")
+
+# Block initializer
+ba_even = BitArray.new(10) { |idx| idx % 2 == 0 }
+assert_equal(5, ba_even.count(true), "even bits count is 5")
+
+puts "bit_array: all passed"
+
+# ===========================================================================
+# Section 5: Colorize
+# ===========================================================================
+puts "== colorize surface"
+
+Colorize.enabled = true
+c_red = "alert".colorize.red.bold
+s_red = c_red.to_s
+assert_true(s_red.includes?("\e["), "colorize with enabled has ANSI codes")
+assert_true(s_red.includes?("31"), "red ANSI code 31 present")
+
+Colorize.enabled = false
+c_plain = "alert".colorize.red.bold
+assert_str_equal("alert", c_plain.to_s, "colorize disabled emits plain text")
+
+Colorize.enabled = true
+# Test explicit toggle
+c_off = "alert".colorize.toggle(false).red
+assert_str_equal("alert", c_off.to_s, "toggle(false) emits plain text")
+
+puts "colorize: all passed"
+
+# ===========================================================================
+# Section 6: StaticArray
+# ===========================================================================
+puts "== static_array surface"
+
+sa = StaticArray(Int32, 5).new { |i| (i + 1) * 10 }
+assert_equal(5, sa.size, "StaticArray size is 5")
+assert_equal(10, sa.first, "first element is 10")
+assert_equal(50, sa.last, "last element is 50")
+assert_equal(30, sa[2], "element at index 2 is 30")
+
+sa[2] = 99
+assert_equal(99, sa[2], "updated element at index 2 is 99")
+
+# to_slice and to_a
+sl = sa.to_slice
+assert_equal(5, sl.size, "slice size is 5")
+assert_equal(10, sl[0], "slice element 0 is 10")
+assert_equal(99, sl[2], "slice element 2 is 99")
+
+arr = sa.to_a
+assert_equal(5, arr.size, "heap array size is 5")
+assert_equal(99, arr[2], "heap array element 2 is 99")
+
+# Map over static array
+mapped = sa.map { |x| x + 1 }
+assert_equal(11, mapped[0], "mapped element 0 is 11")
+assert_equal(100, mapped[2], "mapped element 2 is 100")
+
+puts "static_array: all passed"
+
+# ===========================================================================
+# Section 7: Tuple
+# ===========================================================================
+puts "== tuple surface"
+
+t = {10, "iyi", true, 3.14}
+assert_equal(4, t.size, "tuple size is 4")
+assert_true(!t.empty?, "tuple is not empty")
+assert_equal(10, t.first, "tuple first is 10")
+assert_true(t.last == 3.14, "tuple last is 3.14")
+assert_equal(10, t[0], "tuple[0] is 10")
+assert_str_equal("iyi", t[1], "tuple[1] is 'iyi'")
+assert_true(t[2], "tuple[2] is true")
+
+assert_true(t == {10, "iyi", true, 3.14}, "tuple equality")
+assert_true(t != {10, "iyi", false, 3.14}, "tuple inequality")
+
+# Map over tuple
+t_doubled = {1, 2, 3}.map { |x| x * 2 }
+assert_true(t_doubled == {2, 4, 6}, "tuple map doubled")
+
+# Tuple to_a and to_s
+t_arr = {1, 2, 3}.to_a
+assert_equal(3, t_arr.size, "tuple to_a size is 3")
+assert_str_equal("{1, 2, 3}", {1, 2, 3}.to_s, "tuple to_s")
+
+puts "tuple: all passed"
+
+# ===========================================================================
+# Section 8: NamedTuple
+# ===========================================================================
+puts "== named_tuple surface"
+
+nt = {language: "iyi", year: 2026, fast: true}
+assert_equal(3, nt.size, "named_tuple size is 3")
+assert_true(!nt.empty?, "named_tuple is not empty")
+assert_str_equal("iyi", nt[:language], "named_tuple[:language]")
+assert_equal(2026, nt["year"], "named_tuple['year']")
+assert_true(nt[:fast], "named_tuple[:fast]")
+
+assert_true(nt.has_key?(:language), "has_key? :language")
+assert_true(nt.has_key?("year"), "has_key? 'year'")
+assert_true(!nt.has_key?(:missing), "has_key? :missing is false")
+
+# Keys and Values
+nt_keys = nt.keys
+assert_true(nt_keys == {:language, :year, :fast}, "named_tuple keys")
+assert_equal(3, nt.values.size, "named_tuple values size")
+
+# Merging
+merged = nt.merge({year: 2027, author: "Jason"})
+assert_equal(2027, merged[:year], "merged overwrites year")
+assert_str_equal("Jason", merged[:author], "merged adds author")
+assert_str_equal("iyi", merged[:language], "merged preserves language")
+
+puts "named_tuple: all passed"
+
+# ===========================================================================
+# Section 9: Benchmark
+# ===========================================================================
+puts "== benchmark surface"
+
+# Benchmark.measure
+tms = Benchmark.measure("computation") do
+  sum = 0
+  10000.times { sum += 1 }
+end
+assert_str_equal("computation", tms.label, "Benchmark.measure label")
+assert_true(tms.real >= 0.0, "Benchmark.measure real time is non-negative")
+
+# Benchmark.realtime
+span = Benchmark.realtime do
+  sum = 0
+  5000.times { sum += 1 }
+end
+assert_true(span.total_milliseconds >= 0.0, "Benchmark.realtime span >= 0")
+
+# Benchmark.memory
+mem = Benchmark.memory do
+  arr = [1, 2, 3, 4, 5]
+end
+assert_true(mem >= 0, "Benchmark.memory >= 0")
+
+# Benchmark.ips
+job = Benchmark.ips(calculation: Std::Time::Span.milliseconds(10), warmup: Std::Time::Span.milliseconds(5), interactive: false) do |x|
+  x.report("fast_op") do
+    a = 1 + 2
+  end
+end
+assert_equal(1, job.items.size, "Benchmark.ips executed 1 entry")
+
+puts "benchmark: all passed"
+
+# ===========================================================================
+# Section 10: Random
+# ===========================================================================
+puts "== random surface"
+
+# Deterministic reproducibility with PCG32
+r1 = Random.new(12345_u64)
+r2 = Random.new(12345_u64)
+10.times do
+  assert_equal(r1.rand(1000), r2.rand(1000), "same seed yields same rand sequence")
+end
+
+# Types generation
+r = Random.new(42_u64)
+f = r.next_float
+assert_true(f >= 0.0 && f < 1.0, "next_float in [0.0, 1.0)")
+b = r.next_bool
+assert_true(b == true || b == false, "next_bool returns boolean")
+n = r.next_int
+assert_true(n.is_a?(Int32), "next_int returns Int32")
+
+# Secure entropy
+sec_bytes = Random::Secure.random_bytes(16)
+assert_equal(16, sec_bytes.size, "Secure.random_bytes size 16")
+sec_hex = Random::Secure.hex(16)
+assert_equal(32, sec_hex.size, "Secure.hex(16) produces 32 characters")
+sec_b64 = Random::Secure.base64(12)
+assert_equal(16, sec_b64.size, "Secure.base64(12) produces 16 characters")
+
+# Array sample & shuffle
+items = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+sampled = items.sample(r)
+assert_true(items.includes?(sampled), "sampled element is member of array")
+shuffled = items.shuffle(r)
+assert_equal(10, shuffled.size, "shuffled array has same size")
+assert_equal(items.sum, shuffled.sum, "shuffled array has same elements sum")
+
+# ISAAC RNG
+isaac = Random::ISAAC.new
+u_isaac = isaac.next_u
+assert_true(u_isaac.is_a?(UInt64), "ISAAC returns UInt64")
+
+puts "random: all passed"
+
+# ===========================================================================
+# Section 11: SemanticVersion
+# ===========================================================================
+puts "== semantic_version surface"
+
+v = SemanticVersion.parse("1.2.3-alpha.1+build.2026")
+assert_equal(1, v.major, "major is 1")
+assert_equal(2, v.minor, "minor is 2")
+assert_equal(3, v.patch, "patch is 3")
+assert_str_equal("1.2.3-alpha.1+build.2026", v.to_s, "SemanticVersion to_s")
+
+# valid? checks
+assert_true(SemanticVersion.valid?("0.1.0"), "0.1.0 is valid")
+assert_true(SemanticVersion.valid?("1.0.0-rc.1"), "1.0.0-rc.1 is valid")
+assert_true(!SemanticVersion.valid?("1.0"), "1.0 is invalid")
+assert_true(!SemanticVersion.valid?("v1.0.0"), "v1.0.0 is invalid")
+
+# Precedence and comparison
+v_plain = SemanticVersion.parse("1.2.3")
+v_alpha = SemanticVersion.parse("1.2.3-alpha")
+v_beta = SemanticVersion.parse("1.2.3-beta")
+v_next = SemanticVersion.parse("1.2.4")
+
+assert_true(v_alpha < v_beta, "alpha < beta")
+assert_true(v_beta < v_plain, "prerelease < normal release")
+assert_true(v_plain < v_next, "1.2.3 < 1.2.4")
+assert_true(v_plain == SemanticVersion.new(1, 2, 3), "equality on same version")
+
+# Version bumping
+assert_true(v_plain.bump_major == SemanticVersion.parse("2.0.0"), "bump_major")
+assert_true(v_plain.bump_minor == SemanticVersion.parse("1.3.0"), "bump_minor")
+assert_true(v_plain.bump_patch == SemanticVersion.parse("1.2.4"), "bump_patch")
+
+puts "semantic_version: all passed"
+
+# ===========================================================================
+# Section 12: UUID
+# ===========================================================================
+puts "== uuid surface"
+
+# UUID v4
+u4 = UUID.v4
+assert_true(u4.v4?, "UUID.v4 is v4")
+assert_true(u4.variant == UUID::Variant::RFC4122, "u4 is RFC4122")
+assert_true(u4.version == UUID::Version::V4, "u4 version is V4")
+assert_true(u4.validate_v4, "u4 validate_v4")
+assert_true(u4.check_v4, "u4 check_v4")
+assert_true(u4.ensure_v4, "u4 ensure_v4")
+
+# UUID v1
+u1 = UUID.v1
+assert_true(u1.v1?, "UUID.v1 is v1")
+assert_true(u1.validate_v1, "u1 validate_v1")
+
+# UUID v3 (MD5) & v5 (SHA1)
+ns_dns = UUID::Namespace::DNS
+u3 = UUID.v3("example.com", ns_dns)
+assert_true(u3.v3?, "UUID.v3 is v3")
+assert_true(u3.validate_v3, "u3 validate_v3")
+# Determinism: same name + namespace produces identical UUID
+assert_true(u3 == UUID.v3("example.com", ns_dns), "v3 is deterministic")
+
+u5 = UUID.v5("example.com", ns_dns)
+assert_true(u5.v5?, "UUID.v5 is v5")
+assert_true(u5.validate_v5, "u5 validate_v5")
+assert_true(u5 == UUID.v5("example.com", ns_dns), "v5 is deterministic")
+
+# UUID v6
+u6 = UUID.v6
+assert_true(u6.v6?, "UUID.v6 is v6")
+assert_true(u6.validate_v6, "u6 validate_v6")
+
+# UUID v7
+u7 = UUID.v7
+assert_true(u7.v7?, "UUID.v7 is v7")
+assert_true(u7.validate_v7, "u7 validate_v7")
+
+# UUID v8 (custom)
+custom = uninitialized StaticArray(UInt8, 16)
+i = 0
+while i < 16
+  custom[i] = (i * 17).to_u8
+  i += 1
+end
+u8 = UUID.v8(custom.to_slice)
+assert_true(u8.v8?, "UUID.v8 is v8")
+assert_true(u8.validate_v8, "u8 validate_v8")
+
+# UUID empty
+empty_uuid = UUID.empty
+assert_str_equal("00000000-0000-4000-0000-000000000000", empty_uuid.to_s, "empty UUID string")
+
+# Parse roundtrip
+parsed = UUID.new(u4.to_s)
+assert_true(u4 == parsed, "UUID parse roundtrip")
+assert_str_equal("urn:uuid:" + u4.to_s, u4.urn, "UUID urn")
+
+# Comparison and ordering
+sorted_pair = if u1 < u4
+                {u1, u4}
+              else
+                {u4, u1}
+              end
+assert_true(sorted_pair[0] <= sorted_pair[1], "UUID comparison <=")
+
+puts "uuid: all passed"
+
+# ===========================================================================
+# Failure Probes (for panic assertions in shell driver)
+# ===========================================================================
+if Program.args.size > 0
+  mode = Program.args[0]
+  case mode
+  when "probe_bit_array_bounds"
+    b_probe = BitArray.new(10)
+    b_probe[99]
+  when "probe_bit_array_negative"
+    BitArray.new(-10)
+  when "probe_static_array_bounds"
+    sa_probe = StaticArray(Int32, 4).new(0)
+    sa_probe[10]
+  when "probe_uuid_invalid_string"
+    UUID.new("not-a-valid-uuid")
+  when "probe_uuid_mismatched_version"
+    UUID.v4.validate_v1
+  when "probe_semver_invalid"
+    SemanticVersion.parse("invalid.semver.string")
+  else
+    raise "Unknown probe mode: #{mode}"
+  end
+end
+
+puts "\nall utility types checks passed"

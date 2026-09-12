@@ -1,0 +1,1890 @@
+# Native DEFLATE (RFC 1951), Zlib (RFC 1950), and Gzip (RFC 1952) for iyi.
+#
+# Fully native compression and decompression with zero external C dependencies
+# or library links (no zlib, no LibZ).
+#
+# Provides:
+#   - Inflate: RFC 1951 decompressor supporting stored, fixed Huffman,
+#     and dynamic Huffman blocks, with strict corrupt-stream detection
+#     and bounded output limits (DecompressError, DecompressLimitExceeded).
+#   - Deflate: RFC 1951 compressor supporting stored blocks (level 0),
+#     fixed Huffman blocks (level 1), and dynamic Huffman blocks with an
+#     LZ77 hash-chain match finder (levels 2..9).
+#   - Zlib: RFC 1950 framing with Adler-32 verification.
+#   - Gzip: RFC 1952 framing with CRC-32 and input size verification,
+#     handling standard header flags (FEXTRA, FNAME, FCOMMENT, FHCRC).
+#   - Adler32 and CRC32 checksum engines.
+
+module std/compress
+
+import std/slice
+using std/slice::{Slice}
+
+pub alias Bytes = Std::Slice::Bytes
+
+# -----------------------------------------------------------------------------
+# Decompression results and error types
+# -----------------------------------------------------------------------------
+
+pub struct DecompressError
+  getter message : String
+
+  def initialize(@message : String)
+  end
+
+  def to_s : String
+    @message
+  end
+end
+
+pub struct DecompressLimitExceeded
+  getter limit : Int64
+  getter produced : Int64
+
+  def initialize(@limit : Int64, @produced : Int64 = 0_i64)
+  end
+
+  def to_s : String
+    "decompress limit exceeded: " + @limit.to_s + " bytes"
+  end
+end
+
+# -----------------------------------------------------------------------------
+# Checksums: Adler-32 (RFC 1950) and CRC-32 (ISO 3309 / RFC 1952)
+# -----------------------------------------------------------------------------
+
+pub struct Adler32
+  BASE = 65521_u64
+
+  # Computes the 32-bit Adler-32 checksum of *data*.
+  def self.checksum(data : Bytes) : UInt64
+    update(1_u64, data)
+  end
+
+  # Updates an existing Adler-32 *adler* with *data*.
+  def self.update(adler : UInt64, data : Bytes) : UInt64
+    s1 = adler & 0xFFFF_u64
+    s2 = (adler.unsafe_shr(16)) & 0xFFFF_u64
+
+    len = data.size
+    ptr = data.to_unsafe
+    i = 0
+
+    # Process in chunks of 5552 to prevent 32-bit overflow before modulo
+    while len > 0
+      chunk = len > 5552 ? 5552 : len
+      j = 0
+      while j < chunk
+        s1 = s1 + ptr[i].to_u64
+        s2 = s2 + s1
+        i = i + 1
+        j = j + 1
+      end
+      s1 = s1 % BASE
+      s2 = s2 % BASE
+      len = len - chunk
+    end
+
+    (s2.unsafe_shl(16)) | s1
+  end
+end
+
+pub struct CRC32
+  # Precomputed IEEE 802.3 CRC-32 lookup table
+  @@table : Array(UInt64)?
+
+  private def self.table : Array(UInt64)
+    if tbl = @@table
+      return tbl
+    end
+    t = Array(UInt64).new(256) { 0_u64 }
+    poly = 0xEDB88320_u64
+    i = 0
+    while i < 256
+      c = i.to_u64
+      j = 0
+      while j < 8
+        if (c & 1_u64) != 0_u64
+          c = (c.unsafe_shr(1)) ^ poly
+        else
+          c = c.unsafe_shr(1)
+        end
+        j = j + 1
+      end
+      t[i] = c
+      i = i + 1
+    end
+    @@table = t
+    t
+  end
+
+  # Computes the 32-bit CRC-32 checksum of *data*.
+  def self.checksum(data : Bytes) : UInt64
+    update(0_u64, data)
+  end
+
+  # Updates an existing *crc* with *data*.
+  def self.update(crc : UInt64, data : Bytes) : UInt64
+    tbl = table
+    c = (crc ^ 0xFFFFFFFF_u64) & 0xFFFFFFFF_u64
+    ptr = data.to_unsafe
+    i = 0
+    size = data.size
+    while i < size
+      byte_val = ptr[i].to_u64
+      idx = (c ^ byte_val) & 0xFF_u64
+      c = (c.unsafe_shr(8)) ^ tbl[idx.to_i32]
+      i = i + 1
+    end
+    (c ^ 0xFFFFFFFF_u64) & 0xFFFFFFFF_u64
+  end
+end
+
+# -----------------------------------------------------------------------------
+# Growing byte buffer
+# -----------------------------------------------------------------------------
+
+class ByteBuffer
+  @pointer : Pointer(UInt8)
+  @size : Int32
+  @capacity : Int32
+
+  getter size : Int32
+  getter capacity : Int32
+
+  def initialize(initial_capacity : Int32 = 1024)
+    cap = initial_capacity < 0 ? 0 : initial_capacity
+    @pointer = cap == 0 ? Pointer(UInt8).new(0_u64) : Pointer(UInt8).malloc(cap.to_u64)
+    @size = 0
+    @capacity = cap
+  end
+
+  def ensure_capacity(needed : Int32) : Nil
+    target = @size + needed
+    return if target <= @capacity
+    new_cap = @capacity * 2
+    new_cap = target if new_cap < target
+    new_ptr = Pointer(UInt8).malloc(new_cap.to_u64)
+    new_ptr.copy_from(@pointer, @size) if @size > 0
+    @pointer = new_ptr
+    @capacity = new_cap
+  end
+
+  def push(byte : UInt8) : Nil
+    ensure_capacity(1)
+    @pointer[@size] = byte
+    @size = @size + 1
+  end
+
+  def push(byte : Int32) : Nil
+    push(byte.to_u8)
+  end
+
+  def copy_backward_one(distance : Int32) : Nil
+    ensure_capacity(1)
+    @pointer[@size] = @pointer[@size - distance]
+    @size = @size + 1
+  end
+
+  def copy_backward(distance : Int32, length : Int32) : Nil
+    raise "invalid backward distance (exceeds output size)" if distance > @size
+    raise "backward distance exceeds 32KB window" if distance > 32768
+    raise "invalid distance zero or negative" if distance <= 0
+    ensure_capacity(length)
+    l = length
+    while l > 0
+      @pointer[@size] = @pointer[@size - distance]
+      @size = @size + 1
+      l = l - 1
+    end
+  end
+
+  def to_slice : Bytes
+    Slice(UInt8).new(@pointer, @size, read_only: false)
+  end
+end
+
+# -----------------------------------------------------------------------------
+# BitReader (LSB first)
+# -----------------------------------------------------------------------------
+
+class BitReader
+  @bytes : Bytes
+  @ptr : Pointer(UInt8)
+  @size : Int32
+  @pos : Int32
+  @bit_buf : Int64
+  @bit_count : Int32
+  @valid_bits : Int32
+  @error : String?
+
+  getter pos : Int32
+  getter bit_count : Int32
+  getter valid_bits : Int32
+  getter error : String?
+
+  def initialize(@bytes : Bytes, start_pos : Int32 = 0)
+    @ptr = @bytes.to_unsafe
+    @size = @bytes.size
+    @pos = start_pos
+    @bit_buf = 0_i64
+    @bit_count = 0
+    @valid_bits = 0
+    @error = nil
+  end
+
+  def fail(msg : String) : Nil
+    @error = msg unless @error
+  end
+
+  def error? : Bool
+    !@error.nil?
+  end
+
+  def ensure_bits(count : Int32) : Nil
+    return if @error
+    while @bit_count < count
+      if @pos < @size
+        byte_val = @ptr[@pos].to_i64
+        @bit_buf = @bit_buf | (byte_val << @bit_count)
+        @bit_count = @bit_count + 8
+        @valid_bits = @valid_bits + 8
+        @pos = @pos + 1
+      else
+        if @valid_bits <= 0
+          fail("unexpected end of compressed data")
+          break
+        end
+        @bit_count = count
+        break
+      end
+    end
+  end
+
+  def peek_bits(count : Int32) : Int32
+    ensure_bits(count)
+    return 0 if @error
+    mask = (1_i64 << count) - 1_i64
+    (@bit_buf & mask).to_i32
+  end
+
+  def consume_bits(count : Int32) : Nil
+    return if @error
+    if count > @valid_bits
+      fail("unexpected end of compressed data")
+      return
+    end
+    @bit_buf = @bit_buf >> count
+    @bit_count = @bit_count - count
+    @valid_bits = @valid_bits - count
+  end
+
+  def read_bits(count : Int32) : Int32
+    return 0 if count == 0 || @error
+    val = peek_bits(count)
+    return 0 if @error
+    consume_bits(count)
+    val
+  end
+
+  # Aligns reader to the next byte boundary, discarding unused bits in current byte.
+  def align_to_byte : Nil
+    return if @error
+    drop = @bit_count % 8
+    if drop > 0
+      drop = @valid_bits if drop > @valid_bits
+      consume_bits(drop)
+    end
+  end
+
+  def read_byte : UInt8
+    return 0_u8 if @error
+    if @valid_bits >= 8
+      val = (@bit_buf & 0xFF_i64).to_u8
+      consume_bits(8)
+      val
+    else
+      align_to_byte
+      if @pos >= @size
+        fail("unexpected end of compressed data")
+        return 0_u8
+      end
+      val = @ptr[@pos]
+      @pos = @pos + 1
+      val
+    end
+  end
+
+  def read_u16_le : Int32
+    return 0 if @error
+    b0 = read_byte.to_i32
+    return 0 if @error
+    b1 = read_byte.to_i32
+    b0 | (b1 << 8)
+  end
+
+  def copy_bytes_to(buf : ByteBuffer, count : Int32) : Nil
+    align_to_byte
+    return if @error
+    c = count
+    while c > 0
+      b = read_byte
+      return if @error
+      buf.push(b)
+      c = c - 1
+    end
+  end
+end
+
+# -----------------------------------------------------------------------------
+# BitWriter (LSB first)
+# -----------------------------------------------------------------------------
+
+class BitWriter
+  @buf : ByteBuffer
+  @bit_buf : Int64
+  @bit_count : Int32
+
+  def initialize(initial_capacity : Int32 = 1024)
+    @buf = ByteBuffer.new(initial_capacity)
+    @bit_buf = 0_i64
+    @bit_count = 0
+  end
+
+  def write_bits(val : Int32, count : Int32) : Nil
+    return if count == 0
+    val_i64 = val.to_i64 & ((1_i64 << count) - 1_i64)
+    @bit_buf = @bit_buf | (val_i64 << @bit_count)
+    @bit_count = @bit_count + count
+    while @bit_count >= 8
+      @buf.push((@bit_buf & 0xFF_i64).to_u8)
+      @bit_buf = @bit_buf >> 8
+      @bit_count = @bit_count - 8
+    end
+  end
+
+  def write_bits(val : Int64, count : Int32) : Nil
+    write_bits(val.to_i32, count)
+  end
+
+  def write_byte(b : UInt8) : Nil
+    write_bits(b.to_i32, 8)
+  end
+
+  def align_to_byte : Nil
+    if @bit_count > 0
+      rem = 8 - (@bit_count % 8)
+      if rem < 8
+        write_bits(0, rem)
+      end
+    end
+  end
+
+  def flush : Bytes
+    if @bit_count > 0
+      @buf.push((@bit_buf & 0xFF_i64).to_u8)
+      @bit_buf = 0_i64
+      @bit_count = 0
+    end
+    @buf.to_slice
+  end
+end
+
+# -----------------------------------------------------------------------------
+# Huffman Decoder: Canonical lookup table with secondary tree
+# -----------------------------------------------------------------------------
+
+class HuffmanDecoder
+  TABLE_BITS =   9
+  TABLE_SIZE = 512
+  TABLE_MASK = 511
+
+  @table : Array(Int32)
+  @tree : Array(Int32)
+  @tree_nodes : Int32
+  @error : String?
+
+  getter error : String?
+
+  def initialize(lengths : Array(Int32), max_symbols : Int32)
+    @table = Array(Int32).new(TABLE_SIZE) { 0 }
+    @tree = Array(Int32).new(1024) { 0 }
+    @tree_nodes = 0
+    @error = nil
+    build(lengths, max_symbols)
+  end
+
+  private def bit_reverse(code : Int32, len : Int32) : Int32
+    res = 0
+    c = code
+    i = 0
+    while i < len
+      res = (res << 1) | (c & 1)
+      c = c >> 1
+      i = i + 1
+    end
+    res
+  end
+
+  private def build(lengths : Array(Int32), count : Int32) : Nil
+    # 1. Count code lengths
+    bl_count = Array(Int32).new(16) { 0 }
+    sym = 0
+    while sym < count
+      len = lengths[sym]
+      if len > 15
+        @error = "invalid code length #{len} (> 15)"
+        return
+      end
+      bl_count[len] = bl_count[len] + 1 if len > 0
+      sym = sym + 1
+    end
+
+    # 2. Find starting codes for each length
+    next_code = Array(Int32).new(16) { 0 }
+    code = 0
+    bl_count[0] = 0
+    bits = 1
+    while bits <= 15
+      code = (code + bl_count[bits - 1]) << 1
+      next_code[bits] = code
+      bits += 1
+    end
+
+    # 3. Assign codes and populate primary table / tree
+    sym = 0
+    while sym < count
+      len = lengths[sym]
+      if len > 0
+        canonical_code = next_code[len]
+        next_code[len] = canonical_code + 1
+
+        rev = bit_reverse(canonical_code, len)
+
+        if len <= TABLE_BITS
+          # Fits in primary table: populate all entries with this prefix
+          step = 1 << len
+          entry = (sym << 4) | len
+          idx = rev
+          while idx < TABLE_SIZE
+            @table[idx] = entry
+            idx = idx + step
+          end
+        else
+          # Code exceeds primary table: route to secondary binary tree
+          prefix = rev & TABLE_MASK
+          entry = @table[prefix]
+          root_node = 0
+          if entry <= 0 && entry != 0
+            root_node = -entry
+          else
+            @tree_nodes = @tree_nodes + 1
+            root_node = @tree_nodes
+            @table[prefix] = -root_node
+            ensure_tree_node(root_node)
+          end
+
+          # Walk remaining bits in binary tree
+          curr_node = root_node
+          bit_idx = TABLE_BITS
+          while bit_idx < len - 1
+            b = (rev >> bit_idx) & 1
+            child_idx = curr_node * 2 + b
+            next_node = @tree[child_idx]
+            if next_node == 0
+              @tree_nodes = @tree_nodes + 1
+              next_node = @tree_nodes
+              @tree[child_idx] = next_node
+              ensure_tree_node(next_node)
+            end
+            curr_node = next_node
+            bit_idx = bit_idx + 1
+          end
+
+          # Leaf node: store -(sym + 1)
+          last_bit = (rev >> (len - 1)) & 1
+          @tree[curr_node * 2 + last_bit] = -(sym + 1)
+        end
+      end
+      sym = sym + 1
+    end
+  end
+
+  private def ensure_tree_node(node_id : Int32) : Nil
+    required_size = node_id * 2 + 2
+    while @tree.size <= required_size
+      @tree << 0
+    end
+  end
+
+  def decode(reader : BitReader) : Int32
+    return 0 if reader.error?
+    peek = reader.peek_bits(TABLE_BITS)
+    return 0 if reader.error?
+    entry = @table[peek]
+    if entry > 0
+      # Direct primary table hit
+      sym = entry >> 4
+      len = entry & 0x0F
+      reader.consume_bits(len)
+      sym
+    elsif entry < 0
+      # Secondary tree traversal
+      reader.consume_bits(TABLE_BITS)
+      return 0 if reader.error?
+      node = -entry
+      while node > 0
+        bit = reader.read_bits(1)
+        return 0 if reader.error?
+        node = @tree[node * 2 + bit]
+      end
+      if node == 0
+        reader.fail("invalid Huffman code in stream")
+        return 0
+      end
+      -(node + 1)
+    else
+      reader.fail("invalid Huffman code in stream")
+      0
+    end
+  end
+end
+
+# -----------------------------------------------------------------------------
+# Fixed Huffman Tables (RFC 1951 section 3.2.6)
+# -----------------------------------------------------------------------------
+
+class FixedHuffman
+  @@lit_decoder : HuffmanDecoder?
+  @@dist_decoder : HuffmanDecoder?
+
+  def self.lit_decoder : HuffmanDecoder
+    if dec = @@lit_decoder
+      return dec
+    end
+    lens = Array(Int32).new(288) { 0 }
+    i = 0
+    while i <= 143
+      lens[i] = 8
+      i = i + 1
+    end
+    while i <= 255
+      lens[i] = 9
+      i = i + 1
+    end
+    while i <= 279
+      lens[i] = 7
+      i = i + 1
+    end
+    while i <= 287
+      lens[i] = 8
+      i = i + 1
+    end
+    dec = HuffmanDecoder.new(lens, 288)
+    @@lit_decoder = dec
+    dec
+  end
+
+  def self.dist_decoder : HuffmanDecoder
+    if dec = @@dist_decoder
+      return dec
+    end
+    lens = Array(Int32).new(32) { 5 }
+    dec = HuffmanDecoder.new(lens, 32)
+    @@dist_decoder = dec
+    dec
+  end
+end
+
+# -----------------------------------------------------------------------------
+# Tables for RFC 1951 match lengths and distances
+# -----------------------------------------------------------------------------
+
+module DeflateConstants
+  LENGTH_BASE = [
+    3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258,
+  ]
+  LENGTH_EXTRA_BITS = [
+    0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0,
+  ]
+
+  DIST_BASE = [
+    1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577,
+  ]
+  DIST_EXTRA_BITS = [
+    0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13,
+  ]
+
+  CL_ORDER = [
+    16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
+  ]
+end
+
+# -----------------------------------------------------------------------------
+# InflateDecoder: Internal decompressor engine
+# -----------------------------------------------------------------------------
+
+class InflateDecoder
+  include DeflateConstants
+
+  @reader : BitReader
+  @out_buf : ByteBuffer
+  @max_output_size : Int64
+  @error : String?
+  @limit_exceeded : Bool
+
+  def initialize(data : Bytes, @max_output_size : Int64 = -1_i64)
+    @reader = BitReader.new(data)
+
+    # 1. Reasonable input-derived estimate: data.size * 2 + 512, avoiding overflow
+    in_sz = data.size.to_i64
+    est = in_sz > 1073741824_i64 ? 2147483647_i64 : (in_sz * 2_i64 + 512_i64)
+    est = 16_i64 if est < 16_i64
+
+    # 2. Output bound is also an allocation bound:
+    # Initial capacity must be min(reasonable input-derived capacity, max_output_size)
+    init_cap = if @max_output_size >= 0_i64
+                 est > @max_output_size ? @max_output_size : est
+               else
+                 est
+               end
+
+    init_cap = 0_i64 if init_cap < 0_i64
+    init_cap = 2147483647_i64 if init_cap > 2147483647_i64
+
+    @out_buf = ByteBuffer.new(init_cap.to_i32)
+    @error = nil
+    @limit_exceeded = false
+  end
+
+  def fail(msg : String) : Nil
+    @error = msg unless @error
+  end
+
+  def decode : Bytes | DecompressError | DecompressLimitExceeded
+    final_block = false
+    while !final_block
+      final_block = @reader.read_bits(1) != 0
+      if r_err = @reader.error
+        return DecompressError.new(r_err)
+      end
+
+      btype = @reader.read_bits(2)
+      if r_err = @reader.error
+        return DecompressError.new(r_err)
+      end
+      case btype
+      when 0
+        decode_stored
+      when 1
+        lit_dec = FixedHuffman.lit_decoder
+        dist_dec = FixedHuffman.dist_decoder
+        decode_huffman_block(lit_dec, dist_dec)
+      when 2
+        trees = read_dynamic_huffman_trees
+        if trees
+          lit_dec, dist_dec = trees
+          decode_huffman_block(lit_dec, dist_dec)
+        end
+      else
+        fail("invalid DEFLATE block type: 3 (reserved)")
+      end
+
+      if @limit_exceeded
+        return DecompressLimitExceeded.new(@max_output_size, @out_buf.size.to_i64)
+      end
+      if err = @error
+        return DecompressError.new(err)
+      end
+      if r_err = @reader.error
+        return DecompressError.new(r_err)
+      end
+    end
+
+    if @limit_exceeded
+      return DecompressLimitExceeded.new(@max_output_size, @out_buf.size.to_i64)
+    end
+    if err = @error
+      return DecompressError.new(err)
+    end
+    if r_err = @reader.error
+      return DecompressError.new(r_err)
+    end
+
+    @out_buf.to_slice
+  end
+
+  private def decode_stored : Nil
+    @reader.align_to_byte
+    len = @reader.read_u16_le
+    nlen = @reader.read_u16_le
+    return if @reader.error?
+
+    if (len ^ 0xFFFF) != nlen
+      fail("stored block length check failed: len #{len} nlen #{nlen}")
+      return
+    end
+
+    l = len
+    while l > 0
+      if @max_output_size >= 0_i64 && @out_buf.size.to_i64 >= @max_output_size # GUARD_STORED_LIMIT
+        @limit_exceeded = true
+        return
+      end
+      b = @reader.read_byte
+      return if @reader.error?
+      @out_buf.push(b)
+      l = l - 1
+    end
+  end
+
+  private def read_dynamic_huffman_trees : Tuple(HuffmanDecoder, HuffmanDecoder)?
+    hlit = @reader.read_bits(5) + 257
+    return nil if @reader.error?
+    hdist = @reader.read_bits(5) + 1
+    return nil if @reader.error?
+    hclen = @reader.read_bits(4) + 4
+    return nil if @reader.error?
+    if hlit > 286 # DYNAMIC_HLIT_INVARIANT
+      fail("invalid HLIT #{hlit}")
+      return nil
+    end
+    if hdist > 32
+      fail("invalid HDIST #{hdist}")
+      return nil
+    end
+
+    cl_lengths = Array(Int32).new(19) { 0 }
+    i = 0
+    while i < hclen
+      cl_lengths[CL_ORDER[i]] = @reader.read_bits(3)
+      return nil if @reader.error?
+      i = i + 1
+    end
+
+    cl_decoder = HuffmanDecoder.new(cl_lengths, 19)
+    if err = cl_decoder.error
+      fail(err)
+      return nil
+    end
+
+    total_codes = hlit + hdist
+    all_lengths = Array(Int32).new(total_codes) { 0 }
+    code_idx = 0
+
+    while code_idx < total_codes
+      sym = cl_decoder.decode(@reader)
+      return nil if @reader.error?
+      if sym < 16
+        all_lengths[code_idx] = sym
+        code_idx = code_idx + 1
+      elsif sym == 16
+        if code_idx == 0
+          fail("symbol 16 repeat code with no previous length")
+          return nil
+        end
+        repeat_len = all_lengths[code_idx - 1]
+        repeat_count = 3 + @reader.read_bits(2)
+        return nil if @reader.error?
+        if code_idx + repeat_count > total_codes
+          fail("repeat code exceeds total codes")
+          return nil
+        end
+        while repeat_count > 0
+          all_lengths[code_idx] = repeat_len
+          code_idx = code_idx + 1
+          repeat_count = repeat_count - 1
+        end
+      elsif sym == 17
+        repeat_count = 3 + @reader.read_bits(3)
+        return nil if @reader.error?
+        if code_idx + repeat_count > total_codes
+          fail("repeat code exceeds total codes")
+          return nil
+        end
+        while repeat_count > 0
+          all_lengths[code_idx] = 0
+          code_idx = code_idx + 1
+          repeat_count = repeat_count - 1
+        end
+      elsif sym == 18
+        repeat_count = 11 + @reader.read_bits(7)
+        return nil if @reader.error?
+        if code_idx + repeat_count > total_codes
+          fail("repeat code exceeds total codes")
+          return nil
+        end
+        while repeat_count > 0
+          all_lengths[code_idx] = 0
+          code_idx = code_idx + 1
+          repeat_count = repeat_count - 1
+        end
+      else
+        fail("invalid code length symbol #{sym}")
+        return nil
+      end
+    end
+
+    lit_lens = Array(Int32).new(hlit) { 0 }
+    i = 0
+    while i < hlit
+      lit_lens[i] = all_lengths[i]
+      i = i + 1
+    end
+
+    dist_lens = Array(Int32).new(hdist) { 0 }
+    i = 0
+    while i < hdist
+      dist_lens[i] = all_lengths[hlit + i]
+      i = i + 1
+    end
+
+    lit_dec = HuffmanDecoder.new(lit_lens, hlit)
+    if err = lit_dec.error
+      fail(err)
+      return nil
+    end
+
+    dist_dec = HuffmanDecoder.new(dist_lens, hdist)
+    if err = dist_dec.error
+      fail(err)
+      return nil
+    end
+
+    {lit_dec, dist_dec}
+  end
+
+  private def decode_huffman_block(lit_dec : HuffmanDecoder, dist_dec : HuffmanDecoder) : Nil
+    loop do
+      sym = lit_dec.decode(@reader)
+      return if @reader.error?
+
+      if sym < 256
+        if @max_output_size >= 0_i64 && @out_buf.size.to_i64 >= @max_output_size # GUARD_LITERAL_LIMIT
+          @limit_exceeded = true
+          return
+        end
+        @out_buf.push(sym.to_u8)
+      elsif sym == 256
+        break
+      elsif sym <= 285
+        len_idx = sym - 257
+        base_len = LENGTH_BASE[len_idx]
+        extra_bits = LENGTH_EXTRA_BITS[len_idx]
+        match_len = base_len + @reader.read_bits(extra_bits)
+        return if @reader.error?
+
+        dist_sym = dist_dec.decode(@reader)
+        return if @reader.error?
+        if dist_sym > 29
+          fail("invalid distance symbol #{dist_sym}")
+          return
+        end
+
+        base_dist = DIST_BASE[dist_sym]
+        dist_extra_bits = DIST_EXTRA_BITS[dist_sym]
+        match_dist = base_dist + @reader.read_bits(dist_extra_bits)
+        return if @reader.error?
+
+        if match_dist > @out_buf.size
+          fail("invalid backward distance (exceeds output size)")
+          return
+        end
+        if match_dist > 32768
+          fail("backward distance exceeds 32KB window")
+          return
+        end
+        if match_dist <= 0
+          fail("invalid distance zero or negative")
+          return
+        end
+
+        l = match_len
+        while l > 0
+          if @max_output_size >= 0_i64 && @out_buf.size.to_i64 >= @max_output_size # GUARD_MATCH_LIMIT
+            @limit_exceeded = true
+            return
+          end
+          @out_buf.copy_backward_one(match_dist)
+          l = l - 1
+        end
+      else
+        fail("invalid literal/length symbol #{sym}")
+        return
+      end
+    end
+  end
+end
+
+# -----------------------------------------------------------------------------
+# Inflate: RFC 1951 Decompressor
+# -----------------------------------------------------------------------------
+
+pub struct Inflate
+  # Decompresses raw DEFLATE *data*, bounding output to at most *max_output_size* bytes.
+  # Returns:
+  #   - Bytes on success
+  #   - DecompressLimitExceeded if producing the next byte would exceed max_output_size
+  #   - DecompressError on any parse or corruption error condition without unwinding
+  pub def self.decompress(data : Bytes, max_output_size : Int64) : Bytes | DecompressError | DecompressLimitExceeded
+    InflateDecoder.new(data, max_output_size).decode
+  end
+
+  # Decompresses raw DEFLATE *data* into original uncompressed bytes.
+  # Panics on corruption or unexpected EOF.
+  def self.decompress(data : Bytes) : Bytes
+    res = decompress(data, -1_i64)
+    case res
+    when Bytes
+      res
+    when DecompressError
+      raise res.message
+    when DecompressLimitExceeded
+      raise res.to_s
+    else
+      raise "unexpected result from decompress"
+    end
+  end
+end
+
+# -----------------------------------------------------------------------------
+# Huffman Encoder & Tree Builder
+# -----------------------------------------------------------------------------
+
+struct HuffmanEncoder
+  def self.bit_reverse(code : Int32, len : Int32) : Int32
+    res = 0
+    c = code
+    i = 0
+    while i < len
+      res = (res << 1) | (c & 1)
+      c = c >> 1
+      i = i + 1
+    end
+    res
+  end
+
+  # Builds length-limited Huffman code lengths (at most max_len bits) from frequencies.
+  def self.build_lengths(freqs : Array(Int32), count : Int32, max_len : Int32) : Array(Int32)
+    lengths = Array(Int32).new(count) { 0 }
+
+    # Collect active symbols
+    active_count = 0
+    sym = 0
+    while sym < count
+      active_count = active_count + 1 if freqs[sym] > 0
+      sym = sym + 1
+    end
+
+    return lengths if active_count == 0
+
+    if active_count == 1
+      sym = 0
+      while sym < count
+        if freqs[sym] > 0
+          lengths[sym] = 1
+          return lengths
+        end
+        sym = sym + 1
+      end
+    end
+
+    # Build binary tree using arrays for priority queue
+    # node layout: weight, left, right, sym
+    node_weights = Array(Int32).new(count * 2)
+    node_left = Array(Int32).new(count * 2)
+    node_right = Array(Int32).new(count * 2)
+    node_sym = Array(Int32).new(count * 2)
+
+    # Active node indices
+    nodes = Array(Int32).new(count)
+
+    sym = 0
+    while sym < count
+      if freqs[sym] > 0
+        nid = node_weights.size
+        node_weights << freqs[sym]
+        node_left << -1
+        node_right << -1
+        node_sym << sym
+        nodes << nid
+      end
+      sym = sym + 1
+    end
+
+    # Combine lowest-frequency pairs
+    while nodes.size > 1
+      # Find lowest 2
+      min1_idx = 0
+      min1_w = node_weights[nodes[0]]
+      i = 1
+      while i < nodes.size
+        w = node_weights[nodes[i]]
+        if w < min1_w
+          min1_w = w
+          min1_idx = i
+        end
+        i = i + 1
+      end
+      node1 = nodes[min1_idx]
+      nodes[min1_idx] = nodes[nodes.size - 1]
+      nodes.pop
+
+      min2_idx = 0
+      min2_w = node_weights[nodes[0]]
+      i = 1
+      while i < nodes.size
+        w = node_weights[nodes[i]]
+        if w < min2_w
+          min2_w = w
+          min2_idx = i
+        end
+        i = i + 1
+      end
+      node2 = nodes[min2_idx]
+
+      # Create parent
+      parent_id = node_weights.size
+      node_weights << (min1_w + min2_w)
+      node_left << node1
+      node_right << node2
+      node_sym << -1
+
+      nodes[min2_idx] = parent_id
+    end
+
+    root = nodes[0]
+
+    # Compute depths with iterative stack
+    stack_node = Array(Int32).new(count * 2)
+    stack_depth = Array(Int32).new(count * 2)
+    stack_node << root
+    stack_depth << 0
+
+    while stack_node.size > 0
+      curr = stack_node.pop
+      depth = stack_depth.pop
+      s = node_sym[curr]
+      if s >= 0
+        lengths[s] = depth
+      else
+        l = node_left[curr]
+        r = node_right[curr]
+        if l >= 0
+          stack_node << l
+          stack_depth << (depth + 1)
+        end
+        if r >= 0
+          stack_node << r
+          stack_depth << (depth + 1)
+        end
+      end
+    end
+
+    # Length-limit to max_len using Kraft inequality rebalancing
+    counts = Array(Int32).new(max_len + 1) { 0 }
+    sym = 0
+    while sym < count
+      l = lengths[sym]
+      if l > 0
+        clamped = l > max_len ? max_len : l
+        counts[clamped] = counts[clamped] + 1
+      end
+      sym = sym + 1
+    end
+
+    # Compute Kraft sum: sum(counts[i] << (max_len - i))
+    total_kraft = 0
+    i = 1
+    while i <= max_len
+      total_kraft = total_kraft + (counts[i] << (max_len - i))
+      i = i + 1
+    end
+
+    limit = 1 << max_len
+    while total_kraft > limit
+      # Move codes deeper from highest length < max_len
+      adj = max_len - 1
+      while adj > 0
+        if counts[adj] > 0
+          counts[adj] = counts[adj] - 1
+          counts[adj + 1] = counts[adj + 1] + 1
+          total_kraft = total_kraft - ((1 << (max_len - adj)) - (1 << (max_len - (adj + 1))))
+          break
+        end
+        adj = adj - 1
+      end
+    end
+
+    # Sort active symbols by original length ascending, then freq descending
+    active_syms = Array(Int32).new(active_count) { 0 }
+    idx = 0
+    sym = 0
+    while sym < count
+      if lengths[sym] > 0
+        active_syms[idx] = sym
+        idx = idx + 1
+      end
+      sym = sym + 1
+    end
+
+    # Simple bubble sort (active_count <= 288)
+    n = active_count
+    i = 0
+    while i < n - 1
+      j = 0
+      while j < n - 1 - i
+        s1 = active_syms[j]
+        s2 = active_syms[j + 1]
+        swap = false
+        if lengths[s1] > lengths[s2]
+          swap = true
+        elsif lengths[s1] == lengths[s2] && freqs[s1] < freqs[s2]
+          swap = true
+        end
+        if swap
+          tmp = active_syms[j]
+          active_syms[j] = active_syms[j + 1]
+          active_syms[j + 1] = tmp
+        end
+        j = j + 1
+      end
+      i = i + 1
+    end
+
+    # Assign adjusted lengths
+    sym_idx = 0
+    len_val = 1
+    while len_val <= max_len
+      c = counts[len_val]
+      while c > 0
+        s = active_syms[sym_idx]
+        lengths[s] = len_val
+        sym_idx = sym_idx + 1
+        c = c - 1
+      end
+      len_val = len_val + 1
+    end
+
+    lengths
+  end
+
+  # Returns array of packed (bit_reversed_code << 5) | len for each symbol
+  def self.build_canonical_codes(lengths : Array(Int32), count : Int32) : Array(Int32)
+    codes = Array(Int32).new(count) { 0 }
+
+    max_len = 0
+    sym = 0
+    while sym < count
+      max_len = lengths[sym] if lengths[sym] > max_len
+      sym = sym + 1
+    end
+
+    return codes if max_len == 0
+
+    bl_count = Array(Int32).new(max_len + 1) { 0 }
+    sym = 0
+    while sym < count
+      l = lengths[sym]
+      bl_count[l] = bl_count[l] + 1 if l > 0
+      sym = sym + 1
+    end
+
+    next_code = Array(Int32).new(max_len + 1) { 0 }
+    code = 0
+    bl_count[0] = 0
+    bits = 1
+    while bits <= max_len
+      code = (code + bl_count[bits - 1]) << 1
+      next_code[bits] = code
+      bits += 1
+    end
+
+    sym = 0
+    while sym < count
+      l = lengths[sym]
+      if l > 0
+        c = next_code[l]
+        next_code[l] = c + 1
+        rev = bit_reverse(c, l)
+        codes[sym] = (rev << 5) | l
+      end
+      sym = sym + 1
+    end
+
+    codes
+  end
+end
+
+# -----------------------------------------------------------------------------
+# Deflate: RFC 1951 Compressor
+# -----------------------------------------------------------------------------
+
+pub struct Deflate
+  include DeflateConstants
+
+  # Compresses uncompressed *data* using RFC 1951 DEFLATE.
+  # *level* can be:
+  #   0: Stored blocks (uncompressed)
+  #   1: Fixed Huffman blocks with LZ77
+  #   2..9: Dynamic Huffman blocks with LZ77 match finder
+  def self.compress(data : Bytes, level : Int32 = 6) : Bytes
+    return compress_empty if data.empty?
+    return compress_stored(data) if level == 0
+    return compress_fixed(data) if level == 1
+    compress_dynamic(data, level)
+  end
+
+  # Decompresses raw DEFLATE *data*.
+  def self.decompress(data : Bytes) : Bytes
+    Inflate.decompress(data)
+  end
+
+  # Decompresses raw DEFLATE *data*, bounding output to at most *max_output_size* bytes.
+  pub def self.decompress(data : Bytes, max_output_size : Int64) : Bytes | DecompressError | DecompressLimitExceeded
+    Inflate.decompress(data, max_output_size)
+  end
+
+  private def self.compress_empty : Bytes
+    # Empty stream: single empty fixed Huffman block (BFINAL=1, BTYPE=01, EOB)
+    b = Bytes.new(2)
+    b[0] = 3_u8
+    b[1] = 0_u8
+    b
+  end
+
+  private def self.compress_stored(data : Bytes) : Bytes
+    writer = BitWriter.new(data.size + 16)
+    size = data.size
+    pos = 0
+
+    while pos < size
+      remaining = size - pos
+      chunk = remaining > 65535 ? 65535 : remaining
+      final_block = (pos + chunk) >= size
+
+      writer.write_bits(final_block ? 1 : 0, 1)
+      writer.write_bits(0, 2) # BTYPE = 00
+      writer.align_to_byte
+
+      nlen = (chunk ^ 0xFFFF) & 0xFFFF
+      writer.write_bits(chunk, 16)
+      writer.write_bits(nlen, 16)
+
+      i = 0
+      ptr = data.to_unsafe
+      while i < chunk
+        writer.write_byte(ptr[pos + i])
+        i = i + 1
+      end
+
+      pos = pos + chunk
+    end
+
+    writer.flush
+  end
+
+  private def self.encode_length(len : Int32) : Tuple(Int32, Int32, Int32)
+    i = 28
+    while i >= 0
+      base = LENGTH_BASE[i]
+      if len >= base
+        sym = 257 + i
+        extra = len - base
+        extra_bits = LENGTH_EXTRA_BITS[i]
+        return {sym, extra, extra_bits}
+      end
+      i = i - 1
+    end
+    {257, 0, 0}
+  end
+
+  private def self.encode_distance(dist : Int32) : Tuple(Int32, Int32, Int32)
+    i = 29
+    while i >= 0
+      base = DIST_BASE[i]
+      if dist >= base
+        sym = i
+        extra = dist - base
+        extra_bits = DIST_EXTRA_BITS[i]
+        return {sym, extra, extra_bits}
+      end
+      i = i - 1
+    end
+    {0, 0, 0}
+  end
+
+  # Fixed Huffman literal code lookup: returns (bit_reversed_code, length)
+  private def self.fixed_lit_code(sym : Int32) : Tuple(Int32, Int32)
+    code = 0
+    len = 0
+    if sym <= 143
+      code = 0x30 + sym
+      len = 8
+    elsif sym <= 255
+      code = 0x190 + (sym - 144)
+      len = 9
+    elsif sym <= 279
+      code = sym - 256
+      len = 7
+    else
+      code = 0xC0 + (sym - 280)
+      len = 8
+    end
+    {HuffmanEncoder.bit_reverse(code, len), len}
+  end
+
+  private def self.lz77(data : Bytes, max_chain : Int32) : Tuple(Array(Int32), Array(Int32))
+    size = data.size
+    ptr = data.to_unsafe
+
+    tokens_lit = Array(Int32).new(size)
+    tokens_dist = Array(Int32).new(size)
+
+    head = Array(Int32).new(8192) { -1 }
+    prev = Array(Int32).new(size) { -1 }
+
+    pos = 0
+    while pos < size
+      if pos + 2 >= size
+        tokens_lit << ptr[pos].to_i32
+        tokens_dist << 0
+        pos = pos + 1
+        next
+      end
+
+      # Hash 3 bytes
+      b0 = ptr[pos].to_i32
+      b1 = ptr[pos + 1].to_i32
+      b2 = ptr[pos + 2].to_i32
+      h = (((b0 << 5) ^ b1) << 5) ^ b2
+      h = (h ^ (h >> 3)) & 0x1FFF
+
+      match_pos = head[h]
+      prev[pos] = match_pos
+      head[h] = pos
+
+      best_len = 0
+      best_dist = 0
+      cur = match_pos
+      chain = 0
+
+      while cur >= 0 && (pos - cur) <= 32768 && chain < max_chain
+        l = 0
+        max_l = size - pos
+        max_l = 258 if max_l > 258
+        while l < max_l && ptr[pos + l] == ptr[cur + l]
+          l = l + 1
+        end
+
+        if l > best_len
+          best_len = l
+          best_dist = pos - cur
+          break if best_len >= 258
+        end
+
+        cur = prev[cur]
+        chain = chain + 1
+      end
+
+      if best_len >= 3
+        tokens_lit << best_len
+        tokens_dist << best_dist
+
+        k = 1
+        while k < best_len
+          skip_pos = pos + k
+          if skip_pos + 2 < size
+            sb0 = ptr[skip_pos].to_i32
+            sb1 = ptr[skip_pos + 1].to_i32
+            sb2 = ptr[skip_pos + 2].to_i32
+            sh = (((sb0 << 5) ^ sb1) << 5) ^ sb2
+            sh = (sh ^ (sh >> 3)) & 0x1FFF
+            prev[skip_pos] = head[sh]
+            head[sh] = skip_pos
+          end
+          k = k + 1
+        end
+
+        pos = pos + best_len
+      else
+        tokens_lit << ptr[pos].to_i32
+        tokens_dist << 0
+        pos = pos + 1
+      end
+    end
+
+    {tokens_lit, tokens_dist}
+  end
+
+  private def self.compress_fixed(data : Bytes) : Bytes
+    writer = BitWriter.new(data.size + 64)
+    writer.write_bits(1, 1) # BFINAL = 1
+    writer.write_bits(1, 2) # BTYPE = 01 (fixed Huffman)
+
+    tokens_lit, tokens_dist = lz77(data, 4)
+    num_tokens = tokens_lit.size
+    i = 0
+    while i < num_tokens
+      t_lit = tokens_lit[i]
+      t_dist = tokens_dist[i]
+      if t_dist == 0
+        c, n = fixed_lit_code(t_lit)
+        writer.write_bits(c, n)
+      else
+        len_sym, len_extra, len_ebits = encode_length(t_lit)
+        c, n = fixed_lit_code(len_sym)
+        writer.write_bits(c, n)
+        writer.write_bits(len_extra, len_ebits) if len_ebits > 0
+
+        dist_sym, dist_extra, dist_ebits = encode_distance(t_dist)
+        d_code = HuffmanEncoder.bit_reverse(dist_sym, 5)
+        writer.write_bits(d_code, 5)
+        writer.write_bits(dist_extra, dist_ebits) if dist_ebits > 0
+      end
+      i = i + 1
+    end
+
+    eob_c, eob_n = fixed_lit_code(256)
+    writer.write_bits(eob_c, eob_n)
+
+    writer.flush
+  end
+
+  private def self.compress_dynamic(data : Bytes, level : Int32) : Bytes
+    max_chain = level >= 9 ? 128 : (level >= 6 ? 32 : (level >= 3 ? 16 : 8))
+    tokens_lit, tokens_dist = lz77(data, max_chain)
+    num_tokens = tokens_lit.size
+
+    # 1. Count symbol frequencies
+    lit_freqs = Array(Int32).new(286) { 0 }
+    dist_freqs = Array(Int32).new(32) { 0 }
+    lit_freqs[256] = 1 # EOB
+
+    i = 0
+    while i < num_tokens
+      t_lit = tokens_lit[i]
+      t_dist = tokens_dist[i]
+      if t_dist == 0
+        lit_freqs[t_lit] = lit_freqs[t_lit] + 1
+      else
+        len_sym, _, _ = encode_length(t_lit)
+        dist_sym, _, _ = encode_distance(t_dist)
+        lit_freqs[len_sym] = lit_freqs[len_sym] + 1
+        dist_freqs[dist_sym] = dist_freqs[dist_sym] + 1
+      end
+      i = i + 1
+    end
+
+    # RFC 1951 requires at least one distance code
+    has_dist = false
+    d = 0
+    while d < 32
+      if dist_freqs[d] > 0
+        has_dist = true
+        break
+      end
+      d = d + 1
+    end
+    dist_freqs[0] = 1 unless has_dist
+
+    # 2. Build Huffman code lengths
+    lit_lengths = HuffmanEncoder.build_lengths(lit_freqs, 286, 15)
+    dist_lengths = HuffmanEncoder.build_lengths(dist_freqs, 32, 15)
+
+    # 3. Determine HLIT and HDIST
+    last_lit = 285
+    while last_lit > 256 && lit_lengths[last_lit] == 0
+      last_lit = last_lit - 1
+    end
+    hlit_count = last_lit + 1
+    hlit = hlit_count - 257
+
+    last_dist = 31
+    while last_dist > 0 && dist_lengths[last_dist] == 0
+      last_dist = last_dist - 1
+    end
+    hdist_count = last_dist + 1
+    hdist = hdist_count - 1
+
+    # 4. Concatenate and run-length encode code lengths
+    total_tree_codes = hlit_count + hdist_count
+    combined = Array(Int32).new(total_tree_codes) { 0 }
+    idx = 0
+    while idx < hlit_count
+      combined[idx] = lit_lengths[idx]
+      idx = idx + 1
+    end
+    d_idx = 0
+    while d_idx < hdist_count
+      combined[hlit_count + d_idx] = dist_lengths[d_idx]
+      d_idx = d_idx + 1
+    end
+
+    rle_sym = Array(Int32).new(total_tree_codes)
+    rle_extra = Array(Int32).new(total_tree_codes)
+    rle_ebits = Array(Int32).new(total_tree_codes)
+
+    idx = 0
+    while idx < total_tree_codes
+      val = combined[idx]
+      run = 1
+      while idx + run < total_tree_codes && combined[idx + run] == val
+        run = run + 1
+      end
+      idx = idx + run
+
+      if val == 0
+        while run >= 11
+          chunk = run > 138 ? 138 : run
+          rle_sym << 18
+          rle_extra << (chunk - 11)
+          rle_ebits << 7
+          run = run - chunk
+        end
+        while run >= 3
+          chunk = run > 10 ? 10 : run
+          rle_sym << 17
+          rle_extra << (chunk - 3)
+          rle_ebits << 3
+          run = run - chunk
+        end
+        while run > 0
+          rle_sym << 0
+          rle_extra << 0
+          rle_ebits << 0
+          run = run - 1
+        end
+      else
+        rle_sym << val
+        rle_extra << 0
+        rle_ebits << 0
+        run = run - 1
+        while run >= 3
+          chunk = run > 6 ? 6 : run
+          rle_sym << 16
+          rle_extra << (chunk - 3)
+          rle_ebits << 2
+          run = run - chunk
+        end
+        while run > 0
+          rle_sym << val
+          rle_extra << 0
+          rle_ebits << 0
+          run = run - 1
+        end
+      end
+    end
+
+    # 5. Build code length Huffman tree (symbols 0..18, max length 7)
+    cl_freqs = Array(Int32).new(19) { 0 }
+    rle_count = rle_sym.size
+    r = 0
+    while r < rle_count
+      cl_freqs[rle_sym[r]] = cl_freqs[rle_sym[r]] + 1
+      r = r + 1
+    end
+
+    cl_lengths = HuffmanEncoder.build_lengths(cl_freqs, 19, 7)
+    cl_codes = HuffmanEncoder.build_canonical_codes(cl_lengths, 19)
+
+    # 6. Determine HCLEN
+    hclen = 4
+    k = 18
+    while k >= 4
+      if cl_lengths[CL_ORDER[k]] > 0
+        hclen = k + 1
+        break
+      end
+      k = k - 1
+    end
+
+    # 7. Build canonical codes for literals and distances
+    lit_codes = HuffmanEncoder.build_canonical_codes(lit_lengths, 286)
+    dist_codes = HuffmanEncoder.build_canonical_codes(dist_lengths, 32)
+
+    # 8. Emit dynamic Huffman block
+    writer = BitWriter.new(data.size + 128)
+    writer.write_bits(1, 1) # BFINAL = 1
+    writer.write_bits(2, 2) # BTYPE = 10 (dynamic Huffman)
+    writer.write_bits(hlit, 5)
+    writer.write_bits(hdist, 5)
+    writer.write_bits(hclen - 4, 4)
+
+    # Emit code length code lengths
+    c_idx = 0
+    while c_idx < hclen
+      writer.write_bits(cl_lengths[CL_ORDER[c_idx]], 3)
+      c_idx = c_idx + 1
+    end
+
+    # Emit encoded tree lengths
+    r = 0
+    while r < rle_count
+      sym = rle_sym[r]
+      extra = rle_extra[r]
+      ebits = rle_ebits[r]
+      packed = cl_codes[sym]
+      rev_code = packed >> 5
+      len = packed & 0x1F
+      writer.write_bits(rev_code, len)
+      writer.write_bits(extra, ebits) if ebits > 0
+      r = r + 1
+    end
+
+    # Emit compressed tokens
+    i = 0
+    while i < num_tokens
+      t_lit = tokens_lit[i]
+      t_dist = tokens_dist[i]
+      if t_dist == 0
+        packed = lit_codes[t_lit]
+        writer.write_bits(packed >> 5, packed & 0x1F)
+      else
+        len_sym, len_extra, len_ebits = encode_length(t_lit)
+        packed_len = lit_codes[len_sym]
+        writer.write_bits(packed_len >> 5, packed_len & 0x1F)
+        writer.write_bits(len_extra, len_ebits) if len_ebits > 0
+
+        dist_sym, dist_extra, dist_ebits = encode_distance(t_dist)
+        packed_dist = dist_codes[dist_sym]
+        writer.write_bits(packed_dist >> 5, packed_dist & 0x1F)
+        writer.write_bits(dist_extra, dist_ebits) if dist_ebits > 0
+      end
+      i = i + 1
+    end
+
+    # Emit EOB (symbol 256)
+    eob_packed = lit_codes[256]
+    writer.write_bits(eob_packed >> 5, eob_packed & 0x1F)
+
+    writer.flush
+  end
+end
+
+# -----------------------------------------------------------------------------
+# Zlib: RFC 1950 Wrapper
+# -----------------------------------------------------------------------------
+
+pub struct Zlib
+  # Compresses *data* with RFC 1950 zlib wrapper (CMF/FLG header, Adler-32 footer).
+  def self.compress(data : Bytes, level : Int32 = 6) : Bytes
+    adler = Adler32.checksum(data)
+    deflated = Deflate.compress(data, level)
+
+    out_size = 2 + deflated.size + 4
+    out_buf = Bytes.new(out_size)
+    ptr = out_buf.to_unsafe
+
+    # CMF = 0x78 (DEFLATE, 32K window)
+    # FLG: default compression level 2 -> (0x78 * 256 + 0x9C) % 31 == 0
+    ptr[0] = 0x78_u8
+    ptr[1] = 0x9C_u8
+
+    # Copy deflated payload
+    i = 0
+    d_ptr = deflated.to_unsafe
+    d_size = deflated.size
+    while i < d_size
+      ptr[2 + i] = d_ptr[i]
+      i = i + 1
+    end
+
+    # 4-byte Adler-32 in big-endian (network byte order)
+    footer_pos = 2 + d_size
+    ptr[footer_pos] = ((adler.unsafe_shr(24)) & 0xFF_u64).to_u8
+    ptr[footer_pos + 1] = ((adler.unsafe_shr(16)) & 0xFF_u64).to_u8
+    ptr[footer_pos + 2] = ((adler.unsafe_shr(8)) & 0xFF_u64).to_u8
+    ptr[footer_pos + 3] = (adler & 0xFF_u64).to_u8
+
+    out_buf
+  end
+
+  # Decompresses RFC 1950 zlib *data*, verifying header and Adler-32 checksum.
+  def self.decompress(data : Bytes) : Bytes
+    raise "zlib data too short (minimum 6 bytes)" if data.size < 6
+
+    ptr = data.to_unsafe
+    cmf = ptr[0].to_i32
+    flg = ptr[1].to_i32
+
+    if ((cmf * 256 + flg) % 31) != 0
+      raise "invalid zlib header check"
+    end
+
+    cm = cmf & 0x0F
+    if cm != 8
+      raise "unsupported zlib compression method: #{cm}"
+    end
+
+    cinfo = cmf >> 4
+    if cinfo > 7
+      raise "invalid zlib window size: #{cinfo}"
+    end
+
+    fdict = (flg & 0x20) != 0
+    payload_start = 2
+    if fdict
+      raise "zlib stream specifies preset dictionary which is not supported"
+    end
+
+    deflated_size = data.size - payload_start - 4
+    raise "zlib payload size invalid" if deflated_size < 0
+    deflated_data = data[payload_start, deflated_size]
+
+    decompressed = Deflate.decompress(deflated_data)
+
+    footer_pos = data.size - 4
+    expected_adler = (ptr[footer_pos].to_u64.unsafe_shl(24)) |
+                     (ptr[footer_pos + 1].to_u64.unsafe_shl(16)) |
+                     (ptr[footer_pos + 2].to_u64.unsafe_shl(8)) |
+                     ptr[footer_pos + 3].to_u64
+
+    actual_adler = Adler32.checksum(decompressed)
+    if actual_adler != expected_adler
+      raise "zlib Adler-32 checksum mismatch: expected #{expected_adler}, got #{actual_adler}"
+    end
+
+    decompressed
+  end
+end
+
+# -----------------------------------------------------------------------------
+# Gzip: RFC 1952 Wrapper
+# -----------------------------------------------------------------------------
+
+pub struct Gzip
+  # Compresses *data* with RFC 1952 gzip wrapper (10-byte header, CRC-32 and ISIZE footer).
+  #
+  # Note on metadata: MTIME is set to 0 and FNAME is omitted deliberately.
+  # This provides deterministic, reproducible output for in-memory payloads
+  # and HTTP content-encoding without non-deterministic timestamps or
+  # filesystem path leaks. Decompressors expecting a filename see FLG bit 3
+  # cleared. Decompression (`Gzip.decompress`) handles all standard flags
+  # (FNAME, FCOMMENT, FEXTRA, FHCRC).
+  def self.compress(data : Bytes, level : Int32 = 6) : Bytes
+    crc = CRC32.checksum(data)
+    isize = (data.size.to_u64) & 0xFFFFFFFF_u64
+    deflated = Deflate.compress(data, level)
+
+    out_size = 10 + deflated.size + 8
+    out_buf = Bytes.new(out_size)
+    ptr = out_buf.to_unsafe
+
+    # Gzip header
+    ptr[0] = 0x1F_u8 # ID1
+    ptr[1] = 0x8B_u8 # ID2
+    ptr[2] = 8_u8    # CM = DEFLATE
+    ptr[3] = 0_u8    # FLG = 0
+    ptr[4] = 0_u8    # MTIME byte 0
+    ptr[5] = 0_u8    # MTIME byte 1
+    ptr[6] = 0_u8    # MTIME byte 2
+    ptr[7] = 0_u8    # MTIME byte 3
+    ptr[8] = 2_u8    # XFL = 2 (max compression)
+    ptr[9] = 255_u8  # OS = 255 (unknown OS)
+
+    # Copy deflated payload
+    i = 0
+    d_ptr = deflated.to_unsafe
+    d_size = deflated.size
+    while i < d_size
+      ptr[10 + i] = d_ptr[i]
+      i = i + 1
+    end
+
+    # 8-byte footer: CRC-32 (4 bytes little-endian) and ISIZE (4 bytes little-endian)
+    footer_pos = 10 + d_size
+    ptr[footer_pos] = (crc & 0xFF_u64).to_u8
+    ptr[footer_pos + 1] = ((crc.unsafe_shr(8)) & 0xFF_u64).to_u8
+    ptr[footer_pos + 2] = ((crc.unsafe_shr(16)) & 0xFF_u64).to_u8
+    ptr[footer_pos + 3] = ((crc.unsafe_shr(24)) & 0xFF_u64).to_u8
+
+    ptr[footer_pos + 4] = (isize & 0xFF_u64).to_u8
+    ptr[footer_pos + 5] = ((isize.unsafe_shr(8)) & 0xFF_u64).to_u8
+    ptr[footer_pos + 6] = ((isize.unsafe_shr(16)) & 0xFF_u64).to_u8
+    ptr[footer_pos + 7] = ((isize.unsafe_shr(24)) & 0xFF_u64).to_u8
+
+    out_buf
+  end
+
+  # Decompresses RFC 1952 gzip *data*, parsing headers, flags, CRC-32, and ISIZE.
+  def self.decompress(data : Bytes) : Bytes
+    raise "gzip data too short (minimum 18 bytes)" if data.size < 18
+
+    ptr = data.to_unsafe
+    id1 = ptr[0]
+    id2 = ptr[1]
+    if id1 != 0x1F_u8 || id2 != 0x8B_u8
+      raise "not in gzip format (invalid magic bytes 0x#{id1.to_s(16)} 0x#{id2.to_s(16)})"
+    end
+
+    cm = ptr[2]
+    if cm != 8_u8
+      raise "unsupported gzip compression method: #{cm}"
+    end
+
+    flg = ptr[3].to_i32
+    if (flg & 0xE0) != 0
+      raise "reserved gzip flag bits are set: 0x#{flg.to_s(16)}"
+    end
+
+    pos = 10
+
+    if (flg & 0x04) != 0
+      raise "truncated gzip extra field" if pos + 2 > data.size
+      xlen = ptr[pos].to_i32 | (ptr[pos + 1].to_i32 << 8)
+      pos = pos + 2 + xlen
+      raise "truncated gzip extra field content" if pos > data.size
+    end
+
+    if (flg & 0x08) != 0
+      while pos < data.size && ptr[pos] != 0_u8
+        pos = pos + 1
+      end
+      pos = pos + 1
+      raise "truncated gzip filename" if pos > data.size
+    end
+
+    if (flg & 0x10) != 0
+      while pos < data.size && ptr[pos] != 0_u8
+        pos = pos + 1
+      end
+      pos = pos + 1
+      raise "truncated gzip comment" if pos > data.size
+    end
+
+    if (flg & 0x02) != 0
+      pos = pos + 2
+      raise "truncated gzip header CRC" if pos > data.size
+    end
+
+    deflated_size = data.size - pos - 8
+    raise "gzip payload size invalid" if deflated_size < 0
+    deflated_data = data[pos, deflated_size]
+
+    decompressed = Deflate.decompress(deflated_data)
+
+    footer_pos = data.size - 8
+    expected_crc = ptr[footer_pos].to_u64 |
+                   (ptr[footer_pos + 1].to_u64.unsafe_shl(8)) |
+                   (ptr[footer_pos + 2].to_u64.unsafe_shl(16)) |
+                   (ptr[footer_pos + 3].to_u64.unsafe_shl(24))
+
+    expected_isize = ptr[footer_pos + 4].to_u64 |
+                     (ptr[footer_pos + 5].to_u64.unsafe_shl(8)) |
+                     (ptr[footer_pos + 6].to_u64.unsafe_shl(16)) |
+                     (ptr[footer_pos + 7].to_u64.unsafe_shl(24))
+
+    actual_crc = CRC32.checksum(decompressed)
+    if actual_crc != expected_crc
+      raise "gzip CRC-32 checksum mismatch: expected #{expected_crc}, got #{actual_crc}"
+    end
+
+    actual_isize = (decompressed.size.to_u64) & 0xFFFFFFFF_u64
+    if actual_isize != expected_isize
+      raise "gzip ISIZE length mismatch: expected #{expected_isize}, got #{actual_isize}"
+    end
+
+    decompressed
+  end
+end

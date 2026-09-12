@@ -42,8 +42,9 @@
     Node.new(build(depth - 1, seed &* 3_i64 &+ 1_i64), build(depth - 1, seed &* 5_i64 &+ 2_i64), seed)
   end
 
-  # Five explicit collections, the mean pause and the last mark's helper
-  # count, with the tree checked after each.
+  # Five explicit collections, the mean pause and total helper work, with the
+  # tree checked after each. A helper may lose one round's queue to the main
+  # thread; participation is the sum across the phase, not the last schedule.
   def collect_five(tree : Node, expected : Int64) : Tuple(Int64, Int64)
     total = 0_i64
     helpers = 0_i64
@@ -52,7 +53,7 @@
       before = IyiMark.pause_total_ns
       IyiMark.collect
       total = total + (IyiMark.pause_total_ns - before).to_i64
-      helpers = IyiMark.helper_black.to_i64
+      helpers = helpers + IyiMark.helper_black.to_i64
       fail("the tree's checksum changed under collection #{round}") if tree.sum != expected
       round = round + 1
     end
@@ -82,7 +83,7 @@
   helped = collect_five(tree, expected)
   fail("the helpers blackened nothing: the mark was one thread and the rest watched") if helped[1] == 0_i64
 
-  puts "mark: #{alone[0] // 1000_i64} us alone, #{helped[0] // 1000_i64} us with helpers, which blackened #{helped[1]} of the last mark's nodes"
+  puts "mark: #{alone[0] // 1000_i64} us alone, #{helped[0] // 1000_i64} us with helpers, which blackened #{helped[1]} nodes across the five marks"
 
   # The pool's memory is the most batches ever in it at once, not every
   # batch a mark published: a batch taken is a batch's words free again.

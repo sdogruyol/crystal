@@ -1,0 +1,311 @@
+# Protocol-negotiating HTTP client.
+#
+# Application code sends a Request and receives a Response. TLS ALPN, Alt-Svc,
+# and an upstream proxy choose the wire protocol below that boundary.
+
+module std/http_client
+
+pub import std/http
+pub import std/http1
+pub import std/http2
+pub import std/tls
+pub import std/uri
+pub import std/time
+using std/http::{Headers, Request, Response}
+using std/uri::{URI}
+using std/slice::{Bytes}
+using std/time::{Time}
+
+pub struct Protocol
+  pub HTTP1 = "http/1.1"
+  pub HTTP2 = "h2"
+  pub HTTP3 = "h3"
+end
+
+# The route passed to transport infrastructure. Application code does not
+# construct one and therefore never chooses a protocol.
+pub class Route
+  getter url : String
+  getter host : String
+  getter port : Int32
+  getter scheme : String
+  getter offered_protocols : Array(String)
+
+  def initialize(
+    @url : String,
+    @host : String,
+    @port : Int32,
+    @scheme : String,
+    @offered_protocols : Array(String),
+  )
+  end
+end
+
+pub class NegotiatedResponse
+  getter response : Response
+  getter protocol : String
+
+  def initialize(@response : Response, @protocol : String)
+  end
+end
+
+# A proxy, an HTTP/3 connector, or a test transport implements this seam. The
+# client supplies ordered offers and the route; the application still handles
+# only Request and Response.
+pub abstract class Upstream
+  abstract def execute(request : Request, route : Route) : NegotiatedResponse
+end
+
+pub class AltSvcEntry
+  getter origin : String
+  getter host : String
+  getter port : Int32
+  getter expires_at : Int64
+
+  def initialize(@origin : String, @host : String, @port : Int32, @expires_at : Int64)
+  end
+
+  def fresh?(now : Int64) : Bool
+    now < @expires_at
+  end
+end
+
+pub class Client
+  getter last_protocol : String?
+  getter alt_svc_entries : Array(AltSvcEntry)
+  MAX_H2_READS = 64
+
+  @proxy : Upstream?
+  @http3 : Upstream?
+  @direct : Upstream?
+  @verify_peer : Bool
+  @timeout_ms : Int32
+
+  def initialize(
+    @proxy : Upstream? = nil,
+    @http3 : Upstream? = nil,
+    @direct : Upstream? = nil,
+    @verify_peer : Bool = true,
+    @timeout_ms : Int32 = 10000,
+  )
+    @last_protocol = nil
+    @alt_svc_entries = [] of AltSvcEntry
+  end
+
+  def get(url : String, headers : Headers? = nil) : Response
+    execute(Request.new("GET", url, headers), url)
+  end
+
+  def post(url : String, body : String = "", headers : Headers? = nil) : Response
+    execute(Request.new("POST", url, headers, body), url)
+  end
+
+  def execute(request : Request, url : String? = nil) : Response
+    absolute_url = url || request.target
+    uri = URI.parse(absolute_url)
+    scheme = uri.scheme || "http"
+    host = uri.host || raise "HTTP URL has no host: #{absolute_url}"
+    port = uri.port || (scheme == "https" ? 443 : 80)
+    origin = origin_key(scheme, host, port)
+
+    if proxy = @proxy
+      result = proxy.execute(copy_request(request), Route.new(absolute_url, host, port, scheme, [Protocol::HTTP3, Protocol::HTTP2, Protocol::HTTP1]))
+      return accept(result, origin)
+    end
+
+    if scheme == "https"
+      if alternative = fresh_alt_svc(origin, Time.utc.seconds)
+        if http3 = @http3
+          result = http3.execute(
+            copy_request(request),
+            Route.new(absolute_url, alternative.host, alternative.port, scheme, [Protocol::HTTP3]),
+          )
+          return accept(result, origin)
+        end
+      end
+    end
+
+    if direct = @direct
+      offers = scheme == "https" ? [Protocol::HTTP2, Protocol::HTTP1] : [Protocol::HTTP1]
+      return accept(direct.execute(copy_request(request), Route.new(absolute_url, host, port, scheme, offers)), origin)
+    end
+
+    result = scheme == "https" ? execute_https(copy_request(request), absolute_url, host, port) : execute_http1(copy_request(request), absolute_url)
+    accept(result, origin)
+  end
+
+  def clear_alt_svc(origin : String) : Nil
+    kept = [] of AltSvcEntry
+    i = 0
+    while i < @alt_svc_entries.size
+      entry = @alt_svc_entries[i]
+      kept << entry unless entry.origin == origin
+      i = i + 1
+    end
+    @alt_svc_entries = kept
+  end
+
+  private def accept(result : NegotiatedResponse, origin : String) : Response
+    @last_protocol = result.protocol
+    learn_alt_svc(origin, result.response)
+    result.response
+  end
+
+  private def execute_http1(request : Request, url : String) : NegotiatedResponse
+    client = Std::Http1::Client.new(timeout_ms: @timeout_ms, verify_peer: @verify_peer)
+    response = client.execute(request, url)
+    client.close
+    NegotiatedResponse.new(response, Protocol::HTTP1)
+  end
+
+  private def execute_https(request : Request, url : String, host : String, port : Int32) : NegotiatedResponse
+    tls = Std::Tls::Client.connect(host, port, [Protocol::HTTP2, Protocol::HTTP1], @verify_peer)
+    transport = Std::Http1::TlsTransport.new(tls)
+    transport.timeout_ms = @timeout_ms
+    selected = tls.alpn_selected
+    if selected == Protocol::HTTP2
+      execute_http2(tls, request, url, host)
+    elsif selected == Protocol::HTTP1 || selected.nil?
+      client = Std::Http1::Client.new(timeout_ms: @timeout_ms, verify_peer: @verify_peer, transport: transport)
+      response = client.execute(request, url)
+      client.close
+      NegotiatedResponse.new(response, Protocol::HTTP1)
+    else
+      tls.close
+      raise "server selected unsupported HTTP ALPN protocol: #{selected}"
+    end
+  end
+
+  private def execute_http2(tls : Std::Tls::Client, request : Request, url : String, host : String) : NegotiatedResponse
+    client = Std::Http2::Client.new
+    initial = client.flush_outbound
+    tls.write(initial) unless initial.empty?
+
+    uri = URI.parse(url)
+    target = uri.path.empty? ? "/" : uri.path
+    if query = uri.query
+      target = target + "?" + query
+    end
+    headers = request.headers.dup
+    headers["Host"] = host unless headers.has_key?("Host")
+    h2_request = Request.new(request.method, target, headers, request.body, "HTTP/2")
+    stream_id, send_error = client.send_request(h2_request)
+    unless send_error.nil?
+      tls.close
+      raise "HTTP/2 send failed: #{send_error}"
+    end
+    outbound = client.flush_outbound
+    tls.write(outbound) unless outbound.empty?
+
+    response = nil.as(Response?)
+    reads = 0
+    while response.nil? && reads < MAX_H2_READS
+      incoming = tls.read(16384)
+      break if incoming.empty?
+      receive_error = client.receive(incoming)
+      unless receive_error.nil?
+        tls.close
+        raise "HTTP/2 receive failed: #{receive_error}"
+      end
+      control = client.flush_outbound
+      tls.write(control) unless control.empty?
+      response = client.get_response(stream_id)
+      reads = reads + 1
+    end
+    tls.close
+    raise "HTTP/2 response did not complete" if response.nil?
+    NegotiatedResponse.new(response, Protocol::HTTP2)
+  end
+
+  private def copy_request(request : Request) : Request
+    Request.new(request.method, request.target, request.headers.dup, request.body, request.version, request.trailers.dup)
+  end
+
+  private def origin_key(scheme : String, host : String, port : Int32) : String
+    scheme + "://" + host.downcase + ":" + port.to_s
+  end
+
+  private def fresh_alt_svc(origin : String, now : Int64) : AltSvcEntry?
+    fresh = [] of AltSvcEntry
+    found = nil.as(AltSvcEntry?)
+    i = 0
+    while i < @alt_svc_entries.size
+      entry = @alt_svc_entries[i]
+      if entry.fresh?(now)
+        fresh << entry
+        found = entry if entry.origin == origin
+      end
+      i = i + 1
+    end
+    @alt_svc_entries = fresh
+    found
+  end
+
+  private def learn_alt_svc(origin : String, response : Response) : Nil
+    value = response.headers["Alt-Svc"]?
+    return if value.nil?
+    if value.strip.downcase == "clear"
+      clear_alt_svc(origin)
+      return
+    end
+
+    uri = URI.parse(origin)
+    origin_host = uri.host || ""
+    now = Time.utc.seconds
+    entries = value.split(',')
+    i = 0
+    while i < entries.size
+      entry = parse_h3_alt_svc(entries[i], origin, origin_host, now)
+      if entry
+        clear_alt_svc(origin)
+        @alt_svc_entries << entry
+        return
+      end
+      i = i + 1
+    end
+  end
+
+  private def parse_h3_alt_svc(raw : String, origin : String, origin_host : String, now : Int64) : AltSvcEntry?
+    parts = raw.split(';')
+    return nil if parts.empty?
+    pair = parts[0].strip
+    eq = pair.index('=')
+    return nil unless eq
+    protocol = pair[0, eq].strip.downcase
+    return nil unless protocol == "h3" || protocol.starts_with?("h3-")
+
+    authority = pair[eq + 1, pair.bytesize - eq - 1].strip
+    return nil unless authority.starts_with?('"') && authority.ends_with?('"') && authority.bytesize >= 3
+    authority = authority[1, authority.bytesize - 2]
+
+    host = origin_host
+    port_text = authority
+    if colon = authority.rindex(':')
+      if colon > 0
+        host = authority[0, colon]
+      end
+      port_text = authority[colon + 1, authority.bytesize - colon - 1]
+    end
+    port = port_text.to_i?
+    return nil if port.nil? || port <= 0 || port > 65535
+
+    max_age = 86400_i64
+    i = 1
+    while i < parts.size
+      param = parts[i].strip
+      peq = param.index('=')
+      if peq
+        name = param[0, peq].strip.downcase
+        val = param[peq + 1, param.bytesize - peq - 1].strip
+        if name == "ma"
+          parsed = val.to_i64?
+          return nil if parsed.nil? || parsed < 0
+          max_age = parsed
+        end
+      end
+      i = i + 1
+    end
+    return nil if max_age == 0_i64
+    AltSvcEntry.new(origin, host, port, now + max_age)
+  end
+end

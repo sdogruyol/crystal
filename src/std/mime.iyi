@@ -1,0 +1,781 @@
+# Standard MIME media type parsing and registry for iyi.
+#
+# Answers RFC 1521, RFC 2045, RFC 2046 media type representation:
+# type/subtype with optional parameters (e.g. text/html; charset=utf-8),
+# supporting quoted values with escape sequences and case-insensitive keys.
+#
+# System mime.types decision:
+# We do not automatically load /etc/mime.types or OS database files on startup.
+# In iyi, programs adhere to minimal dependency and footprint floors (SPEC III.9).
+# Reading an OS file unconditionally creates non-deterministic cross-target behavior
+# (macOS, Linux, Alpine, Windows, wasm32-wasi) and requires filesystem access during
+# type initialization. We embed a rich standard table of common media types directly,
+# and provide MIME.load_mime_database(content) and MIME.register(ext, type) for
+# applications that explicitly want to load custom or host-provided databases.
+
+module std/mime
+
+import std/text
+
+import std/slice
+import std/http
+using std/http::{Headers}
+
+pub class Error < Exception
+  getter message : String
+
+  def initialize(@message : String)
+  end
+end
+
+pub struct MediaType
+  @media_type : String
+  @params : Hash(String, String)
+
+  getter media_type : String
+
+  def initialize(@media_type : String, @params : Hash(String, String))
+  end
+
+  def initialize(media_type : String)
+    @media_type = media_type.downcase
+    @params = Hash(String, String).new
+  end
+
+  # Returns the top-level type (before the slash), e.g. "text" from "text/html".
+  def type : String
+    idx = @media_type.index('/')
+    idx ? @media_type[0, idx] : @media_type
+  end
+
+  # Returns the subtype (after the slash), e.g. "html" from "text/html".
+  def sub_type : String
+    idx = @media_type.index('/')
+    idx ? @media_type[idx + 1, @media_type.bytesize - idx - 1] : ""
+  end
+
+  # Returns parameter value for *key*, or raises if not found.
+  def [](key : String) : String
+    val = @params[key.downcase]?
+    if val
+      val
+    else
+      raise "missing media type parameter: " + key
+    end
+  end
+
+  # Returns parameter value for *key*, or nil if not found.
+  def []?(key : String) : String?
+    @params[key.downcase]?
+  end
+
+  def has_key?(key : String) : Bool
+    @params.has_key?(key.downcase)
+  end
+
+  def fetch(key : String, default_value : String) : String
+    val = @params[key.downcase]?
+    val ? val : default_value
+  end
+
+  def []=(key : String, value : String) : Nil
+    @params[key.downcase] = value
+  end
+
+  def each_parameter(& : (String, String) -> Nil) : Nil
+    @params.each do |k, v|
+      yield k, v
+    end
+  end
+
+  # Returns true if *byte* is a valid RFC 2045 / RFC 2616 token character.
+  def self.token_byte?(b : UInt8) : Bool
+    (b >= 97_u8 && b <= 122_u8) ||  # a-z
+      (b >= 65_u8 && b <= 90_u8) || # A-Z
+      (b >= 48_u8 && b <= 57_u8) || # 0-9
+      b == 33_u8 ||                 # !
+      b == 35_u8 ||                 # #
+      b == 36_u8 ||                 # $
+      b == 37_u8 ||                 # %
+      b == 38_u8 ||                 # &
+      b == 39_u8 ||                 # '
+      b == 42_u8 ||                 # *
+      b == 43_u8 ||                 # +
+      b == 45_u8 ||                 # -
+      b == 46_u8 ||                 # .
+      b == 94_u8 ||                 # ^
+      b == 95_u8 ||                 # _
+      b == 96_u8 ||                 # `
+      b == 124_u8 ||                # |
+      b == 126_u8                   # ~
+  end
+
+  def self.token_string?(str : String) : Bool
+    return false if str.empty?
+    raw = str.to_unsafe
+    len = str.bytesize
+    i = 0
+    while i < len
+      return false unless token_byte?(raw[i])
+      i = i + 1
+    end
+    true
+  end
+
+  # Parses a media type string with optional parameters, e.g.:
+  # "text/html; charset=utf-8" or "multipart/form-data; boundary=\"---123\""
+  def self.parse?(string : String) : MediaType?
+    s = string.strip
+    return nil if s.empty?
+
+    # Separate media_type from parameters at first ';'
+    semi = s.index(';')
+    raw_type = ""
+    raw_params = ""
+    if semi
+      raw_type = s[0, semi].strip.downcase
+      raw_params = s[semi + 1, s.bytesize - semi - 1]
+    else
+      raw_type = s.downcase
+    end
+
+    # Validate type/subtype format
+    slash = raw_type.index('/')
+    return nil unless slash
+    return nil if slash == 0 || slash == raw_type.bytesize - 1
+
+    params = Hash(String, String).new
+
+    # Parse parameters if present
+    unless raw_params.empty?
+      raw = raw_params.to_unsafe
+      len = raw_params.bytesize
+      ptr = 0
+
+      while ptr < len
+        # Skip leading whitespace and semicolons
+        while ptr < len && (raw[ptr] == 32_u8 || raw[ptr] == 9_u8 || raw[ptr] == 10_u8 || raw[ptr] == 13_u8 || raw[ptr] == 59_u8)
+          ptr = ptr + 1
+        end
+        break if ptr >= len
+
+        # Read parameter name until '='
+        key_start = ptr
+        while ptr < len && raw[ptr] != 61_u8 && raw[ptr] != 59_u8 # '=' or ';'
+          ptr = ptr + 1
+        end
+        return nil if ptr >= len || raw[ptr] != 61_u8 # must find '='
+
+        key_str = raw_params[key_start, ptr - key_start].strip.downcase
+        return nil if key_str.empty?
+
+        ptr = ptr + 1 # skip '='
+
+        # Skip whitespace before value
+        while ptr < len && (raw[ptr] == 32_u8 || raw[ptr] == 9_u8)
+          ptr = ptr + 1
+        end
+        return nil if ptr >= len
+
+        val_str = ""
+        if raw[ptr] == 34_u8 # '"' (quoted value)
+          ptr = ptr + 1      # skip opening quote
+          val_bytes = [] of UInt8
+          closed = false
+          while ptr < len
+            if raw[ptr] == 92_u8 # '\\'
+              if ptr + 1 < len
+                val_bytes << raw[ptr + 1]
+                ptr = ptr + 2
+              else
+                val_bytes << raw[ptr]
+                ptr = ptr + 1
+              end
+            elsif raw[ptr] == 34_u8 # '"'
+              closed = true
+              ptr = ptr + 1
+              break
+            else
+              val_bytes << raw[ptr]
+              ptr = ptr + 1
+            end
+          end
+          return nil unless closed
+
+          val_str = String.new(val_bytes.size) do |buf|
+            buf.copy_from(val_bytes.to_unsafe, val_bytes.size)
+          end
+
+          # Skip whitespace after closing quote until ';' or end
+          while ptr < len && raw[ptr] != 59_u8
+            ptr = ptr + 1
+          end
+        else
+          # Unquoted token value
+          val_start = ptr
+          while ptr < len && raw[ptr] != 59_u8
+            ptr = ptr + 1
+          end
+          val_str = raw_params[val_start, ptr - val_start].strip
+        end
+
+        params[key_str] = val_str
+        ptr = ptr + 1 if ptr < len && raw[ptr] == 59_u8
+      end
+    end
+
+    MediaType.new(raw_type, params)
+  end
+
+  def self.parse(string : String) : MediaType
+    res = parse?(string)
+    if res
+      res
+    else
+      raise "invalid media type: " + string
+    end
+  end
+
+  def to_s : String
+    parts = [] of String
+    parts << @media_type
+    @params.each do |k, v|
+      if MediaType.token_string?(v)
+        parts << ("; " + k + "=" + v)
+      else
+        escaped_bytes = [] of UInt8
+        v_raw = v.to_unsafe
+        v_len = v.bytesize
+        vi = 0
+        while vi < v_len
+          vb = v_raw[vi]
+          if vb == 34_u8 || vb == 92_u8 # '"' or '\\'
+            escaped_bytes << 92_u8
+          end
+          escaped_bytes << vb
+          vi = vi + 1
+        end
+        v_esc = String.new(escaped_bytes.size) do |buf|
+          buf.copy_from(escaped_bytes.to_unsafe, escaped_bytes.size)
+        end
+        parts << ("; " + k + "=\"" + v_esc + "\"")
+      end
+    end
+    parts.join("")
+  end
+
+  def fetch(key : String) : String
+    val = @params[key.downcase]?
+    if val
+      val
+    else
+      raise "missing media type parameter: " + key
+    end
+  end
+
+  def []=(key : String, value : String) : Nil
+    @params[key.downcase] = value
+  end
+
+  def to_s(io) : Nil
+    io << to_s
+  end
+end
+
+pub struct MIME
+  pub class Error < Exception
+    getter message : String
+
+    def initialize(@message : String)
+    end
+  end
+
+  @@custom_extensions : Hash(String, String) = Hash(String, String).new
+  @@custom_reverse : Hash(String, Array(String)) = Hash(String, Array(String)).new
+
+  @@initialized : Bool = false
+
+  def self.init(load_defaults : Bool = true) : Nil
+    @@initialized = true
+    if load_defaults
+      register_defaults
+    end
+  end
+
+  private def self.register_defaults : Nil
+    register(".css", "text/css; charset=utf-8")
+    register(".gif", "image/gif")
+    register(".htm", "text/html; charset=utf-8")
+    register(".html", "text/html; charset=utf-8")
+    register(".jpg", "image/jpeg")
+    register(".jpeg", "image/jpeg")
+    register(".js", "text/javascript; charset=utf-8")
+    register(".json", "application/json")
+    register(".pdf", "application/pdf")
+    register(".png", "image/png")
+    register(".svg", "image/svg+xml")
+    register(".txt", "text/plain; charset=utf-8")
+    register(".xml", "text/xml; charset=utf-8")
+    register(".wasm", "application/wasm")
+    register(".webp", "image/webp")
+  end
+
+  # Registers or overrides an extension to media type mapping.
+  # Extension can be specified with or without leading dot (e.g. ".cr" or "cr").
+  def self.register(ext : String, media_type : String) : Nil
+    normalized_ext = ext.starts_with?('.') ? ext.downcase : ("." + ext.downcase)
+    normalized_type = media_type.downcase
+    @@custom_extensions[normalized_ext] = normalized_type
+
+    list = @@custom_reverse[normalized_type]?
+    if list
+      unless list.includes?(normalized_ext)
+        list << normalized_ext
+      end
+    else
+      new_list = [] of String
+      new_list << normalized_ext
+      @@custom_reverse[normalized_type] = new_list
+    end
+  end
+
+  # Returns the media type for *ext*, or nil if not registered.
+  def self.from_extension?(ext : String) : String?
+    normalized = ext.starts_with?('.') ? ext.downcase : ("." + ext.downcase)
+
+    # Check custom overrides first
+    custom = @@custom_extensions[normalized]?
+    return custom if custom
+
+    # Common built-in table
+    case normalized
+    when ".html", ".htm"
+      "text/html; charset=utf-8"
+    when ".css"
+      "text/css; charset=utf-8"
+    when ".js", ".mjs"
+      "text/javascript; charset=utf-8"
+    when ".json"
+      "application/json"
+    when ".xml"
+      "text/xml; charset=utf-8"
+    when ".txt", ".text"
+      "text/plain; charset=utf-8"
+    when ".csv"
+      "text/csv; charset=utf-8"
+    when ".md", ".markdown"
+      "text/markdown; charset=utf-8"
+    when ".png"
+      "image/png"
+    when ".jpg", ".jpeg"
+      "image/jpeg"
+    when ".gif"
+      "image/gif"
+    when ".svg"
+      "image/svg+xml"
+    when ".webp"
+      "image/webp"
+    when ".ico"
+      "image/x-icon"
+    when ".avif"
+      "image/avif"
+    when ".bmp"
+      "image/bmp"
+    when ".tif", ".tiff"
+      "image/tiff"
+    when ".pdf"
+      "application/pdf"
+    when ".zip"
+      "application/zip"
+    when ".gz"
+      "application/gzip"
+    when ".tar"
+      "application/x-tar"
+    when ".wasm"
+      "application/wasm"
+    when ".bin"
+      "application/octet-stream"
+    when ".mp3"
+      "audio/mpeg"
+    when ".wav"
+      "audio/wav"
+    when ".ogg"
+      "audio/ogg"
+    when ".flac"
+      "audio/flac"
+    when ".mp4"
+      "video/mp4"
+    when ".webm"
+      "video/webm"
+    when ".woff"
+      "font/woff"
+    when ".woff2"
+      "font/woff2"
+    when ".ttf"
+      "font/ttf"
+    when ".otf"
+      "font/otf"
+    when ".epub"
+      "application/epub+zip"
+    else
+      nil
+    end
+  end
+
+  # Returns the media type for *ext*, or raises if not found.
+  def self.from_extension(ext : String) : String
+    res = from_extension?(ext)
+    if res
+      res
+    else
+      raise "unknown mime extension: " + ext
+    end
+  end
+
+  # Returns media type from file path or file name.
+  def self.from_filename?(filename : String) : String?
+    # Extract file extension after last dot, after last slash
+    slash = filename.rindex('/')
+    name = slash ? filename[slash + 1, filename.bytesize - slash - 1] : filename
+    dot = name.rindex('.')
+    return nil unless dot
+    ext = name[dot, name.bytesize - dot]
+    from_extension?(ext)
+  end
+
+  def self.from_filename(filename : String) : String
+    res = from_filename?(filename)
+    if res
+      res
+    else
+      raise "unknown mime filename: " + filename
+    end
+  end
+
+  # Returns extensions registered for the given media type.
+  def self.extensions(media_type : String) : Array(String)
+    t = media_type.downcase
+    custom = @@custom_reverse[t]?
+    result = [] of String
+    if custom
+      i = 0
+      while i < custom.size
+        result << custom[i]
+        i = i + 1
+      end
+    end
+
+    # Built-in reverse mappings
+    case t
+    when "text/html", "text/html; charset=utf-8"
+      result << ".html" unless result.includes?(".html")
+      result << ".htm" unless result.includes?(".htm")
+    when "text/css", "text/css; charset=utf-8"
+      result << ".css" unless result.includes?(".css")
+    when "text/javascript", "text/javascript; charset=utf-8"
+      result << ".js" unless result.includes?(".js")
+      result << ".mjs" unless result.includes?(".mjs")
+    when "application/json"
+      result << ".json" unless result.includes?(".json")
+    when "text/plain", "text/plain; charset=utf-8"
+      result << ".txt" unless result.includes?(".txt")
+    when "image/png"
+      result << ".png" unless result.includes?(".png")
+    when "image/jpeg"
+      result << ".jpg" unless result.includes?(".jpg")
+      result << ".jpeg" unless result.includes?(".jpeg")
+    when "image/gif"
+      result << ".gif" unless result.includes?(".gif")
+    when "image/svg+xml"
+      result << ".svg" unless result.includes?(".svg")
+    when "application/pdf"
+      result << ".pdf" unless result.includes?(".pdf")
+    when "application/wasm"
+      result << ".wasm" unless result.includes?(".wasm")
+    end
+
+    result
+  end
+
+  # Loads a mime database from mime.types format content.
+  # Each line: media/type ext1 ext2 ...
+  # Lines starting with # and blank lines are ignored.
+  def self.load_mime_database(content : String) : Nil
+    lines = content.split('\n')
+    line_idx = 0
+    while line_idx < lines.size
+      raw_line = lines[line_idx].strip
+      unless raw_line.empty? || raw_line.starts_with?('#')
+        # Strip comment if present
+        hash_idx = raw_line.index('#')
+        line = hash_idx ? raw_line[0, hash_idx].strip : raw_line
+        unless line.empty?
+          tokens = line.split(' ')
+          clean_tokens = [] of String
+          ti = 0
+          while ti < tokens.size
+            t = tokens[ti].strip
+            clean_tokens << t unless t.empty?
+            ti = ti + 1
+          end
+
+          if clean_tokens.size >= 2
+            media_type = clean_tokens[0]
+            ext_idx = 1
+            while ext_idx < clean_tokens.size
+              register(clean_tokens[ext_idx], media_type)
+              ext_idx = ext_idx + 1
+            end
+          end
+        end
+      end
+      line_idx = line_idx + 1
+    end
+  end
+
+  def self.from_extension(ext : String, default : String) : String
+    from_extension?(ext) || default
+  end
+
+  def self.from_extension(ext : String, &block : String -> String) : String
+    res = from_extension?(ext)
+    res ? res : yield(ext)
+  end
+
+  def self.from_filename(filename : String, default : String) : String
+    from_filename?(filename) || default
+  end
+
+  def self.from_filename(filename : String, &block : String -> String) : String
+    res = from_filename?(filename)
+    res ? res : yield(filename)
+  end
+
+  pub struct Multipart
+    pub class Error < MIME::Error
+      getter message : String
+
+      def initialize(@message : String)
+      end
+    end
+
+    def self.generate_boundary : String
+      "---------------------------dQu6bXHYb4m5zrRC3xPTGwV"
+    end
+
+    def self.parse_boundary(content_type : String) : String?
+      if type = MediaType.parse?(content_type)
+        if type.type == "multipart"
+          return type["boundary"]?
+        end
+      end
+      nil
+    end
+
+    def self.build(io : T, boundary : String = Multipart.generate_boundary, &block : Builder(T) -> Nil) : Nil forall T
+      builder = Builder(T).new(io, boundary)
+      block.call(builder)
+      builder.finish
+    end
+
+    def self.build(boundary : String = Multipart.generate_boundary, &block : Builder(StringAccumulator) -> Nil) : String
+      io = StringAccumulator.new
+      builder = Builder(StringAccumulator).new(io, boundary)
+      block.call(builder)
+      builder.finish
+      io.to_s
+    end
+
+    def self.parse(io : T, boundary : String, &block : (Headers, StringAccumulator) -> Nil) : Nil forall T
+      parser = Parser(T).new(io, boundary)
+      while parser.has_next?
+        parser.next do |headers, body_io|
+          yield headers, body_io
+        end
+      end
+    end
+
+    class StringAccumulator
+      @parts : Array(String)
+
+      def initialize
+        @parts = [] of String
+      end
+
+      def <<(str) : self
+        @parts << str.to_s
+        self
+      end
+
+      def write(bytes : Bytes) : Int32
+        len = bytes.size
+        @parts << String.new(len) { |ptr| ptr.copy_from(bytes.to_unsafe, len); len }
+        len
+      end
+
+      def to_s : String
+        @parts.join("")
+      end
+    end
+
+    pub class Builder(T)
+      getter boundary : String
+      @io : T
+
+      def initialize(@io : T, @boundary : String = Multipart.generate_boundary)
+        @state = 0 # 0: start, 1: preamble, 2: body, 3: epilogue, 4: finished
+      end
+
+      def content_type(subtype : String = "mixed") : String
+        "multipart/#{subtype}; boundary=\"#{@boundary}\""
+      end
+
+      def preamble(string : String) : Nil
+        preamble { |io| io << string }
+      end
+
+      def preamble(data : Bytes) : Nil
+        preamble { |io| io.write(data) }
+      end
+
+      def preamble(io) : Nil
+        preamble { |out_io| out_io << io.to_s }
+      end
+
+      def preamble(&block) : Nil
+        raise Error.new("Cannot generate preamble: body already started").message if @state > 1
+        yield @io
+        @state = 1
+      end
+
+      def body_part(headers : Headers, string : String) : Nil
+        body_part(headers) { |io| io << string }
+      end
+
+      def body_part(headers : Headers, data : Bytes) : Nil
+        body_part(headers) { |io| io.write(data) }
+      end
+
+      def body_part(headers : Headers, body_io) : Nil
+        body_part(headers) { |io| io << body_io.to_s }
+      end
+
+      def body_part(headers : Headers, &block) : Nil
+        raise Error.new("Cannot generate body part: already finished").message if @state >= 4
+        raise Error.new("Cannot generate body part: after epilogue").message if @state == 3
+
+        @io << "\r\n" unless @state == 0
+        @io << "--" << @boundary
+        headers.each do |name, val|
+          @io << "\r\n" << name << ": " << val
+        end
+        @io << "\r\n\r\n"
+        yield @io
+        @state = 2
+      end
+
+      def body_part(headers : Headers) : Nil
+        body_part(headers) { }
+      end
+
+      def epilogue(string : String) : Nil
+        epilogue { |io| io << string }
+      end
+
+      def epilogue(data : Bytes) : Nil
+        epilogue { |io| io.write(data) }
+      end
+
+      def epilogue(io) : Nil
+        epilogue { |out_io| out_io << io.to_s }
+      end
+
+      def epilogue(&block) : Nil
+        raise Error.new("Cannot generate epilogue: already finished").message if @state >= 4
+        finish_parts unless @state == 3
+        yield @io
+        @state = 3
+      end
+
+      def finish : Nil
+        return if @state >= 4
+        finish_parts unless @state == 3
+        @state = 4
+      end
+
+      private def finish_parts : Nil
+        @io << "\r\n--" << @boundary << "--\r\n"
+      end
+    end
+
+    pub class Parser(T)
+      @io : T
+      @dash_boundary : String
+      @close_boundary : String
+      @parts : Array(Tuple(Headers, String))
+      @raw_content : String
+      @idx : Int32
+
+      def initialize(@io : T, @boundary : String)
+        @dash_boundary = "--#{@boundary}"
+        @close_boundary = "--#{@boundary}--"
+        @parts = [] of Tuple(Headers, String)
+        @raw_content = @io.to_s
+        @idx = 0
+        parse_all_parts
+      end
+
+      def has_next? : Bool
+        @idx < @parts.size
+      end
+
+      def next(&block : (Headers, StringAccumulator) -> Nil) : Nil
+        raise Error.new("Multipart parser already finished parsing").message if @idx >= @parts.size
+        headers, body = @parts[@idx]
+        @idx += 1
+        io = StringAccumulator.new
+        io << body
+        yield headers, io
+      end
+
+      private def parse_all_parts : Nil
+        content = @raw_content
+        return if content.empty?
+
+        chunks = content.split(@dash_boundary)
+        return if chunks.size < 2
+
+        chunk_idx = 1
+        while chunk_idx < chunks.size
+          chunk = chunks[chunk_idx]
+          if chunk.starts_with?("--")
+            break
+          end
+
+          c = chunk.starts_with?("\r\n") ? chunk[2, chunk.bytesize - 2] : chunk
+          if c.ends_with?("\r\n")
+            c = c[0, c.bytesize - 2]
+          end
+
+          sep_idx = c.index("\r\n\r\n")
+          if sep_idx
+            header_text = c[0, sep_idx]
+            body_text = c[sep_idx + 4, c.bytesize - sep_idx - 4]
+            headers = Headers.new
+            header_text.lines.each do |line|
+              colon = line.index(":")
+              if colon
+                k = line[0, colon].strip
+                v = line[colon + 1, line.bytesize - colon - 1].strip
+                headers.add(k, v)
+              end
+            end
+            @parts << {headers, body_text}
+          end
+
+          chunk_idx += 1
+        end
+      end
+    end
+  end
+end

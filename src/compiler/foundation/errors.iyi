@@ -1,0 +1,31 @@
+module compiler/foundation/errors
+
+import compiler/foundation/location
+using compiler/foundation/location::{Location}
+
+pub class SyntaxException < Exception
+  getter message : String
+  getter line_number : Int32
+  getter column_number : Int32
+  getter filename : String
+  getter size : Int32?
+
+  def initialize(@message : String, @line_number : Int32 = 0, @column_number : Int32 = 0, @filename : String = "", @size : Int32? = nil)
+  end
+
+  def location : Location
+    Location.new(@filename, @line_number, @column_number)
+  end
+
+  def to_s : String
+    if @filename.empty?
+      if @line_number > 0
+        "Syntax error in line #{@line_number}, column #{@column_number}: #{@message}"
+      else
+        "Syntax error: #{@message}"
+      end
+    else
+      "Syntax error in #{@filename}:#{@line_number}:#{@column_number}: #{@message}"
+    end
+  end
+end

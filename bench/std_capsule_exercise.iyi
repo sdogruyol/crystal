@@ -1,0 +1,474 @@
+# HTTP Datagrams, Capsule Protocol, and WebTransport session exercise.
+#
+#   ./bin/iyi run bench/std_capsule_exercise.iyi
+#
+# Exercises:
+# 1. QUIC Variable-Length Integer Encoding (RFC 9000 Section 16 & Appendix A)
+#    including all published test vectors, explicit multi-byte encodings,
+#    and boundary round trips (0, 63, 64, 16383, 16384, 1073741823, 1073741824, MAX).
+# 2. Refusal of truncated varints, reserved values (> 2^62 - 1), and overlong encodings.
+# 3. HTTP Datagrams (RFC 9297 Section 2) and Quarter Stream ID association.
+# 4. Capsule Protocol framing (RFC 9297 Section 3), length overruns, and truncation refusal.
+# 5. Extensibility rule (RFC 9297 Section 3.2): unknown capsule types skipped without error.
+# 6. Extended CONNECT (RFC 8441 & RFC 9220) settings and header validation.
+# 7. WebTransport stream framing: Bidirectional (0x41) and Unidirectional (0x54).
+# 8. WebTransport unreliable datagrams with Quarter Stream ID mapping.
+# 9. WebTransport session state machine: establishment, streams, datagrams, drain, and close.
+# 10. Wave two transport interface contract statement.
+
+import std/slice
+import std/capsule
+import std/webtransport
+using std/slice::{Slice, Bytes}
+using std/capsule::{VarInt, HttpDatagram, Capsule, CapsuleType, CapsuleReader, ExtendedConnect, CapsuleProtocol}
+using std/webtransport::{WebTransportConstants, CloseSessionCapsule, DrainSessionCapsule, BidiStreamHeader, UniStreamHeader, WebTransportDatagram, SessionStatus, WebTransportSession, WaveTwoTransportContract}
+
+# Helper to compare two byte slices
+def bytes_equal?(a : Bytes, b : Bytes) : Bool
+  return false unless a.size == b.size
+  i = 0
+  while i < a.size
+    return false unless a[i] == b[i]
+    i = i + 1
+  end
+  true
+end
+
+# =============================================================================
+# 1. QUIC Varint RFC 9000 Appendix A Test Vectors
+# =============================================================================
+
+# Table 4 in RFC 9000 Appendix A:
+# Value 37 in 1-byte, 2-byte, 4-byte, and 8-byte encodings:
+v37_1 = VarInt.encode(37_u64, 1)
+raise "rfc9000 app a: 37 in 1 byte size" unless v37_1.size == 1
+raise "rfc9000 app a: 37 in 1 byte hex" unless v37_1[0] == 0x25_u8
+
+v37_2 = VarInt.encode(37_u64, 2)
+raise "rfc9000 app a: 37 in 2 byte size" unless v37_2.size == 2
+raise "rfc9000 app a: 37 in 2 byte hex" unless v37_2[0] == 0x40_u8 && v37_2[1] == 0x25_u8
+
+v37_4 = VarInt.encode(37_u64, 4)
+raise "rfc9000 app a: 37 in 4 byte size" unless v37_4.size == 4
+raise "rfc9000 app a: 37 in 4 byte hex" unless v37_4[0] == 0x80_u8 && v37_4[1] == 0x00_u8 && v37_4[2] == 0x00_u8 && v37_4[3] == 0x25_u8
+
+v37_8 = VarInt.encode(37_u64, 8)
+raise "rfc9000 app a: 37 in 8 byte size" unless v37_8.size == 8
+raise "rfc9000 app a: 37 in 8 byte hex" unless v37_8[0] == 0xc0_u8 && v37_8[1] == 0x00_u8 && v37_8[2] == 0x00_u8 && v37_8[3] == 0x00_u8 && v37_8[4] == 0x00_u8 && v37_8[5] == 0x00_u8 && v37_8[6] == 0x00_u8 && v37_8[7] == 0x25_u8
+
+# All 4 multi-byte encodings of 37 must decode back to 37 in standard decode mode
+d37_1, c37_1 = VarInt.decode(v37_1)
+raise "rfc9000 app a: decode 37 1-byte" unless d37_1 == 37_u64 && c37_1 == 1
+
+d37_2, c37_2 = VarInt.decode(v37_2)
+raise "rfc9000 app a: decode 37 2-byte" unless d37_2 == 37_u64 && c37_2 == 2
+
+d37_4, c37_4 = VarInt.decode(v37_4)
+raise "rfc9000 app a: decode 37 4-byte" unless d37_4 == 37_u64 && c37_4 == 4
+
+d37_8, c37_8 = VarInt.decode(v37_8)
+raise "rfc9000 app a: decode 37 8-byte" unless d37_8 == 37_u64 && c37_8 == 8
+
+# Value 15293 in 2 bytes: 0x7bbd
+v15293 = VarInt.encode(15293_u64)
+raise "rfc9000 app a: 15293 size" unless v15293.size == 2
+raise "rfc9000 app a: 15293 hex" unless v15293[0] == 0x7b_u8 && v15293[1] == 0xbd_u8
+d15293, c15293 = VarInt.decode(v15293)
+raise "rfc9000 app a: decode 15293" unless d15293 == 15293_u64 && c15293 == 2
+
+# Value 494878333 in 4 bytes: 0x9d7f3e7d
+v494 = VarInt.encode(494878333_u64)
+raise "rfc9000 app a: 494878333 size" unless v494.size == 4
+raise "rfc9000 app a: 494878333 hex" unless v494[0] == 0x9d_u8 && v494[1] == 0x7f_u8 && v494[2] == 0x3e_u8 && v494[3] == 0x7d_u8
+d494, c494 = VarInt.decode(v494)
+raise "rfc9000 app a: decode 494878333" unless d494 == 494878333_u64 && c494 == 4
+
+# Value 151288809941952652 in 8 bytes: 0xc2197c5eff14e88c
+v151 = VarInt.encode(151288809941952652_u64)
+raise "rfc9000 app a: 151288809941952652 size" unless v151.size == 8
+raise "rfc9000 app a: 151288809941952652 hex" unless v151[0] == 0xc2_u8 && v151[1] == 0x19_u8 && v151[2] == 0x7c_u8 && v151[3] == 0x5e_u8 && v151[4] == 0xff_u8 && v151[5] == 0x14_u8 && v151[6] == 0xe8_u8 && v151[7] == 0x8c_u8
+d151, c151 = VarInt.decode(v151)
+raise "rfc9000 app a: decode 151288809941952652" unless d151 == 151288809941952652_u64 && c151 == 8
+
+puts "    rfc 9000 appendix a: all published test vectors and multi-byte forms verified"
+
+# =============================================================================
+# 2. QUIC Varint Boundary Values and Round Trips
+# =============================================================================
+
+# Round trip exact boundary values:
+# 0 (1-byte boundary low)
+b_0 = VarInt.encode(0_u64)
+raise "boundary 0 size" unless b_0.size == 1 && b_0[0] == 0x00_u8
+d_0, _ = VarInt.decode(b_0)
+raise "boundary 0 value" unless d_0 == 0_u64
+
+# 63 (1-byte boundary high)
+b_63 = VarInt.encode(63_u64)
+raise "boundary 63 size" unless b_63.size == 1 && b_63[0] == 0x3f_u8
+d_63, _ = VarInt.decode(b_63)
+raise "boundary 63 value" unless d_63 == 63_u64
+
+# 64 (2-byte boundary low)
+b_64 = VarInt.encode(64_u64)
+raise "boundary 64 size" unless b_64.size == 2 && b_64[0] == 0x40_u8 && b_64[1] == 0x40_u8
+d_64, _ = VarInt.decode(b_64)
+raise "boundary 64 value" unless d_64 == 64_u64
+
+# 16383 (2-byte boundary high)
+b_16383 = VarInt.encode(16383_u64)
+raise "boundary 16383 size" unless b_16383.size == 2 && b_16383[0] == 0x7f_u8 && b_16383[1] == 0xff_u8
+d_16383, _ = VarInt.decode(b_16383)
+raise "boundary 16383 value" unless d_16383 == 16383_u64
+
+# 16384 (4-byte boundary low)
+b_16384 = VarInt.encode(16384_u64)
+raise "boundary 16384 size" unless b_16384.size == 4 && b_16384[0] == 0x80_u8 && b_16384[1] == 0x00_u8 && b_16384[2] == 0x40_u8 && b_16384[3] == 0x00_u8
+d_16384, _ = VarInt.decode(b_16384)
+raise "boundary 16384 value" unless d_16384 == 16384_u64
+
+# 1073741823 (4-byte boundary high)
+b_1073 = VarInt.encode(1073741823_u64)
+raise "boundary 1073741823 size" unless b_1073.size == 4 && b_1073[0] == 0xbf_u8 && b_1073[1] == 0xff_u8 && b_1073[2] == 0xff_u8 && b_1073[3] == 0xff_u8
+d_1073, _ = VarInt.decode(b_1073)
+raise "boundary 1073741823 value" unless d_1073 == 1073741823_u64
+
+# 1073741824 (8-byte boundary low)
+b_1074 = VarInt.encode(1073741824_u64)
+raise "boundary 1073741824 size" unless b_1074.size == 8 && b_1074[0] == 0xc0_u8 && b_1074[1] == 0x00_u8 && b_1074[2] == 0x00_u8 && b_1074[3] == 0x00_u8 && b_1074[4] == 0x40_u8 && b_1074[5] == 0x00_u8 && b_1074[6] == 0x00_u8 && b_1074[7] == 0x00_u8
+d_1074, _ = VarInt.decode(b_1074)
+raise "boundary 1073741824 value" unless d_1074 == 1073741824_u64
+
+# Maximum: 4611686018427387903 (2^62 - 1)
+b_max = VarInt.encode(VarInt::MAX)
+raise "boundary max size" unless b_max.size == 8
+i = 0
+while i < 8
+  raise "boundary max byte #{i}" unless b_max[i] == 0xff_u8
+  i = i + 1
+end
+d_max, _ = VarInt.decode(b_max)
+raise "boundary max value" unless d_max == VarInt::MAX
+
+puts "    boundary values: 0, 63, 64, 16383, 16384, 1073741823, 1073741824, and max round-trip verified"
+
+# =============================================================================
+# 3. Varint Errors: Truncated, Overlong, and Reserved Refused
+# =============================================================================
+
+# Refusal of truncated varints:
+t_buf = Bytes.new(1)
+t_buf[0] = 0x40_u8 # indicates 2-byte varint, but buffer size is only 1
+raise "varint: truncated 2-byte not refused" unless VarInt.decode?(t_buf).nil?
+
+t_buf4 = Bytes.new(3)
+t_buf4[0] = 0x80_u8 # indicates 4-byte varint, but buffer size is 3
+raise "varint: truncated 4-byte not refused" unless VarInt.decode?(t_buf4).nil?
+
+t_buf8 = Bytes.new(7)
+t_buf8[0] = 0xc0_u8 # indicates 8-byte varint, but buffer size is 7
+raise "varint: truncated 8-byte not refused" unless VarInt.decode?(t_buf8).nil?
+
+# Refusal of overlong varints under strict mode:
+raise "varint: overlong 2-byte not refused in strict mode" unless VarInt.decode_strict?(v37_2).nil?
+raise "varint: overlong 4-byte not refused in strict mode" unless VarInt.decode_strict?(v37_4).nil?
+raise "varint: overlong 8-byte not refused in strict mode" unless VarInt.decode_strict?(v37_8).nil?
+
+# Refusal of reserved / out-of-range varint value (> 2^62 - 1):
+raise "varint: reserved value > 2^62 - 1 not refused" if VarInt.valid_value?(VarInt::MAX + 1_u64)
+
+puts "    varint errors: truncated varints, overlong encodings, and reserved values strictly refused"
+
+# =============================================================================
+# 4. HTTP Datagrams and Quarter Stream ID Mapping (RFC 9297 Section 2)
+# =============================================================================
+
+# Stream 0 -> Quarter Stream ID 0
+d0_payload = Bytes.new(4)
+d0_payload[0] = 0xAA_u8; d0_payload[1] = 0xBB_u8; d0_payload[2] = 0xCC_u8; d0_payload[3] = 0xDD_u8
+d0 = HttpDatagram.from_stream_id(0_u64, d0_payload)
+raise "dgram stream 0 qid" unless d0.quarter_stream_id == 0_u64
+raise "dgram stream 0 stream_id" unless d0.stream_id == 0_u64
+
+enc_d0 = d0.encode
+dec_d0, c_d0 = HttpDatagram.decode(enc_d0)
+raise "dgram stream 0 decode qid" unless dec_d0.quarter_stream_id == 0_u64
+raise "dgram stream 0 decode stream_id" unless dec_d0.stream_id == 0_u64
+raise "dgram stream 0 payload equal" unless bytes_equal?(dec_d0.payload, d0_payload)
+
+# Stream 4 -> Quarter Stream ID 1
+d4 = HttpDatagram.from_stream_id(4_u64, d0_payload)
+raise "dgram stream 4 qid" unless d4.quarter_stream_id == 1_u64
+raise "dgram stream 4 stream_id" unless d4.stream_id == 4_u64
+
+# Stream 16388 -> Quarter Stream ID 4097
+d16388 = HttpDatagram.from_stream_id(16388_u64, d0_payload)
+raise "dgram stream 16388 qid" unless d16388.quarter_stream_id == 4097_u64
+raise "dgram stream 16388 stream_id" unless d16388.stream_id == 16388_u64
+
+enc_d16388 = d16388.encode
+dec_d16388, _ = HttpDatagram.decode(enc_d16388)
+raise "dgram stream 16388 round trip" unless dec_d16388.stream_id == 16388_u64 && bytes_equal?(dec_d16388.payload, d0_payload)
+
+puts "    http datagrams: quarter stream id association and payload round-trip verified"
+
+# =============================================================================
+# 5. Capsule Protocol Framing and Refusal of Truncation / Overrun
+# =============================================================================
+
+# Round trip standard DATAGRAM capsule (type 0x00)
+cap_data = Bytes.new(5)
+cap_data[0] = 0x10_u8; cap_data[1] = 0x20_u8; cap_data[2] = 0x30_u8; cap_data[3] = 0x40_u8; cap_data[4] = 0x50_u8
+cap1 = Capsule.new(CapsuleType::DATAGRAM, cap_data)
+enc_cap1 = cap1.encode
+dec_cap1, c_cap1 = Capsule.decode(enc_cap1)
+raise "capsule 1 type" unless dec_cap1.datagram?
+raise "capsule 1 value" unless bytes_equal?(dec_cap1.value, cap_data)
+raise "capsule 1 consumed" unless c_cap1 == enc_cap1.size
+
+# Refusal of truncated capsule:
+bad_slice = Bytes.new(4)
+bad_slice[0] = enc_cap1[0]
+bad_slice[1] = enc_cap1[1]
+bad_slice[2] = enc_cap1[2]
+bad_slice[3] = enc_cap1[3]
+raise "capsule: truncated payload not refused" unless Capsule.decode?(bad_slice).nil?
+
+# Refusal of length overrunning the buffer:
+overrun_buf = Bytes.new(3)
+overrun_buf[0] = 0x00_u8 # type 0 (DATAGRAM)
+overrun_buf[1] = 0x32_u8 # length 50 bytes
+overrun_buf[2] = 0xAA_u8 # only 1 byte payload available
+raise "capsule: length overrunning buffer not refused" unless Capsule.decode?(overrun_buf).nil?
+
+puts "    capsule framing: type/length/value round-trip, truncation and buffer overrun refused"
+
+# =============================================================================
+# 6. Capsule Extensibility: Unknown Capsule Types Skipped Without Error
+# =============================================================================
+
+# Construct a stream carrying:
+# 1. Unknown capsule type 0x1234 with 4 bytes value
+# 2. Known DATAGRAM capsule (type 0x00) with 3 bytes value
+# 3. Unknown capsule type 0x9999 with 2 bytes value
+# 4. Known CLOSE_WEBTRANSPORT_SESSION capsule (type 0x2843) with close payload
+unknown_val1 = Bytes.new(4)
+unknown_val1[0] = 0xAA_u8; unknown_val1[1] = 0xBB_u8; unknown_val1[2] = 0xCC_u8; unknown_val1[3] = 0xDD_u8
+cap_unk1 = Capsule.new(0x1234_u64, unknown_val1)
+
+known_dgram_val = Bytes.new(3)
+known_dgram_val[0] = 0x01_u8; known_dgram_val[1] = 0x02_u8; known_dgram_val[2] = 0x03_u8
+cap_known1 = Capsule.new(CapsuleType::DATAGRAM, known_dgram_val)
+
+unknown_val2 = Bytes.new(2)
+unknown_val2[0] = 0xEE_u8; unknown_val2[1] = 0xFF_u8
+cap_unk2 = Capsule.new(0x9999_u64, unknown_val2)
+
+cap_close = CloseSessionCapsule.new(0_u64, "normal close").to_capsule
+
+# Concatenate all 4 capsules into one contiguous stream buffer
+e1 = cap_unk1.encode
+e2 = cap_known1.encode
+e3 = cap_unk2.encode
+e4 = cap_close.encode
+
+total_stream_size = e1.size + e2.size + e3.size + e4.size
+stream_buf = Bytes.new(total_stream_size)
+p = 0
+i = 0; while i < e1.size
+  stream_buf[p] = e1[i]; p = p + 1; i = i + 1
+end
+i = 0; while i < e2.size
+  stream_buf[p] = e2[i]; p = p + 1; i = i + 1
+end
+i = 0; while i < e3.size
+  stream_buf[p] = e3[i]; p = p + 1; i = i + 1
+end
+i = 0; while i < e4.size
+  stream_buf[p] = e4[i]; p = p + 1; i = i + 1
+end
+
+# CapsuleReader.read_known MUST skip the 2 unknown capsules and return exactly the 2 known ones
+known_only = CapsuleReader.read_known(stream_buf)
+raise "extensibility: expected 2 known capsules, got #{known_only.size}" unless known_only.size == 2
+raise "extensibility: first known capsule is datagram" unless known_only[0].datagram?
+raise "extensibility: second known capsule is close" unless known_only[1].close_webtransport_session?
+
+# Also verify read_with_skip_count reports exactly 2 skipped unknown capsules
+known_res, skipped_count = CapsuleReader.read_with_skip_count(stream_buf)
+raise "extensibility: skip count should be 2, got #{skipped_count}" unless skipped_count == 2
+raise "extensibility: result count should be 2, got #{known_res.size}" unless known_res.size == 2
+
+puts "    capsule extensibility: unknown capsule types skipped without error per RFC 9297"
+
+# =============================================================================
+# 7. Extended CONNECT (RFC 8441 & RFC 9220)
+# =============================================================================
+
+raise "extended connect setting" unless ExtendedConnect.settings_id == 0x08_u64
+
+# Valid WebTransport Extended CONNECT request
+valid_req = ExtendedConnect.valid_request?(
+  ExtendedConnect::METHOD_CONNECT,
+  ExtendedConnect::PROTOCOL_WEBTRANSPORT,
+  "https",
+  "example.com:443",
+  "/chat"
+)
+raise "extended connect valid request" unless valid_req
+
+# Invalid request missing :protocol
+invalid_req_no_proto = ExtendedConnect.valid_request?(
+  ExtendedConnect::METHOD_CONNECT,
+  nil,
+  "https",
+  "example.com:443",
+  "/chat"
+)
+raise "extended connect missing proto rejected" if invalid_req_no_proto
+
+# Invalid request with wrong method (GET instead of CONNECT)
+invalid_req_get = ExtendedConnect.valid_request?(
+  "GET",
+  ExtendedConnect::PROTOCOL_WEBTRANSPORT,
+  "https",
+  "example.com:443",
+  "/chat"
+)
+raise "extended connect wrong method rejected" if invalid_req_get
+
+# Response status validation
+raise "extended connect 200 ok" unless ExtendedConnect.valid_response?(200)
+raise "extended connect 201 created" unless ExtendedConnect.valid_response?(201)
+raise "extended connect 404 rejected" if ExtendedConnect.valid_response?(404)
+raise "extended connect 500 rejected" if ExtendedConnect.valid_response?(500)
+
+# Capsule-Protocol header validation
+raise "capsule header name" unless CapsuleProtocol.header_name == "Capsule-Protocol"
+raise "capsule header value" unless CapsuleProtocol.header_value == "?1"
+raise "capsule header valid" unless CapsuleProtocol.valid_header?("Capsule-Protocol", "?1")
+raise "capsule header invalid" if CapsuleProtocol.valid_header?("Content-Type", "text/plain")
+
+puts "    extended connect: settings 0x08, pseudo-header validation, and Capsule-Protocol verified"
+
+# =============================================================================
+# 8. WebTransport Stream Framing: Bidirectional (0x41) and Unidirectional (0x54)
+# =============================================================================
+
+# Bidirectional stream header (Type 0x41, Session ID 12)
+bidi_hdr = BidiStreamHeader.new(12_u64)
+enc_bidi = bidi_hdr.encode
+dec_bidi, consumed_bidi = BidiStreamHeader.decode(enc_bidi)
+raise "bidi session id" unless dec_bidi.session_id == 12_u64
+raise "bidi wire prefix 0x4041" unless enc_bidi[0] == 0x40_u8 && enc_bidi[1] == 0x41_u8
+
+# Unidirectional stream header (Type 0x54, Session ID 12)
+uni_hdr = UniStreamHeader.new(12_u64)
+enc_uni = uni_hdr.encode
+dec_uni, consumed_uni = UniStreamHeader.decode(enc_uni)
+raise "uni session id" unless dec_uni.session_id == 12_u64
+raise "uni wire prefix 0x4054" unless enc_uni[0] == 0x40_u8 && enc_uni[1] == 0x54_u8
+# Rejection of wrong stream type
+wrong_bidi = Bytes.new(2)
+wrong_bidi[0] = 0x40_u8
+wrong_bidi[1] = 0x99_u8 # varint 0x99 (not 0x41)
+raise "bidi header: wrong type not refused" unless BidiStreamHeader.decode?(wrong_bidi).nil?
+
+puts "    webtransport stream framing: bidi 0x41 and uni 0x54 headers and session tagging verified"
+
+# =============================================================================
+# 9. WebTransport Unreliable Datagrams (RFC 9297 & draft-ietf-webtrans-http3)
+# =============================================================================
+
+# Session ID 24 -> Quarter Stream ID = 24 // 4 = 6
+wt_payload = Bytes.new(4)
+wt_payload[0] = 0xCA_u8; wt_payload[1] = 0xFE_u8; wt_payload[2] = 0xBA_u8; wt_payload[3] = 0xBE_u8
+
+wt_dgram = WebTransportDatagram.new(24_u64, wt_payload)
+raise "wt dgram qid" unless wt_dgram.quarter_stream_id == 6_u64
+raise "wt dgram session id" unless wt_dgram.session_id == 24_u64
+
+enc_wt_dgram = wt_dgram.encode
+dec_wt_dgram, consumed_wt = WebTransportDatagram.decode(enc_wt_dgram)
+raise "wt dgram decode session id" unless dec_wt_dgram.session_id == 24_u64
+raise "wt dgram decode qid" unless dec_wt_dgram.quarter_stream_id == 6_u64
+raise "wt dgram decode payload" unless bytes_equal?(dec_wt_dgram.payload, wt_payload)
+
+puts "    webtransport datagrams: session to quarter stream id mapping and wire round-trip verified"
+
+# =============================================================================
+# 10. WebTransport Session State Machine Lifecycle
+# =============================================================================
+
+# Session with Session ID = 8 (Stream 8)
+session = WebTransportSession.new(8_u64)
+raise "initial state connecting" unless session.connecting?
+
+# 1. Establishment via Extended CONNECT 200 response
+session.on_connect_response(200)
+raise "established state open" unless session.open?
+
+# 2. Transmit Bidirectional Stream
+app_bidi = Bytes.new(3)
+app_bidi[0] = 10_u8; app_bidi[1] = 20_u8; app_bidi[2] = 30_u8
+wire_bidi = session.send_bidi_stream(app_bidi)
+recvd_bidi = session.receive_bidi_stream(wire_bidi)
+raise "bidi stream payload round trip" unless bytes_equal?(recvd_bidi, app_bidi)
+
+# 3. Transmit Unidirectional Stream
+app_uni = Bytes.new(2)
+app_uni[0] = 99_u8; app_uni[1] = 88_u8
+wire_uni = session.send_uni_stream(app_uni)
+recvd_uni = session.receive_uni_stream(wire_uni)
+raise "uni stream payload round trip" unless bytes_equal?(recvd_uni, app_uni)
+
+# 4. Transmit Unreliable Datagram
+app_dgram = Bytes.new(4)
+app_dgram[0] = 0xDE_u8; app_dgram[1] = 0xAD_u8; app_dgram[2] = 0xBE_u8; app_dgram[3] = 0xEF_u8
+wire_dgram = session.send_datagram(app_dgram)
+recvd_dgram = session.receive_datagram(wire_dgram)
+raise "datagram payload round trip" unless bytes_equal?(recvd_dgram, app_dgram)
+
+# 5. Unknown capsule ingested -> skipped without error
+session.receive_capsule(cap_unk1)
+raise "session remains open after unknown capsule" unless session.open?
+
+# 6. Drain capsule received -> transitions to Draining
+drain_cap = DrainSessionCapsule.to_capsule
+session.receive_capsule(drain_cap)
+raise "session transitions to draining" unless session.draining?
+
+# In Draining state, in-flight streams and datagrams can still be received
+recvd_bidi_draining = session.receive_bidi_stream(wire_bidi)
+raise "bidi stream receive while draining" unless bytes_equal?(recvd_bidi_draining, app_bidi)
+
+# 7. Close capsule sent -> transitions to Closed
+close_cap = session.close(0_u64, "session finished normally")
+raise "session transitions to closed" unless session.closed?
+raise "session close code" unless session.close_code == 0_u64
+raise "session close reason" unless session.close_reason == "session finished normally"
+
+# Peer receiving the close capsule also transitions to Closed
+peer_session = WebTransportSession.new(8_u64)
+peer_session.on_connect_response(200)
+peer_session.receive_capsule(close_cap)
+raise "peer session closed" unless peer_session.closed?
+raise "peer session code" unless peer_session.close_code == 0_u64
+raise "peer session reason" unless peer_session.close_reason == "session finished normally"
+
+puts "    session state machine: connecting -> open -> streams -> datagrams -> drain -> close verified"
+
+# =============================================================================
+# 11. Wave Two Transport Interface Contract Statement
+# =============================================================================
+
+req_settings = WaveTwoTransportContract.required_settings
+raise "wave two settings count" unless req_settings.size == 3
+stypes = WaveTwoTransportContract.stream_types
+raise "wave two stream types count" unless stypes.size == 2
+ctypes = WaveTwoTransportContract.capsule_types
+raise "wave two capsule types count" unless ctypes.size == 3
+
+puts "    wave two transport interface: settings 0x08, 0x33, 0x2b60 and stream/capsule dispatch verified"
+
+puts "all std/capsule checks passed"

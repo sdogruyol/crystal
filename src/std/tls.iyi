@@ -1,0 +1,2465 @@
+# Standard library native TLS 1.3 client (RFC 8446).
+# Pure native iyi implementation without OpenSSL or external C dependencies.
+#
+# Notice: This implementation is written natively from RFC specifications and
+# has not undergone an independent cryptographic audit.
+#
+# Cryptographic capabilities and security verification:
+#   * Key Exchange: X25519 (RFC 7748) with all-zero shared secret rejection.
+#   * Signature Verification:
+#       - Ed25519 (RFC 8032)
+#       - ECDSA P-256 (FIPS 186-4, RFC 6979)
+#       - RSA-PSS with SHA-256 and SHA-384 (RFC 8017)
+#       - RSA-PKCS1v15 with SHA-256 and SHA-384 (RFC 8017)
+#   * Handshake: TLS 1.3 ClientHello through Finished (RFC 8446 Section 4).
+#       - Extensions: server_name (SNI), supported_versions (0x0304),
+#         supported_groups (x25519), signature_algorithms, key_share, ALPN.
+#       - Key Schedule: HKDF-Expand-Label per RFC 8446 Section 7.1.
+#   * Record Layer: AEAD with TLS 1.3 per-record nonce (iv XOR seq_num).
+#       - TLS_AES_128_GCM_SHA256 (0x1301)
+#       - TLS_CHACHA20_POLY1305_SHA256 (0x1303)
+#   * Certificate Verification:
+#       - X.509 ASN.1 DER parser for certificates, public keys, validity, and SAN.
+#       - Hostname matching per RFC 6125 including wildcard rules.
+#       - Validity window verification (notBefore <= now <= notAfter).
+#       - Certificate chain signature verification to a trust anchor.
+#       - Trust store loading from system root bundles (/etc/ssl/cert.pem, etc.).
+#   * Four negative security protections verified to fail closed:
+#       - Bad Finished MAC: rejected (aborts handshake).
+#       - Unverifiable CertificateVerify signature: rejected (aborts handshake).
+#       - Expired or not-yet-valid certificate: rejected (aborts handshake).
+#       - Hostname mismatch (SAN / CN): rejected (aborts handshake).
+
+module std/tls
+
+pub import std/socket
+using std/socket::{IyiSocket}
+
+pub import std/slice
+using std/slice::{Slice}
+pub alias Bytes = Std::Slice::Bytes
+
+pub import std/crypto
+using std/crypto::{HMAC, HKDF, AES128GCM, ChaCha20Poly1305}
+
+pub import std/digest
+using std/digest::{SHA256, SHA384, SHA512}
+
+pub import std/big
+using std/big::{BigInt}
+
+pub import std/time
+using std/time::{Time}
+
+pub import std/dns
+
+# -----------------------------------------------------------------------------
+# TLS Errors
+# -----------------------------------------------------------------------------
+pub class Error < Exception
+  getter message : String
+
+  def initialize(@message : String)
+  end
+end
+
+pub class HandshakeError < Error
+  def initialize(message : String)
+    @message = message
+  end
+end
+
+pub class VerificationError < Error
+  def initialize(message : String)
+    @message = message
+  end
+end
+
+# -----------------------------------------------------------------------------
+# ASN.1 DER Parser
+# -----------------------------------------------------------------------------
+
+pub struct ASN1Element
+  getter tag : UInt8
+  getter offset : Int32
+  getter header_len : Int32
+  getter length : Int32
+  getter raw : Bytes
+
+  def initialize(@tag : UInt8, @offset : Int32, @header_len : Int32, @length : Int32, @raw : Bytes)
+  end
+
+  def total_length : Int32
+    @header_len + @length
+  end
+
+  def value : Bytes
+    @raw[@offset + @header_len, @length]
+  end
+
+  def entire_element : Bytes
+    @raw[@offset, total_length]
+  end
+end
+
+pub def self.read_asn1(data : Bytes, offset : Int32) : ASN1Element?
+  return nil if offset >= data.size
+  tag = data[offset]
+  return nil if offset + 1 >= data.size
+
+  len_byte = data[offset + 1].to_i32
+  header_len = 2
+  len = 0
+
+  if (len_byte & 0x80) == 0
+    len = len_byte
+  else
+    num_bytes = len_byte & 0x7f
+    # Indefinite length (0x80) is forbidden in DER (ITU-T X.690 §10.1)
+    return nil if num_bytes == 0
+    return nil if num_bytes > 4 || offset + 2 + num_bytes > data.size
+    header_len = 2 + num_bytes
+    i = 0
+    while i < num_bytes
+      len = (len << 8) | data[offset + 2 + i].to_i32
+      i = i + 1
+    end
+    return nil if len < 0
+  end
+
+  return nil if len < 0 || offset + header_len + len > data.size || offset + header_len + len < 0
+  ASN1Element.new(tag, offset, header_len, len, data)
+end
+
+pub def self.parse_asn1_children(elem : ASN1Element) : Array(ASN1Element)
+  children = Array(ASN1Element).new
+  curr_offset = elem.offset + elem.header_len
+  end_offset = curr_offset + elem.length
+  while curr_offset < end_offset
+    child = read_asn1(elem.raw, curr_offset)
+    break if child.nil?
+    children << child
+    curr_offset = curr_offset + child.total_length
+  end
+  children
+end
+
+pub def self.parse_integer(elem : ASN1Element) : BigInt
+  v = elem.value
+  res = BigInt.zero
+  two_five_six = BigInt.new(256_i64)
+  i = 0
+  while i < v.size
+    res = res * two_five_six + BigInt.new(v[i].to_i64)
+    i = i + 1
+  end
+  res
+end
+
+pub def self.parse_oid(elem : ASN1Element) : String
+  v = elem.value
+  return "" if v.empty?
+  first = v[0].to_i32
+  first_arc = first // 40
+  second_arc = first % 40
+  res = "#{first_arc}.#{second_arc}"
+
+  curr = 0_i64
+  i = 1
+  while i < v.size
+    b = v[i]
+    curr = (curr << 7) | (b & 0x7f).to_i64
+    if (b & 0x80) == 0
+      res = "#{res}.#{curr}"
+      curr = 0_i64
+    end
+    i = i + 1
+  end
+  res
+end
+
+pub def self.parse_time_bytes(bytes : Bytes) : Int64
+  if bytes.size >= 13 && (bytes[bytes.size - 1] == 'Z'.ord.to_u8 || bytes[bytes.size - 1] == 'z'.ord.to_u8)
+    if bytes[0] < '5'.ord.to_u8 && bytes.size == 13 # UTCTime 20YY
+      year = 2000 + (bytes[0].to_i32 - 48) * 10 + (bytes[1].to_i32 - 48)
+      idx = 2
+      month = (bytes[idx].to_i32 - 48) * 10 + (bytes[idx + 1].to_i32 - 48); idx = idx + 2
+      day = (bytes[idx].to_i32 - 48) * 10 + (bytes[idx + 1].to_i32 - 48); idx = idx + 2
+      hour = (bytes[idx].to_i32 - 48) * 10 + (bytes[idx + 1].to_i32 - 48); idx = idx + 2
+      min = (bytes[idx].to_i32 - 48) * 10 + (bytes[idx + 1].to_i32 - 48); idx = idx + 2
+      sec = (bytes[idx].to_i32 - 48) * 10 + (bytes[idx + 1].to_i32 - 48)
+      return Time.utc(year, month, day, hour, min, sec).seconds
+    elsif bytes.size == 13 # UTCTime 19YY
+      year = 1900 + (bytes[0].to_i32 - 48) * 10 + (bytes[1].to_i32 - 48)
+      idx = 2
+      month = (bytes[idx].to_i32 - 48) * 10 + (bytes[idx + 1].to_i32 - 48); idx = idx + 2
+      day = (bytes[idx].to_i32 - 48) * 10 + (bytes[idx + 1].to_i32 - 48); idx = idx + 2
+      hour = (bytes[idx].to_i32 - 48) * 10 + (bytes[idx + 1].to_i32 - 48); idx = idx + 2
+      min = (bytes[idx].to_i32 - 48) * 10 + (bytes[idx + 1].to_i32 - 48); idx = idx + 2
+      sec = (bytes[idx].to_i32 - 48) * 10 + (bytes[idx + 1].to_i32 - 48)
+      return Time.utc(year, month, day, hour, min, sec).seconds
+    elsif bytes.size >= 15 # GeneralizedTime YYYY
+      year = (bytes[0].to_i32 - 48) * 1000 + (bytes[1].to_i32 - 48) * 100 + (bytes[2].to_i32 - 48) * 10 + (bytes[3].to_i32 - 48)
+      idx = 4
+      month = (bytes[idx].to_i32 - 48) * 10 + (bytes[idx + 1].to_i32 - 48); idx = idx + 2
+      day = (bytes[idx].to_i32 - 48) * 10 + (bytes[idx + 1].to_i32 - 48); idx = idx + 2
+      hour = (bytes[idx].to_i32 - 48) * 10 + (bytes[idx + 1].to_i32 - 48); idx = idx + 2
+      min = (bytes[idx].to_i32 - 48) * 10 + (bytes[idx + 1].to_i32 - 48); idx = idx + 2
+      sec = (bytes[idx].to_i32 - 48) * 10 + (bytes[idx + 1].to_i32 - 48)
+      return Time.utc(year, month, day, hour, min, sec).seconds
+    end
+  end
+  0_i64
+end
+
+# -----------------------------------------------------------------------------
+# Base64 Decoder
+# -----------------------------------------------------------------------------
+
+pub def self.base64_decode(str : String) : Bytes
+  # Calculate approximate decoded length
+  valid_chars = 0
+  padding = 0
+  i = 0
+  while i < str.bytesize
+    c = str[i]
+    if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '+' || c == '/'
+      valid_chars = valid_chars + 1
+    elsif c == '='
+      padding = padding + 1
+    end
+    i = i + 1
+  end
+
+  total_len = (valid_chars + padding) * 3 // 4 - padding
+  total_len = 0 if total_len < 0
+  out = Bytes.new(total_len)
+
+  buffer = 0
+  bits = 0
+  out_idx = 0
+
+  i = 0
+  while i < str.bytesize
+    c = str[i]
+    val = -1
+    if c >= 'A' && c <= 'Z'
+      val = c.ord - 65
+    elsif c >= 'a' && c <= 'z'
+      val = c.ord - 97 + 26
+    elsif c >= '0' && c <= '9'
+      val = c.ord - 48 + 52
+    elsif c == '+'
+      val = 62
+    elsif c == '/'
+      val = 63
+    elsif c == '='
+      break
+    end
+
+    if val >= 0
+      buffer = (buffer << 6) | val
+      bits = bits + 6
+      if bits >= 8
+        bits = bits - 8
+        if out_idx < out.size
+          out[out_idx] = ((buffer >> bits) & 0xff).to_u8
+          out_idx = out_idx + 1
+        end
+      end
+    end
+    i = i + 1
+  end
+
+  out[0, out_idx]
+end
+
+# -----------------------------------------------------------------------------
+# X25519 (RFC 7748)
+# -----------------------------------------------------------------------------
+
+module X25519
+  P   = BigInt.from_hex("7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffed")
+  A24 = BigInt.new(121665_i64)
+
+  def self.mod_p(x : BigInt) : BigInt
+    r = x % P
+    r.negative? ? (r + P) : r
+  end
+
+  def self.bytes_to_bigint_le(b : Bytes) : BigInt
+    res = BigInt.zero
+    two_five_six = BigInt.new(256_i64)
+    i = b.size - 1
+    while i >= 0
+      res = res * two_five_six + BigInt.new(b[i].to_i64)
+      i = i - 1
+    end
+    res
+  end
+
+  def self.bigint_to_bytes_le(val : BigInt, len : Int32) : Bytes
+    out = Bytes.new(len)
+    curr = val
+    two_five_six = BigInt.new(256_i64)
+    i = 0
+    while i < len
+      byte_val = (curr % two_five_six).to_i64
+      out[i] = (byte_val & 0xff_i64).to_u8
+      curr = curr // two_five_six
+      i = i + 1
+    end
+    out
+  end
+
+  def self.scalar_mult(k_bytes : Bytes, u_bytes : Bytes) : Bytes
+    k = Bytes.new(32)
+    i = 0; while i < 32
+      k[i] = k_bytes[i]; i = i + 1
+    end
+    k[0] = k[0] & 248_u8
+    k[31] = (k[31] & 127_u8) | 64_u8
+
+    u_clamped = Bytes.new(32)
+    i = 0; while i < 32
+      u_clamped[i] = u_bytes[i]; i = i + 1
+    end
+    u_clamped[31] = u_clamped[31] & 127_u8
+
+    x1 = bytes_to_bigint_le(u_clamped)
+    x2 = BigInt.one
+    z2 = BigInt.zero
+    x3 = x1
+    z3 = BigInt.one
+    swap = 0
+
+    t = 254
+    while t >= 0
+      k_byte = k[t // 8]
+      k_bit = ((k_byte.to_i32 >> (t % 8)) & 1)
+      k_t = k_bit ^ swap
+      swap = k_bit
+
+      if k_t != 0
+        tx = x2; x2 = x3; x3 = tx
+        tz = z2; z2 = z3; z3 = tz
+      end
+
+      a = mod_p(x2 + z2)
+      aa = mod_p(a * a)
+      b = mod_p(x2 - z2)
+      bb = mod_p(b * b)
+      e = mod_p(aa - bb)
+      c = mod_p(x3 + z3)
+      d = mod_p(x3 - z3)
+      da = mod_p(d * a)
+      cb = mod_p(c * b)
+      da_plus_cb = mod_p(da + cb)
+      x3 = mod_p(da_plus_cb * da_plus_cb)
+      da_minus_cb = mod_p(da - cb)
+      z3 = mod_p(x1 * mod_p(da_minus_cb * da_minus_cb))
+      x2 = mod_p(aa * bb)
+      z2 = mod_p(e * mod_p(aa + A24 * e))
+
+      t = t - 1
+    end
+
+    if swap != 0
+      tx = x2; x2 = x3; x3 = tx
+      tz = z2; z2 = z3; z3 = tz
+    end
+
+    p_minus_2 = P - BigInt.new(2_i64)
+    inv_z2 = z2.pow_mod(p_minus_2, P)
+    res_x = mod_p(x2 * inv_z2)
+    bigint_to_bytes_le(res_x, 32)
+  end
+
+  def self.is_all_zero(b : Bytes) : Bool
+    diff = 0_u8
+    i = 0
+    while i < b.size
+      diff = diff | b[i]
+      i = i + 1
+    end
+    diff == 0_u8
+  end
+
+  def self.generate_keypair : {Bytes, Bytes}
+    priv = Std::Crypto.random_bytes(32)
+    base_u = Bytes.new(32, 0_u8)
+    base_u[0] = 9_u8
+    public_key = scalar_mult(priv, base_u)
+    {priv, public_key}
+  end
+end
+
+# -----------------------------------------------------------------------------
+# Ed25519 (RFC 8032) Signature Verification
+# -----------------------------------------------------------------------------
+
+module Ed25519
+  P       = BigInt.from_hex("7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffed")
+  Q_ORDER = BigInt.from_hex("1000000000000000000000000000000014def9dea2f79cd65812631a5cf5d3ed")
+
+  struct Point
+    getter x : BigInt
+    getter y : BigInt
+    getter z : BigInt
+    getter t : BigInt
+
+    def initialize(@x : BigInt, @y : BigInt, @z : BigInt, @t : BigInt)
+    end
+  end
+
+  def self.mod_p(x : BigInt) : BigInt
+    r = x % P
+    r.negative? ? (r + P) : r
+  end
+
+  def self.modp_inv(x : BigInt) : BigInt
+    x.pow_mod(P - BigInt.new(2_i64), P)
+  end
+
+  D_CONST      = mod_p((BigInt.zero - BigInt.new(121665_i64)) * modp_inv(BigInt.new(121666_i64)))
+  MODP_SQRT_M1 = BigInt.new(2_i64).pow_mod((P - BigInt.one) // BigInt.new(4_i64), P)
+
+  def self.recover_x(y : BigInt, sign : Int32) : BigInt?
+    return nil if y >= P
+    y2 = mod_p(y * y)
+    u = mod_p(y2 - BigInt.one)
+    v = mod_p(D_CONST * y2 + BigInt.one)
+    x2 = mod_p(u * modp_inv(v))
+    if x2.zero?
+      return sign != 0 ? nil : BigInt.zero
+    end
+
+    exp = (P + BigInt.new(3_i64)) // BigInt.new(8_i64)
+    x = x2.pow_mod(exp, P)
+    if mod_p(x * x - x2) != BigInt.zero
+      x = mod_p(x * MODP_SQRT_M1)
+    end
+    if mod_p(x * x - x2) != BigInt.zero
+      return nil
+    end
+
+    x_sign = (x % BigInt.new(2_i64)).to_i64.to_i32
+    if x_sign != sign
+      x = P - x
+    end
+    x
+  end
+
+  def self.point_decompress(s : Bytes) : Point?
+    return nil if s.size != 32
+    y_raw = X25519.bytes_to_bigint_le(s)
+    sign = (s[31].to_i32 >> 7) & 1
+    mask = (BigInt.one << 255) - BigInt.one
+    y = y_raw & mask
+    x = recover_x(y, sign)
+    return nil if x.nil?
+    Point.new(x, y, BigInt.one, mod_p(x * y))
+  end
+
+  def self.point_add(p1 : Point, p2 : Point) : Point
+    two = BigInt.new(2_i64)
+    a = mod_p(mod_p(p1.y - p1.x) * mod_p(p2.y - p2.x))
+    b = mod_p(mod_p(p1.y + p1.x) * mod_p(p2.y + p2.x))
+    c = mod_p(two * p1.t * p2.t * D_CONST)
+    d = mod_p(two * p1.z * p2.z)
+    e = mod_p(b - a)
+    f = mod_p(d - c)
+    g = mod_p(d + c)
+    h = mod_p(b + a)
+    Point.new(mod_p(e * f), mod_p(g * h), mod_p(f * g), mod_p(e * h))
+  end
+
+  def self.point_mul(s : BigInt, pt : Point) : Point
+    q = Point.new(BigInt.zero, BigInt.one, BigInt.one, BigInt.zero)
+    curr_p = pt
+    curr_s = s
+    two = BigInt.new(2_i64)
+    while !curr_s.zero?
+      if curr_s.odd?
+        q = point_add(q, curr_p)
+      end
+      curr_p = point_add(curr_p, curr_p)
+      curr_s = curr_s // two
+    end
+    q
+  end
+
+  def self.point_equal(p1 : Point, p2 : Point) : Bool
+    diff1 = mod_p(p1.x * p2.z - p2.x * p1.z)
+    diff2 = mod_p(p1.y * p2.z - p2.y * p1.z)
+    diff1.zero? && diff2.zero?
+  end
+
+  GY      = mod_p(BigInt.new(4_i64) * modp_inv(BigInt.new(5_i64)))
+  GX      = recover_x(GY, 0) || BigInt.zero
+  G_POINT = Point.new(GX, GY, BigInt.one, mod_p(GX * GY))
+
+  def self.verify(pub_key : Bytes, msg : Bytes, sig : Bytes) : Bool
+    return false if pub_key.size != 32 || sig.size != 64
+    pt_a = point_decompress(pub_key)
+    return false if pt_a.nil?
+
+    sig_r = sig[0, 32]
+    sig_s = sig[32, 32]
+    pt_r = point_decompress(sig_r)
+    return false if pt_r.nil?
+
+    s_val = X25519.bytes_to_bigint_le(sig_s)
+    return false if s_val >= Q_ORDER
+
+    h_input = Bytes.new(32 + 32 + msg.size)
+    i = 0; while i < 32
+      h_input[i] = sig_r[i]; i = i + 1
+    end
+    i = 0; while i < 32
+      h_input[32 + i] = pub_key[i]; i = i + 1
+    end
+    i = 0; while i < msg.size
+      h_input[64 + i] = msg[i]; i = i + 1
+    end
+
+    digest = SHA512.digest(h_input)
+    h_val = X25519.bytes_to_bigint_le(digest) % Q_ORDER
+
+    sb = point_mul(s_val, G_POINT)
+    ha = point_mul(h_val, pt_a)
+    r_plus_ha = point_add(pt_r, ha)
+
+    point_equal(sb, r_plus_ha)
+  end
+end
+
+# -----------------------------------------------------------------------------
+# ECDSA P-256 (secp256r1) Signature Verification
+# -----------------------------------------------------------------------------
+
+module P256
+  P  = BigInt.from_hex("ffffffff00000001000000000000000000000000ffffffffffffffffffffffff")
+  N  = BigInt.from_hex("ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551")
+  GX = BigInt.from_hex("6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296")
+  GY = BigInt.from_hex("4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5")
+
+  struct JPoint
+    getter x : BigInt
+    getter y : BigInt
+    getter z : BigInt
+
+    def initialize(@x : BigInt, @y : BigInt, @z : BigInt)
+    end
+
+    def infinity? : Bool
+      @z.zero?
+    end
+  end
+
+  INFINITY = JPoint.new(BigInt.zero, BigInt.one, BigInt.zero)
+  G_POINT  = JPoint.new(GX, GY, BigInt.one)
+
+  def self.mod_p(x : BigInt) : BigInt
+    r = x % P
+    r.negative? ? (r + P) : r
+  end
+
+  def self.mod_n(x : BigInt) : BigInt
+    r = x % N
+    r.negative? ? (r + N) : r
+  end
+
+  def self.modp_inv(x : BigInt) : BigInt
+    x.pow_mod(P - BigInt.new(2_i64), P)
+  end
+
+  def self.modn_inv(x : BigInt) : BigInt
+    x.pow_mod(N - BigInt.new(2_i64), N)
+  end
+
+  def self.j_double(p : JPoint) : JPoint
+    return p if p.infinity? || p.y.zero?
+    two = BigInt.new(2_i64)
+    three = BigInt.new(3_i64)
+    four = BigInt.new(4_i64)
+    eight = BigInt.new(8_i64)
+
+    delta = mod_p(p.z * p.z)
+    gamma = mod_p(p.y * p.y)
+    beta = mod_p(p.x * gamma)
+    alpha = mod_p(three * mod_p(p.x - delta) * mod_p(p.x + delta))
+
+    x3 = mod_p(alpha * alpha - eight * beta)
+    z3 = mod_p(two * p.y * p.z)
+    y3 = mod_p(alpha * mod_p(four * beta - x3) - eight * mod_p(gamma * gamma))
+
+    JPoint.new(x3, y3, z3)
+  end
+
+  def self.j_add(p1 : JPoint, p2 : JPoint) : JPoint
+    return p2 if p1.infinity?
+    return p1 if p2.infinity?
+
+    z1sq = mod_p(p1.z * p1.z)
+    z2sq = mod_p(p2.z * p2.z)
+    u1 = mod_p(p1.x * z2sq)
+    u2 = mod_p(p2.x * z1sq)
+
+    s1 = mod_p(p1.y * mod_p(p2.z * z2sq))
+    s2 = mod_p(p2.y * mod_p(p1.z * z1sq))
+
+    if u1 == u2
+      if s1 != s2
+        return INFINITY
+      else
+        return j_double(p1)
+      end
+    end
+
+    h = mod_p(u2 - u1)
+    r = mod_p(s2 - s1)
+    h2 = mod_p(h * h)
+    h3 = mod_p(h * h2)
+    u1h2 = mod_p(u1 * h2)
+
+    two = BigInt.new(2_i64)
+    x3 = mod_p(mod_p(r * r) - h3 - two * u1h2)
+    y3 = mod_p(r * mod_p(u1h2 - x3) - s1 * h3)
+    z3 = mod_p(h * mod_p(p1.z * p2.z))
+
+    JPoint.new(x3, y3, z3)
+  end
+
+  def self.j_mul(k : BigInt, p : JPoint) : JPoint
+    res = INFINITY
+    curr = p
+    s = k
+    two = BigInt.new(2_i64)
+    while !s.zero?
+      if s.odd?
+        res = j_add(res, curr)
+      end
+      curr = j_double(curr)
+      s = s // two
+    end
+    res
+  end
+
+  def self.verify(qx : BigInt, qy : BigInt, hash_bytes : Bytes, r : BigInt, s : BigInt) : Bool
+    raise "P256.verify reached with zero public key" if qx.zero? && qy.zero?
+    return false if r <= BigInt.zero || r >= N
+    return false if s <= BigInt.zero || s >= N
+
+    effective_hash = hash_bytes.size > 32 ? hash_bytes[0, 32] : hash_bytes
+    e = BigInt.zero
+    two_five_six = BigInt.new(256_i64)
+    i = 0
+    while i < effective_hash.size
+      e = e * two_five_six + BigInt.new(effective_hash[i].to_i64)
+      i = i + 1
+    end
+    e = e % N
+
+    w = modn_inv(s)
+    u1 = mod_n(e * w)
+    u2 = mod_n(r * w)
+
+    q_pt = JPoint.new(qx, qy, BigInt.one)
+    pt1 = j_mul(u1, G_POINT)
+    pt2 = j_mul(u2, q_pt)
+    res_pt = j_add(pt1, pt2)
+
+    return false if res_pt.infinity?
+
+    z_inv = modp_inv(res_pt.z)
+    rx = mod_p(res_pt.x * mod_p(z_inv * z_inv))
+    v = rx % N
+    v == r
+  end
+end
+
+# -----------------------------------------------------------------------------
+# ECDSA P-384 (secp384r1) Signature Verification
+# -----------------------------------------------------------------------------
+
+module P384
+  P  = BigInt.from_hex("fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffeffffffff0000000000000000ffffffff")
+  N  = BigInt.from_hex("ffffffffffffffffffffffffffffffffffffffffffffffffc7634d81f4372ddf581a0db248b0a77aecec196accc52973")
+  GX = BigInt.from_hex("aa87ca22be8b05378eb1c71ef320ad746e1d3b628ba79b9859f741e082542a385502f25dbf55296c3a545e3872760ab7")
+  GY = BigInt.from_hex("3617de4a96262c6f5d9e98bf9292dc29f8f41dbd289a147ce9da3113b5f0b8c00a60b1ce1d7e819d7a431d7c90ea0e5f")
+
+  struct JPoint
+    getter x : BigInt
+    getter y : BigInt
+    getter z : BigInt
+
+    def initialize(@x : BigInt, @y : BigInt, @z : BigInt)
+    end
+
+    def infinity? : Bool
+      @z.zero?
+    end
+  end
+
+  INFINITY = JPoint.new(BigInt.zero, BigInt.one, BigInt.zero)
+  G_POINT  = JPoint.new(GX, GY, BigInt.one)
+
+  def self.mod_p(x : BigInt) : BigInt
+    r = x % P
+    r.negative? ? (r + P) : r
+  end
+
+  def self.mod_n(x : BigInt) : BigInt
+    r = x % N
+    r.negative? ? (r + N) : r
+  end
+
+  def self.modp_inv(x : BigInt) : BigInt
+    x.pow_mod(P - BigInt.new(2_i64), P)
+  end
+
+  def self.modn_inv(x : BigInt) : BigInt
+    x.pow_mod(N - BigInt.new(2_i64), N)
+  end
+
+  def self.j_double(p : JPoint) : JPoint
+    return p if p.infinity? || p.y.zero?
+    two = BigInt.new(2_i64)
+    three = BigInt.new(3_i64)
+    four = BigInt.new(4_i64)
+    eight = BigInt.new(8_i64)
+
+    delta = mod_p(p.z * p.z)
+    gamma = mod_p(p.y * p.y)
+    beta = mod_p(p.x * gamma)
+    alpha = mod_p(three * mod_p(p.x - delta) * mod_p(p.x + delta))
+
+    x3 = mod_p(alpha * alpha - eight * beta)
+    z3 = mod_p(two * p.y * p.z)
+    y3 = mod_p(alpha * mod_p(four * beta - x3) - eight * mod_p(gamma * gamma))
+
+    JPoint.new(x3, y3, z3)
+  end
+
+  def self.j_add(p1 : JPoint, p2 : JPoint) : JPoint
+    return p2 if p1.infinity?
+    return p1 if p2.infinity?
+
+    z1sq = mod_p(p1.z * p1.z)
+    z2sq = mod_p(p2.z * p2.z)
+    u1 = mod_p(p1.x * z2sq)
+    u2 = mod_p(p2.x * z1sq)
+
+    s1 = mod_p(p1.y * mod_p(p2.z * z2sq))
+    s2 = mod_p(p2.y * mod_p(p1.z * z1sq))
+
+    if u1 == u2
+      if s1 != s2
+        return INFINITY
+      else
+        return j_double(p1)
+      end
+    end
+
+    h = mod_p(u2 - u1)
+    r = mod_p(s2 - s1)
+    h2 = mod_p(h * h)
+    h3 = mod_p(h * h2)
+    u1h2 = mod_p(u1 * h2)
+
+    two = BigInt.new(2_i64)
+    x3 = mod_p(mod_p(r * r) - h3 - two * u1h2)
+    y3 = mod_p(r * mod_p(u1h2 - x3) - s1 * h3)
+    z3 = mod_p(h * mod_p(p1.z * p2.z))
+
+    JPoint.new(x3, y3, z3)
+  end
+
+  def self.j_mul(k : BigInt, p : JPoint) : JPoint
+    res = INFINITY
+    curr = p
+    s = k
+    two = BigInt.new(2_i64)
+    while !s.zero?
+      if s.odd?
+        res = j_add(res, curr)
+      end
+      curr = j_double(curr)
+      s = s // two
+    end
+    res
+  end
+
+  def self.verify(qx : BigInt, qy : BigInt, hash_bytes : Bytes, r : BigInt, s : BigInt) : Bool
+    raise "P384.verify reached with zero public key" if qx.zero? && qy.zero?
+    return false if r <= BigInt.zero || r >= N
+    return false if s <= BigInt.zero || s >= N
+
+    effective_hash = hash_bytes.size > 48 ? hash_bytes[0, 48] : hash_bytes
+    e = BigInt.zero
+    two_five_six = BigInt.new(256_i64)
+    i = 0
+    while i < effective_hash.size
+      e = e * two_five_six + BigInt.new(effective_hash[i].to_i64)
+      i = i + 1
+    end
+    e = e % N
+
+    w = modn_inv(s)
+    u1 = mod_n(e * w)
+    u2 = mod_n(r * w)
+
+    q_pt = JPoint.new(qx, qy, BigInt.one)
+    pt1 = j_mul(u1, G_POINT)
+    pt2 = j_mul(u2, q_pt)
+    res_pt = j_add(pt1, pt2)
+
+    return false if res_pt.infinity?
+
+    z_inv = modp_inv(res_pt.z)
+    rx = mod_p(res_pt.x * mod_p(z_inv * z_inv))
+    v = rx % N
+    v == r
+  end
+end
+
+# -----------------------------------------------------------------------------
+# RSA Verification (PKCS#1 v1.5 and RSA-PSS)
+# -----------------------------------------------------------------------------
+
+module RSA
+  def self.bytes_to_bigint_be(b : Bytes) : BigInt
+    res = BigInt.zero
+    two_five_six = BigInt.new(256_i64)
+    i = 0
+    while i < b.size
+      res = res * two_five_six + BigInt.new(b[i].to_i64)
+      i = i + 1
+    end
+    res
+  end
+
+  def self.bigint_to_bytes_be(val : BigInt, len : Int32) : Bytes
+    out = Bytes.new(len)
+    curr = val
+    two_five_six = BigInt.new(256_i64)
+    i = len - 1
+    while i >= 0
+      byte_val = (curr % two_five_six).to_i64
+      out[i] = (byte_val & 0xff_i64).to_u8
+      curr = curr // two_five_six
+      i = i - 1
+    end
+    out
+  end
+
+  def self.bit_length(value : BigInt) : Int32
+    raise "RSA: modulus must be positive" if value <= BigInt.zero
+    bits = 0
+    current = value
+    while current > BigInt.zero
+      current = current >> 1
+      bits = bits + 1
+    end
+    bits
+  end
+
+  # RSA-PSS signing per RFC 8017 sections 8.1.1 and 9.1.1.
+  #
+  # Supplying salt makes published vectors reproducible. A nil salt draws hLen
+  # bytes from the operating system CSPRNG. The native BigInt private operation
+  # is not constant-time or blinded and has not had independent review.
+  pub def self.sign_pss(n : BigInt, d : BigInt, hash_algo : Symbol, m_hash : Bytes, salt : Bytes? = nil) : Bytes
+    h_len = hash_algo == :sha384 ? 48 : 32
+    raise "RSA-PSS: unsupported hash #{hash_algo}" unless hash_algo == :sha256 || hash_algo == :sha384
+    raise "RSA-PSS: message hash must be #{h_len} bytes" unless m_hash.size == h_len
+
+    actual_salt = salt || Std::Crypto.random_bytes(h_len)
+    mod_bits = bit_length(n)
+    em_bits = mod_bits - 1
+    em_len = (em_bits + 7) // 8
+    raise "RSA-PSS: modulus too small" if em_len < h_len + actual_salt.size + 2
+
+    db_len = em_len - h_len - 1
+    ps_len = db_len - actual_salt.size - 1
+    db = Bytes.new(db_len, 0_u8)
+    db[ps_len] = 0x01_u8
+    i = 0
+    while i < actual_salt.size
+      db[ps_len + 1 + i] = actual_salt[i]
+      i = i + 1
+    end
+
+    m_prime = Bytes.new(8 + m_hash.size + actual_salt.size, 0_u8)
+    i = 0
+    while i < m_hash.size
+      m_prime[8 + i] = m_hash[i]
+      i = i + 1
+    end
+    i = 0
+    while i < actual_salt.size
+      m_prime[8 + m_hash.size + i] = actual_salt[i]
+      i = i + 1
+    end
+
+    h = hash_algo == :sha384 ? SHA384.digest(m_prime) : SHA256.digest(m_prime)
+    db_mask = hash_algo == :sha384 ? mgf1_sha384(h, db_len) : mgf1_sha256(h, db_len)
+    masked_db = Bytes.new(db_len)
+    i = 0
+    while i < db_len
+      masked_db[i] = db[i] ^ db_mask[i]
+      i = i + 1
+    end
+
+    unused_bits = 8 * em_len - em_bits
+    masked_db[0] = masked_db[0] & (0xff_u8.unsafe_shr(unused_bits.to_u64)) if unused_bits > 0
+
+    em = Bytes.new(em_len)
+    i = 0
+    while i < db_len
+      em[i] = masked_db[i]
+      i = i + 1
+    end
+    i = 0
+    while i < h_len
+      em[db_len + i] = h[i]
+      i = i + 1
+    end
+    em[em_len - 1] = 0xbc_u8
+
+    encoded = bytes_to_bigint_be(em)
+    signature = encoded.pow_mod(d, n)
+    k = (mod_bits + 7) // 8
+    bigint_to_bytes_be(signature, k)
+  end
+
+  def self.mgf1_sha256(seed : Bytes, length : Int32) : Bytes
+    out = Bytes.new(length)
+    c = 0
+    offset = 0
+    while offset < length
+      c_bytes = Bytes.new(4)
+      c_bytes[0] = ((c >> 24) & 0xff).to_u8
+      c_bytes[1] = ((c >> 16) & 0xff).to_u8
+      c_bytes[2] = ((c >> 8) & 0xff).to_u8
+      c_bytes[3] = (c & 0xff).to_u8
+
+      h = SHA256.new.update(seed).update(c_bytes).final
+      chunk = length - offset
+      chunk = 32 if chunk > 32
+      i = 0; while i < chunk
+        out[offset + i] = h[i]; i = i + 1
+      end
+      offset = offset + chunk
+      c = c + 1
+    end
+    out
+  end
+
+  def self.mgf1_sha384(seed : Bytes, length : Int32) : Bytes
+    out = Bytes.new(length)
+    c = 0
+    offset = 0
+    while offset < length
+      c_bytes = Bytes.new(4)
+      c_bytes[0] = ((c >> 24) & 0xff).to_u8
+      c_bytes[1] = ((c >> 16) & 0xff).to_u8
+      c_bytes[2] = ((c >> 8) & 0xff).to_u8
+      c_bytes[3] = (c & 0xff).to_u8
+
+      h = SHA384.new.update(seed).update(c_bytes).final
+      chunk = length - offset
+      chunk = 48 if chunk > 48
+      i = 0; while i < chunk
+        out[offset + i] = h[i]; i = i + 1
+      end
+      offset = offset + chunk
+      c = c + 1
+    end
+    out
+  end
+
+  # RSA-PSS verification per RFC 8017 / RFC 8446
+  def self.verify_pss(n : BigInt, e : BigInt, hash_algo : Symbol, m_hash : Bytes, sig_bytes : Bytes, salt_len : Int32) : Bool
+    return false unless hash_algo == :sha256 || hash_algo == :sha384
+    return false if salt_len < 0
+    h_len = hash_algo == :sha384 ? 48 : 32
+    return false unless m_hash.size == h_len
+
+    mod_bits = bit_length(n)
+    em_bits = mod_bits - 1
+    em_len = (em_bits + 7) // 8
+    k = (mod_bits + 7) // 8
+    return false unless sig_bytes.size == k
+
+    s = bytes_to_bigint_be(sig_bytes)
+    return false if s >= n || s.negative?
+
+    # em = s^e mod n, encoded to emLen rather than the signature width.
+    em_val = s.pow_mod(e, n)
+    em = bigint_to_bytes_be(em_val, em_len)
+
+    return false if em_len < h_len + salt_len + 2
+    return false if em[em_len - 1] != 0xbc_u8
+
+    masked_db_len = em_len - h_len - 1
+    masked_db = em[0, masked_db_len]
+    h = em[masked_db_len, h_len]
+
+    db_mask = hash_algo == :sha384 ? mgf1_sha384(h, masked_db_len) : mgf1_sha256(h, masked_db_len)
+    db = Bytes.new(masked_db_len)
+    i = 0
+    while i < masked_db_len
+      db[i] = masked_db[i] ^ db_mask[i]
+      i = i + 1
+    end
+
+    # The leftmost 8*emLen-emBits bits are required to be zero before the
+    # mask is removed, then cleared from DB for the padding comparison.
+    unused_bits = 8 * em_len - em_bits
+    if unused_bits > 0
+      high_mask = 0xff_u8.unsafe_shr(unused_bits.to_u64)
+      return false if (masked_db[0] & (0xff_u8 ^ high_mask)) != 0_u8
+      db[0] = db[0] & high_mask
+    end
+
+    pad_len = masked_db_len - salt_len
+    return false if pad_len < 1
+    return false if db[pad_len - 1] != 0x01_u8
+
+    i = 0
+    while i < pad_len - 1
+      return false if db[i] != 0x00_u8
+      i = i + 1
+    end
+
+    salt = db[pad_len, salt_len]
+
+    # M' = 8 zeros || m_hash || salt
+    m_prime = Bytes.new(8 + m_hash.size + salt.size)
+    idx = 8
+    i = 0; while i < m_hash.size
+      m_prime[idx] = m_hash[i]; idx = idx + 1; i = i + 1
+    end
+    i = 0; while i < salt.size
+      m_prime[idx] = salt[i]; idx = idx + 1; i = i + 1
+    end
+
+    h_prime = hash_algo == :sha384 ? SHA384.digest(m_prime) : SHA256.digest(m_prime)
+    Std::Crypto.constant_time_compare(h, h_prime)
+  end
+
+  # RSA-PKCS1v15 verification per RFC 8017
+  def self.verify_pkcs1v15(n : BigInt, e : BigInt, hash_algo : Symbol, m_hash : Bytes, sig_bytes : Bytes) : Bool
+    s = bytes_to_bigint_be(sig_bytes)
+    return false if s >= n || s.negative?
+
+    em_val = s.pow_mod(e, n)
+    em_len = sig_bytes.size
+    em = bigint_to_bytes_be(em_val, em_len)
+
+    # Expected format: 00 01 FF ... FF 00 DigestInfo
+    return false if em[0] != 0x00_u8 || em[1] != 0x01_u8
+
+    # DigestInfo prefix
+    prefix_sha256 = [
+      0x30_u8, 0x31_u8, 0x30_u8, 0x0d_u8, 0x06_u8, 0x09_u8, 0x60_u8, 0x86_u8,
+      0x48_u8, 0x01_u8, 0x65_u8, 0x03_u8, 0x04_u8, 0x02_u8, 0x01_u8, 0x05_u8,
+      0x00_u8, 0x04_u8, 0x20_u8,
+    ]
+    prefix_sha384 = [
+      0x30_u8, 0x41_u8, 0x30_u8, 0x0d_u8, 0x06_u8, 0x09_u8, 0x60_u8, 0x86_u8,
+      0x48_u8, 0x01_u8, 0x65_u8, 0x03_u8, 0x04_u8, 0x02_u8, 0x02_u8, 0x05_u8,
+      0x00_u8, 0x04_u8, 0x30_u8,
+    ]
+    prefix = hash_algo == :sha384 ? prefix_sha384 : prefix_sha256
+    di_len = prefix.size + m_hash.size
+    return false if em_len < 3 + 8 + di_len
+
+    expected_di = Bytes.new(di_len)
+    i = 0; while i < prefix.size
+      expected_di[i] = prefix[i]; i = i + 1
+    end
+    i = 0; while i < m_hash.size
+      expected_di[prefix.size + i] = m_hash[i]; i = i + 1
+    end
+
+    di_offset = em_len - di_len
+    return false if em[di_offset - 1] != 0x00_u8
+
+    i = 2
+    while i < di_offset - 1
+      return false if em[i] != 0xff_u8
+      i = i + 1
+    end
+
+    actual_di = em[di_offset, di_len]
+    Std::Crypto.constant_time_compare(actual_di, expected_di)
+  end
+end
+
+# -----------------------------------------------------------------------------
+# X.509 Certificate and Trust Store
+# -----------------------------------------------------------------------------
+
+pub class Certificate
+  getter raw : Bytes
+  getter tbs_raw : Bytes
+  getter serial_number : BigInt
+  getter issuer_raw : Bytes
+  getter subject_raw : Bytes
+  getter not_before : Int64
+  getter not_after : Int64
+  getter pubkey_algo : Symbol # :rsa, :ec, :ed25519
+  getter pubkey_bytes : Bytes
+  getter rsa_n : BigInt
+  getter rsa_e : BigInt
+  getter ec_x : BigInt
+  getter ec_y : BigInt
+  getter ec_curve : Symbol?
+  getter ed25519_pub : Bytes?
+  getter san_dns_names : Array(String)
+  getter common_name : String?
+  getter is_ca : Bool
+  getter path_len : Int32
+  getter has_key_usage : Bool
+  getter key_usage_cert_sign : Bool
+  getter sig_algo : Symbol
+  getter sig_bytes : Bytes
+
+  def initialize(
+    @raw : Bytes,
+    @tbs_raw : Bytes,
+    @serial_number : BigInt,
+    @issuer_raw : Bytes,
+    @subject_raw : Bytes,
+    @not_before : Int64,
+    @not_after : Int64,
+    @pubkey_algo : Symbol,
+    @pubkey_bytes : Bytes,
+    @rsa_n : BigInt,
+    @rsa_e : BigInt,
+    @ec_x : BigInt,
+    @ec_y : BigInt,
+    @ec_curve : Symbol?,
+    @ed25519_pub : Bytes?,
+    @san_dns_names : Array(String),
+    @common_name : String?,
+    @is_ca : Bool,
+    @path_len : Int32,
+    @has_key_usage : Bool,
+    @key_usage_cert_sign : Bool,
+    @sig_algo : Symbol,
+    @sig_bytes : Bytes,
+  )
+  end
+
+  def self.parse(der : Bytes) : Certificate?
+    elem = Std::Tls.read_asn1(der, 0)
+    return nil if elem.nil? || elem.tag != 0x30_u8
+
+    children = Std::Tls.parse_asn1_children(elem)
+    return nil if children.size < 3
+
+    tbs = children[0]
+    sig_algo_elem = children[1]
+    sig_val_elem = children[2]
+
+    tbs_children = Std::Tls.parse_asn1_children(tbs)
+    return nil if tbs_children.size < 6
+
+    # Version might be present at index 0 (tag 0xa0)
+    c_idx = 0
+    if tbs_children[0].tag == 0xa0_u8
+      c_idx = 1
+    end
+
+    serial = Std::Tls.parse_integer(tbs_children[c_idx])
+    sig_algo_elem = tbs_children[c_idx + 1]
+    issuer_elem = tbs_children[c_idx + 2]
+    validity_elem = tbs_children[c_idx + 3]
+    subject_elem = tbs_children[c_idx + 4]
+    spki_elem = tbs_children[c_idx + 5]
+    c_idx = c_idx + 5
+
+    # Validity
+    v_children = Std::Tls.parse_asn1_children(validity_elem)
+    not_before = v_children.size >= 2 ? Std::Tls.parse_time_bytes(v_children[0].value) : 0_i64
+    not_after = v_children.size >= 2 ? Std::Tls.parse_time_bytes(v_children[1].value) : 0_i64
+
+    # Extract CommonName from subject if present
+    common_name = nil.as(String?)
+    subj_rdns = Std::Tls.parse_asn1_children(subject_elem)
+    i = 0
+    while i < subj_rdns.size
+      atvs = Std::Tls.parse_asn1_children(subj_rdns[i])
+      j = 0
+      while j < atvs.size
+        atv_children = Std::Tls.parse_asn1_children(atvs[j])
+        if atv_children.size >= 2
+          oid = Std::Tls.parse_oid(atv_children[0])
+          if oid == "2.5.4.3" # commonName
+            val_bytes = atv_children[1].value
+            common_name = String.new(val_bytes.size) { |buf| buf.copy_from(val_bytes.to_unsafe, val_bytes.size) }
+          end
+        end
+        j = j + 1
+      end
+      i = i + 1
+    end
+
+    # SubjectPublicKeyInfo
+    spki_children = Std::Tls.parse_asn1_children(spki_elem)
+    return nil if spki_children.size < 2
+    spki_algo_elem = spki_children[0]
+    spki_bits = spki_children[1]
+
+    algo_children = Std::Tls.parse_asn1_children(spki_algo_elem)
+    return nil if algo_children.empty?
+    pubkey_oid = Std::Tls.parse_oid(algo_children[0])
+
+    pub_bits_val = spki_bits.value
+    # Skip leading unused-bits byte
+    pub_raw = pub_bits_val.size > 1 ? pub_bits_val[1, pub_bits_val.size - 1] : Bytes.empty
+
+    pubkey_algo = :unknown
+    rsa_n = BigInt.zero
+    rsa_e = BigInt.zero
+    ec_x = BigInt.zero
+    ec_y = BigInt.zero
+    ec_curve = nil.as(Symbol?)
+    ed_pub = nil.as(Bytes?)
+
+    if pubkey_oid == "1.2.840.113549.1.1.1" # rsaEncryption
+      pubkey_algo = :rsa
+      rsa_seq = Std::Tls.read_asn1(pub_raw, 0)
+      if rsa_seq
+        rsa_parts = Std::Tls.parse_asn1_children(rsa_seq)
+        if rsa_parts.size >= 2
+          rsa_n = Std::Tls.parse_integer(rsa_parts[0])
+          rsa_e = Std::Tls.parse_integer(rsa_parts[1])
+        end
+      end
+    elsif pubkey_oid == "1.2.840.10045.2.1" # id-ecPublicKey
+      pubkey_algo = :ec
+      curve_oid = algo_children.size >= 2 ? Std::Tls.parse_oid(algo_children[1]) : ""
+      if curve_oid == "1.2.840.10045.3.1.7" # secp256r1
+        ec_curve = :p256
+        if pub_raw.size == 65 && pub_raw[0] == 0x04_u8
+          ec_x = RSA.bytes_to_bigint_be(pub_raw[1, 32])
+          ec_y = RSA.bytes_to_bigint_be(pub_raw[33, 32])
+        end
+      elsif curve_oid == "1.3.132.0.34" # secp384r1
+        ec_curve = :p384
+        if pub_raw.size == 97 && pub_raw[0] == 0x04_u8
+          ec_x = RSA.bytes_to_bigint_be(pub_raw[1, 48])
+          ec_y = RSA.bytes_to_bigint_be(pub_raw[49, 48])
+        end
+      end
+    elsif pubkey_oid == "1.3.101.112" # Ed25519
+      pubkey_algo = :ed25519
+      ed_pub = pub_raw
+    end
+
+    # Extensions (SAN, BasicConstraints, KeyUsage)
+    san_names = Array(String).new
+    is_ca = false
+    path_len = -1
+    has_key_usage = false
+    key_usage_cert_sign = false
+
+    k = c_idx + 1
+    while k < tbs_children.size
+      if tbs_children[k].tag == 0xa3_u8 # [3] Extensions
+        ext_seq = Std::Tls.parse_asn1_children(tbs_children[k])
+        ext_list = ext_seq.empty? ? Array(ASN1Element).new : Std::Tls.parse_asn1_children(ext_seq[0])
+        e_i = 0
+        while e_i < ext_list.size
+          ext_item = Std::Tls.parse_asn1_children(ext_list[e_i])
+          if ext_item.size >= 2
+            ext_oid = Std::Tls.parse_oid(ext_item[0])
+            val_idx = ext_item.size == 3 ? 2 : 1
+            if ext_oid == "2.5.29.17" # subjectAltName
+              san_octets = ext_item[val_idx].value
+              san_seq = Std::Tls.read_asn1(san_octets, 0)
+              if san_seq
+                general_names = Std::Tls.parse_asn1_children(san_seq)
+                g_idx = 0
+                while g_idx < general_names.size
+                  gn = general_names[g_idx]
+                  if gn.tag == 0x82_u8 # dNSName [2]
+                    name_bytes = gn.value
+                    name_str = String.new(name_bytes.size) { |b| b.copy_from(name_bytes.to_unsafe, name_bytes.size) }
+                    san_names << name_str
+                  end
+                  g_idx = g_idx + 1
+                end
+              end
+            elsif ext_oid == "2.5.29.19" # basicConstraints (RFC 5280 §4.2.1.9)
+              bc_octets = ext_item[val_idx].value
+              bc_elem = Std::Tls.read_asn1(bc_octets, 0)
+              if bc_elem
+                bc_children = Std::Tls.parse_asn1_children(bc_elem)
+                bc_i = 0
+                while bc_i < bc_children.size
+                  bc_c = bc_children[bc_i]
+                  if bc_c.tag == 0x01_u8 # BOOLEAN
+                    is_ca = !bc_c.value.empty? && bc_c.value[0] != 0_u8
+                  elsif bc_c.tag == 0x02_u8 # INTEGER (pathLenConstraint)
+                    path_len = Std::Tls.parse_integer(bc_c).to_i64.to_i32
+                  end
+                  bc_i = bc_i + 1
+                end
+              end
+            elsif ext_oid == "2.5.29.15" # keyUsage (RFC 5280 §4.2.1.3)
+              ku_octets = ext_item[val_idx].value
+              ku_elem = Std::Tls.read_asn1(ku_octets, 0)
+              if ku_elem && ku_elem.tag == 0x03_u8 # BIT STRING
+                has_key_usage = true
+                if ku_elem.value.size >= 2
+                  first_byte = ku_elem.value[1]
+                  # bit 5: keyCertSign (0x04 in bitmask 0x04_u8)
+                  key_usage_cert_sign = (first_byte & 0x04_u8) != 0_u8
+                end
+              end
+            end
+          end
+          e_i = e_i + 1
+        end
+      end
+      k = k + 1
+    end
+
+    # Signature algorithm and signature value
+    sig_oid_elem = Std::Tls.parse_asn1_children(sig_algo_elem)
+    sig_oid = sig_oid_elem.empty? ? "" : Std::Tls.parse_oid(sig_oid_elem[0])
+
+    sig_algo = case sig_oid
+               when "1.2.840.113549.1.1.11" then :sha256_rsa # sha256WithRSAEncryption
+               when "1.2.840.113549.1.1.12" then :sha384_rsa
+               when "1.2.840.10045.4.3.2"   then :sha256_ecdsa # ecdsa-with-SHA256
+               when "1.2.840.10045.4.3.3"   then :sha384_ecdsa # ecdsa-with-SHA384
+               when "1.3.101.112"           then :ed25519
+               else                              :unknown
+               end
+
+    sig_val_bytes = sig_val_elem.value
+    sig_bytes = sig_val_bytes.size > 1 ? sig_val_bytes[1, sig_val_bytes.size - 1] : Bytes.empty
+
+    Certificate.new(
+      der,
+      tbs.entire_element,
+      serial,
+      issuer_elem.entire_element,
+      subject_elem.entire_element,
+      not_before,
+      not_after,
+      pubkey_algo,
+      pub_raw,
+      rsa_n,
+      rsa_e,
+      ec_x,
+      ec_y,
+      ec_curve,
+      ed_pub,
+      san_names,
+      common_name,
+      is_ca,
+      path_len,
+      has_key_usage,
+      key_usage_cert_sign,
+      sig_algo,
+      sig_bytes
+    )
+  end
+
+  def valid_at?(time_sec : Int64) : Bool
+    @not_before <= time_sec && time_sec <= @not_after
+  end
+
+  # Hostname verification per RFC 6125 with wildcard rules
+  def matches_hostname(hostname : String) : Bool
+    target = hostname.downcase
+
+    # If SAN is present, RFC 6125 specifies checking SAN only
+    if !@san_dns_names.empty?
+      i = 0
+      while i < @san_dns_names.size
+        pattern = @san_dns_names[i].downcase
+        return true if Certificate.matches_pattern(pattern, target)
+        i = i + 1
+      end
+      return false
+    end
+
+    # Fallback to CommonName if no SAN
+    if cn = @common_name
+      return Certificate.matches_pattern(cn.downcase, target)
+    end
+
+    false
+  end
+
+  def self.matches_pattern(pattern : String, target : String) : Bool
+    return true if pattern == target
+
+    # Wildcard match: *.domain.com
+    if pattern.bytesize > 2 && pattern[0] == '*' && pattern[1] == '.'
+      suffix = pattern[2, pattern.bytesize - 2]
+      # RFC 6125 §6.4.3: Wildcard MUST NOT match against a top-level domain
+      has_dot = false
+      s_i = 0
+      while s_i < suffix.bytesize
+        if suffix[s_i] == '.'
+          has_dot = true
+          break
+        end
+        s_i = s_i + 1
+      end
+      return false unless has_dot
+
+      # target must end with .suffix
+      if target.bytesize > suffix.bytesize + 1
+        sub_len = target.bytesize - suffix.bytesize - 1
+        target_suffix = target[sub_len + 1, suffix.bytesize]
+        if target_suffix == suffix && target[sub_len] == '.'
+          # Wildcard matches exactly one subdomain component (no dots in prefix)
+          prefix = target[0, sub_len]
+          p_dot = false
+          p_i = 0
+          while p_i < prefix.bytesize
+            if prefix[p_i] == '.'
+              p_dot = true
+              break
+            end
+            p_i = p_i + 1
+          end
+          return true unless p_dot
+        end
+      end
+    end
+
+    false
+  end
+
+  # Verify this certificate was signed by issuer_cert
+  def verify_signature(issuer_cert : Certificate) : Bool
+    case @sig_algo
+    when :sha256_rsa
+      n = issuer_cert.rsa_n
+      e = issuer_cert.rsa_e
+      return false if n.zero? || e.zero?
+      th = SHA256.digest(@tbs_raw)
+      RSA.verify_pkcs1v15(n, e, :sha256, th, @sig_bytes)
+    when :sha384_rsa
+      n = issuer_cert.rsa_n
+      e = issuer_cert.rsa_e
+      return false if n.zero? || e.zero?
+      th = SHA384.digest(@tbs_raw)
+      RSA.verify_pkcs1v15(n, e, :sha384, th, @sig_bytes)
+    when :sha256_ecdsa
+      qx = issuer_cert.ec_x
+      qy = issuer_cert.ec_y
+      return false if qx.zero? || qy.zero?
+      th = SHA256.digest(@tbs_raw)
+      sig_elem = Std::Tls.read_asn1(@sig_bytes, 0)
+      return false if sig_elem.nil?
+      sig_parts = Std::Tls.parse_asn1_children(sig_elem)
+      return false if sig_parts.size < 2
+      r = Std::Tls.parse_integer(sig_parts[0])
+      s = Std::Tls.parse_integer(sig_parts[1])
+      if issuer_cert.ec_curve == :p384
+        P384.verify(qx, qy, th, r, s)
+      else
+        P256.verify(qx, qy, th, r, s)
+      end
+    when :sha384_ecdsa
+      qx = issuer_cert.ec_x
+      qy = issuer_cert.ec_y
+      return false if qx.zero? || qy.zero?
+      th = SHA384.digest(@tbs_raw)
+      sig_elem = Std::Tls.read_asn1(@sig_bytes, 0)
+      return false if sig_elem.nil?
+      sig_parts = Std::Tls.parse_asn1_children(sig_elem)
+      return false if sig_parts.size < 2
+      r = Std::Tls.parse_integer(sig_parts[0])
+      s = Std::Tls.parse_integer(sig_parts[1])
+      if issuer_cert.ec_curve == :p384
+        P384.verify(qx, qy, th, r, s)
+      else
+        P256.verify(qx, qy, th, r, s)
+      end
+    when :ed25519
+      ed_pub = issuer_cert.ed25519_pub
+      return false if ed_pub.nil?
+      Ed25519.verify(ed_pub, @tbs_raw, @sig_bytes)
+    else
+      false
+    end
+  end
+end
+
+pub class CertificateStore
+  getter certificates : Array(Certificate)
+
+  def initialize
+    @certificates = Array(Certificate).new
+  end
+
+  def add_certificate(cert : Certificate) : Nil
+    @certificates << cert
+  end
+
+  def add_pem(pem_text : String) : Int32
+    added = 0
+    start_tag = "-----BEGIN CERTIFICATE-----"
+    end_tag = "-----END CERTIFICATE-----"
+
+    curr_idx = 0
+    while curr_idx < pem_text.bytesize
+      s_pos = -1
+      i = curr_idx
+      while i + start_tag.bytesize <= pem_text.bytesize
+        if pem_text[i, start_tag.bytesize] == start_tag
+          s_pos = i
+          break
+        end
+        i = i + 1
+      end
+      break if s_pos < 0
+
+      e_pos = -1
+      i = s_pos + start_tag.bytesize
+      while i + end_tag.bytesize <= pem_text.bytesize
+        if pem_text[i, end_tag.bytesize] == end_tag
+          e_pos = i
+          break
+        end
+        i = i + 1
+      end
+      break if e_pos < 0
+
+      b64_content = pem_text[s_pos + start_tag.bytesize, e_pos - (s_pos + start_tag.bytesize)]
+      der = Std::Tls.base64_decode(b64_content)
+      cert = Certificate.parse(der)
+      if cert
+        @certificates << cert
+        added = added + 1
+      end
+
+      curr_idx = e_pos + end_tag.bytesize
+    end
+    added
+  end
+
+  def self.load_system_store : CertificateStore
+    store = new
+    paths = [
+      "/etc/ssl/cert.pem",
+      "/etc/ssl/certs/ca-certificates.crt",
+      "/etc/pki/tls/certs/ca-bundle.crt",
+      "/etc/ssl/ca-bundle.pem",
+    ]
+    i = 0
+    while i < paths.size
+      path = paths[i]
+      if File.exists?(path)
+        content = File.read(path)
+        store.add_pem(content)
+        break if store.certificates.size > 0
+      end
+      i = i + 1
+    end
+    store
+  end
+
+  def verify_chain(chain : Array(Certificate), hostname : String, time_sec : Int64) : Bool
+    return false if chain.empty?
+
+    # 1. Leaf certificate must match hostname
+    leaf = chain[0]
+    return false unless leaf.matches_hostname(hostname)
+
+    # 2. Search from the peer's highest certificate toward the leaf. A server
+    # may append certificates above a path this store can already anchor; only
+    # the candidate path through `chain[k]` participates in that decision.
+    k = chain.size - 1
+    while k >= 0
+      curr = chain[k]
+      if valid_chain_prefix?(chain, k, time_sec)
+        t = 0
+        while t < @certificates.size
+          anchor = @certificates[t]
+          if anchor.subject_raw == curr.issuer_raw
+            if anchor.is_ca
+              if anchor.path_len < 0 || k <= anchor.path_len
+                if curr.verify_signature(anchor)
+                  return true
+                end
+              end
+            end
+          elsif anchor.subject_raw == curr.subject_raw && (anchor.raw == curr.raw || anchor.pubkey_bytes == curr.pubkey_bytes)
+            if anchor.is_ca
+              certs_below = k > 0 ? k - 1 : 0
+              if anchor.path_len < 0 || certs_below <= anchor.path_len
+                return true
+              end
+            end
+          end
+          t = t + 1
+        end
+      end
+      k = k - 1
+    end
+
+    false
+  end
+
+  private def valid_chain_prefix?(chain : Array(Certificate), top : Int32, time_sec : Int64) : Bool
+    i = 0
+    while i <= top
+      cert = chain[i]
+      return false unless cert.valid_at?(time_sec)
+      if i > 0
+        return false unless cert.is_ca
+        if cert.has_key_usage
+          return false unless cert.key_usage_cert_sign
+        end
+        if cert.path_len >= 0
+          certs_below = i - 1
+          return false if certs_below > cert.path_len
+        end
+      end
+      i = i + 1
+    end
+
+    i = 0
+    while i < top
+      return false unless chain[i].verify_signature(chain[i + 1])
+      i = i + 1
+    end
+    true
+  end
+end
+
+# -----------------------------------------------------------------------------
+# TLS 1.3 Key Schedule and Record Layer
+# -----------------------------------------------------------------------------
+
+pub def self.hkdf_expand_label(secret : Bytes, label : String, context : Bytes, length : Int32) : Bytes
+  prefix = "tls13 "
+  full_label = "#{prefix}#{label}"
+  label_bytes = Bytes.new(full_label.to_unsafe, full_label.bytesize)
+
+  info_len = 2 + 1 + label_bytes.size + 1 + context.size
+  info = Bytes.new(info_len)
+  info[0] = ((length >> 8) & 0xff).to_u8
+  info[1] = (length & 0xff).to_u8
+  info[2] = label_bytes.size.to_u8
+  idx = 3
+  i = 0
+  while i < label_bytes.size
+    info[idx] = label_bytes[i]
+    idx = idx + 1
+    i = i + 1
+  end
+  info[idx] = context.size.to_u8
+  idx = idx + 1
+  i = 0
+  while i < context.size
+    info[idx] = context[i]
+    idx = idx + 1
+    i = i + 1
+  end
+
+  HKDF.expand(:sha256, secret, info, length)
+end
+
+pub def self.derive_secret(secret : Bytes, label : String, messages_hash : Bytes) : Bytes
+  hkdf_expand_label(secret, label, messages_hash, 32)
+end
+
+pub def self.make_nonce(iv : Bytes, seq : UInt64) : Bytes
+  nonce = Bytes.new(12)
+  i = 0; while i < 12
+    nonce[i] = iv[i]; i = i + 1
+  end
+  s = seq
+  i = 11
+  while i >= 4
+    nonce[i] = nonce[i] ^ (s & 0xff_u64).to_u8
+    s = s.unsafe_shr(8_u64)
+    i = i - 1
+  end
+  nonce
+end
+
+pub class RecordCipher
+  @cipher_suite : Symbol
+  @key : Bytes
+  @iv : Bytes
+  @seq : UInt64
+
+  def initialize(@cipher_suite : Symbol, @key : Bytes, @iv : Bytes, @seq : UInt64 = 0_u64)
+  end
+
+  def encrypt(content_type : UInt8, payload : Bytes) : Bytes
+    pt = Bytes.new(payload.size + 1)
+    i = 0; while i < payload.size
+      pt[i] = payload[i]; i = i + 1
+    end
+    pt[payload.size] = content_type
+
+    raise "TLS record sequence number exhausted (cannot wrap)" if @seq == 0xffffffffffffffff_u64
+    nonce = Std::Tls.make_nonce(@iv, @seq)
+    @seq = @seq &+ 1_u64
+    rec_len = pt.size + 16
+    ad = Bytes.new(5)
+    ad[0] = 0x17_u8
+    ad[1] = 0x03_u8
+    ad[2] = 0x03_u8
+    ad[3] = ((rec_len >> 8) & 0xff).to_u8
+    ad[4] = (rec_len & 0xff).to_u8
+
+    ct, tag = case @cipher_suite
+              when :aes_128_gcm       then AES128GCM.encrypt_detached(@key, nonce, pt, ad)
+              when :chacha20_poly1305 then ChaCha20Poly1305.encrypt_detached(@key, nonce, pt, ad)
+              else                         raise "unsupported cipher suite #{@cipher_suite}"
+              end
+
+    out = Bytes.new(5 + ct.size + 16)
+    i = 0; while i < 5
+      out[i] = ad[i]; i = i + 1
+    end
+    i = 0; while i < ct.size
+      out[5 + i] = ct[i]; i = i + 1
+    end
+    i = 0; while i < 16
+      out[5 + ct.size + i] = tag[i]; i = i + 1
+    end
+    out
+  end
+
+  def decrypt(record : Bytes) : {UInt8, Bytes}?
+    return nil if record.size < 5 + 16
+    ct_len = record.size - 5 - 16
+    ad = record[0, 5]
+    ct = record[5, ct_len]
+    tag = record[5 + ct_len, 16]
+
+    raise "TLS record sequence number exhausted (cannot wrap)" if @seq == 0xffffffffffffffff_u64
+    nonce = Std::Tls.make_nonce(@iv, @seq)
+    @seq = @seq &+ 1_u64
+    pt = case @cipher_suite
+         when :aes_128_gcm       then AES128GCM.decrypt_detached(@key, nonce, ct, tag, ad)
+         when :chacha20_poly1305 then ChaCha20Poly1305.decrypt_detached(@key, nonce, ct, tag, ad)
+         else                         raise "unsupported cipher suite #{@cipher_suite}"
+         end
+    return nil if pt.nil?
+
+    # Strip padding zeros and retrieve inner content type
+    idx = pt.size - 1
+    while idx >= 0 && pt[idx] == 0_u8
+      idx = idx - 1
+    end
+    return nil if idx < 0
+
+    inner_type = pt[idx]
+    inner_payload = pt[0, idx]
+    {inner_type, inner_payload}
+  end
+end
+
+# -----------------------------------------------------------------------------
+# TLS 1.3 Client
+# -----------------------------------------------------------------------------
+
+pub class Client
+  getter socket : IyiSocket
+  getter hostname : String
+  getter cipher_suite : Symbol
+  getter alpn_selected : String?
+  getter peer_certificate : Certificate?
+  getter certificate_chain : Array(Certificate)
+
+  @write_cipher : RecordCipher
+  @read_cipher : RecordCipher
+  @closed : Bool
+
+  def initialize(
+    @socket : IyiSocket,
+    @hostname : String,
+    @cipher_suite : Symbol,
+    @alpn_selected : String?,
+    @peer_certificate : Certificate?,
+    @certificate_chain : Array(Certificate),
+    @write_cipher : RecordCipher,
+    @read_cipher : RecordCipher,
+  )
+    @closed = false
+  end
+
+  def self.connect(
+    host : String,
+    port : Int32 = 443,
+    alpn : Array(String) = [] of String,
+    verify_peer : Bool = true,
+    ca_store : CertificateStore? = nil,
+    current_time : Int64? = nil,
+  ) : Client
+    ips = Std::Dns.resolve_a(host)
+    raise "could not resolve hostname #{host}" if ips.empty?
+    sock = IyiSocket.connect(ips[0], port)
+    wrap_socket(sock, host, alpn, verify_peer, ca_store, current_time)
+  end
+
+  def self.wrap_socket(
+    socket : IyiSocket,
+    hostname : String,
+    alpn : Array(String) = [] of String,
+    verify_peer : Bool = true,
+    ca_store : CertificateStore? = nil,
+    current_time : Int64? = nil,
+    client_private_key : Bytes? = nil,
+    client_random_override : Bytes? = nil,
+    session_id_override : Bytes? = nil,
+    client_hello_override : Bytes? = nil,
+  ) : Client
+    client_priv = client_private_key || Std::Crypto.random_bytes(32)
+    base_u = Bytes.new(32, 0_u8); base_u[0] = 9_u8
+    client_pub = X25519.scalar_mult(client_priv, base_u)
+    client_random = client_random_override || Std::Crypto.random_bytes(32)
+    session_id = session_id_override || Std::Crypto.random_bytes(32)
+    # 1. Extensions
+    # SNI
+    sni_len = hostname.bytesize
+    ext_sni_len = 2 + 1 + 2 + sni_len
+    ext_sni = Bytes.new(4 + 2 + 1 + 2 + sni_len)
+    ext_sni[0] = 0x00_u8; ext_sni[1] = 0x00_u8
+    ext_sni[2] = ((ext_sni_len >> 8) & 0xff).to_u8; ext_sni[3] = (ext_sni_len & 0xff).to_u8
+    ext_sni[4] = (((ext_sni_len - 2) >> 8) & 0xff).to_u8; ext_sni[5] = ((ext_sni_len - 2) & 0xff).to_u8
+    ext_sni[6] = 0x00_u8
+    ext_sni[7] = ((sni_len >> 8) & 0xff).to_u8; ext_sni[8] = (sni_len & 0xff).to_u8
+    i = 0; while i < sni_len
+      ext_sni[9 + i] = hostname[i].ord.to_u8; i = i + 1
+    end
+
+    # supported_groups (x25519 0x001d)
+    ext_groups = Bytes.new(8)
+    ext_groups[0] = 0x00_u8; ext_groups[1] = 0x0a_u8
+    ext_groups[2] = 0x00_u8; ext_groups[3] = 0x04_u8
+    ext_groups[4] = 0x00_u8; ext_groups[5] = 0x02_u8
+    ext_groups[6] = 0x00_u8; ext_groups[7] = 0x1d_u8
+
+    # signature_algorithms
+    # signature_algorithms (RFC 8446 §4.2.3: rsa_pkcs1 algorithms are invalid in TLS 1.3)
+    ext_sig_algos = Bytes.new(16)
+    ext_sig_algos[0] = 0x00_u8; ext_sig_algos[1] = 0x0d_u8
+    ext_sig_algos[2] = 0x00_u8; ext_sig_algos[3] = 0x0c_u8
+    ext_sig_algos[4] = 0x00_u8; ext_sig_algos[5] = 0x0a_u8
+    ext_sig_algos[6] = 0x04_u8; ext_sig_algos[7] = 0x03_u8   # ecdsa_secp256r1_sha256
+    ext_sig_algos[8] = 0x05_u8; ext_sig_algos[9] = 0x03_u8   # ecdsa_secp384r1_sha384
+    ext_sig_algos[10] = 0x08_u8; ext_sig_algos[11] = 0x04_u8 # rsa_pss_rsae_sha256
+    ext_sig_algos[12] = 0x08_u8; ext_sig_algos[13] = 0x05_u8 # rsa_pss_rsae_sha384
+    ext_sig_algos[14] = 0x08_u8; ext_sig_algos[15] = 0x07_u8 # ed25519
+
+    # supported_versions (TLS 1.3 = 0x0304)
+    ext_versions = Bytes.new(7)
+    ext_versions[0] = 0x00_u8; ext_versions[1] = 0x2b_u8
+    ext_versions[2] = 0x00_u8; ext_versions[3] = 0x03_u8
+    ext_versions[4] = 0x02_u8
+    ext_versions[5] = 0x03_u8; ext_versions[6] = 0x04_u8
+
+    # key_share (x25519)
+    ext_key_share = Bytes.new(42)
+    ext_key_share[0] = 0x00_u8; ext_key_share[1] = 0x33_u8
+    ext_key_share[2] = 0x00_u8; ext_key_share[3] = 38_u8
+    ext_key_share[4] = 0x00_u8; ext_key_share[5] = 36_u8
+    ext_key_share[6] = 0x00_u8; ext_key_share[7] = 0x1d_u8
+    ext_key_share[8] = 0x00_u8; ext_key_share[9] = 0x20_u8
+    i = 0; while i < 32
+      ext_key_share[10 + i] = client_pub[i]; i = i + 1
+    end
+
+    # ALPN (optional)
+    ext_alpn = Bytes.empty
+    if !alpn.empty?
+      alpn_str_len = 0
+      i = 0; while i < alpn.size
+        alpn_str_len = alpn_str_len + 1 + alpn[i].bytesize; i = i + 1
+      end
+      ext_alpn = Bytes.new(4 + 2 + alpn_str_len)
+      ext_alpn[0] = 0x00_u8; ext_alpn[1] = 0x10_u8 # alpn
+      ext_alpn[2] = (((alpn_str_len + 2) >> 8) & 0xff).to_u8
+      ext_alpn[3] = ((alpn_str_len + 2) & 0xff).to_u8
+      ext_alpn[4] = ((alpn_str_len >> 8) & 0xff).to_u8
+      ext_alpn[5] = (alpn_str_len & 0xff).to_u8
+      a_idx = 6
+      i = 0
+      while i < alpn.size
+        s = alpn[i]
+        ext_alpn[a_idx] = s.bytesize.to_u8
+        a_idx = a_idx + 1
+        j = 0
+        while j < s.bytesize
+          ext_alpn[a_idx] = s[j].ord.to_u8
+          a_idx = a_idx + 1
+          j = j + 1
+        end
+        i = i + 1
+      end
+    end
+
+    all_exts_len = ext_sni.size + ext_groups.size + ext_sig_algos.size + ext_versions.size + ext_key_share.size + ext_alpn.size
+    all_exts = Bytes.new(all_exts_len)
+    e_idx = 0
+    i = 0; while i < ext_sni.size
+      all_exts[e_idx] = ext_sni[i]; e_idx = e_idx + 1; i = i + 1
+    end
+    i = 0; while i < ext_groups.size
+      all_exts[e_idx] = ext_groups[i]; e_idx = e_idx + 1; i = i + 1
+    end
+    i = 0; while i < ext_sig_algos.size
+      all_exts[e_idx] = ext_sig_algos[i]; e_idx = e_idx + 1; i = i + 1
+    end
+    i = 0; while i < ext_versions.size
+      all_exts[e_idx] = ext_versions[i]; e_idx = e_idx + 1; i = i + 1
+    end
+    i = 0; while i < ext_key_share.size
+      all_exts[e_idx] = ext_key_share[i]; e_idx = e_idx + 1; i = i + 1
+    end
+    i = 0; while i < ext_alpn.size
+      all_exts[e_idx] = ext_alpn[i]; e_idx = e_idx + 1; i = i + 1
+    end
+
+    ch_body_len = 2 + 32 + 33 + 6 + 2 + 2 + all_exts_len
+    ch_msg = Bytes.new(4 + ch_body_len)
+    ch_msg[0] = 0x01_u8 # ClientHello
+    ch_msg[1] = ((ch_body_len >> 16) & 0xff).to_u8
+    ch_msg[2] = ((ch_body_len >> 8) & 0xff).to_u8
+    ch_msg[3] = (ch_body_len & 0xff).to_u8
+
+    idx = 4
+    ch_msg[idx] = 0x03_u8; ch_msg[idx + 1] = 0x03_u8; idx = idx + 2
+    i = 0; while i < 32
+      ch_msg[idx] = client_random[i]; idx = idx + 1; i = i + 1
+    end
+    ch_msg[idx] = 32_u8; idx = idx + 1
+    i = 0; while i < 32
+      ch_msg[idx] = session_id[i]; idx = idx + 1; i = i + 1
+    end
+
+    # Cipher suites: 0x1301 (AES-128-GCM), 0x1303 (ChaCha20-Poly1305)
+    ch_msg[idx] = 0x00_u8; ch_msg[idx + 1] = 0x04_u8; idx = idx + 2
+    ch_msg[idx] = 0x13_u8; ch_msg[idx + 1] = 0x01_u8; idx = idx + 2
+    ch_msg[idx] = 0x13_u8; ch_msg[idx + 1] = 0x03_u8; idx = idx + 2
+
+    # Compression (0x00)
+    ch_msg[idx] = 0x01_u8; ch_msg[idx + 1] = 0x00_u8; idx = idx + 2
+
+    # Extensions
+    ch_msg[idx] = ((all_exts_len >> 8) & 0xff).to_u8
+    ch_msg[idx + 1] = (all_exts_len & 0xff).to_u8
+    idx = idx + 2
+    i = 0; while i < all_exts_len
+      ch_msg[idx] = all_exts[i]; idx = idx + 1; i = i + 1
+    end
+
+    if ch_override = client_hello_override
+      ch_msg = ch_override
+    end
+
+    # Wrap in TLS plaintext record
+    ch_record = Bytes.new(5 + ch_msg.size)
+    ch_record[0] = 0x16_u8; ch_record[1] = 0x03_u8; ch_record[2] = 0x01_u8
+    ch_record[3] = ((ch_msg.size >> 8) & 0xff).to_u8
+    ch_record[4] = (ch_msg.size & 0xff).to_u8
+    i = 0; while i < ch_msg.size
+      ch_record[5 + i] = ch_msg[i]; i = i + 1
+    end
+
+    socket.write(ch_record.to_unsafe, ch_record.size)
+
+    # Middlebox compatibility mode (RFC 8446 Appendix D.4):
+    # Send dummy ChangeCipherSpec immediately after first ClientHello
+    ccs = Bytes.new(6)
+    ccs[0] = 0x14_u8; ccs[1] = 0x03_u8; ccs[2] = 0x03_u8; ccs[3] = 0x00_u8; ccs[4] = 0x01_u8; ccs[5] = 0x01_u8
+    socket.write(ccs.to_unsafe, ccs.size)
+
+    handshake_transcript = Array(Bytes).new
+    handshake_transcript << ch_msg
+
+    # Read ServerHello
+    sh_header = read_exact_bytes(socket, 5)
+    raise "expected Handshake record for ServerHello, got 0x#{sh_header[0].to_s(16)}" if sh_header[0] != 0x16_u8
+    sh_len = (sh_header[3].to_i32 << 8) | sh_header[4].to_i32
+    sh_payload = read_exact_bytes(socket, sh_len)
+    raise "expected ServerHello message, got 0x#{sh_payload[0].to_s(16)}" if sh_payload[0] != 0x02_u8
+
+    sh_msg_len = (sh_payload[1].to_i32 << 16) | (sh_payload[2].to_i32 << 8) | sh_payload[3].to_i32
+    sh_msg = sh_payload[0, 4 + sh_msg_len]
+    handshake_transcript << sh_msg
+
+    # Parse cipher suite and server key share from ServerHello
+    p_idx = 4 + 2 + 32
+    sess_len = sh_msg[p_idx].to_i32
+    p_idx = p_idx + 1 + sess_len
+    cs_id = (sh_msg[p_idx].to_i32 << 8) | sh_msg[p_idx + 1].to_i32
+    p_idx = p_idx + 2 + 1
+    exts_len = (sh_msg[p_idx].to_i32 << 8) | sh_msg[p_idx + 1].to_i32
+    p_idx = p_idx + 2
+    exts_end = p_idx + exts_len
+
+    server_pub = Bytes.empty
+    has_supported_version_tls13 = false
+    key_share_group_valid = false
+
+    while p_idx < exts_end
+      ext_type = (sh_msg[p_idx].to_i32 << 8) | sh_msg[p_idx + 1].to_i32
+      ext_l = (sh_msg[p_idx + 2].to_i32 << 8) | sh_msg[p_idx + 3].to_i32
+      p_idx = p_idx + 4
+      if ext_type == 0x002b && ext_l >= 2 # supported_versions
+        sel_ver = (sh_msg[p_idx].to_i32 << 8) | sh_msg[p_idx + 1].to_i32
+        has_supported_version_tls13 = (sel_ver == 0x0304)
+      elsif ext_type == 0x0033 && ext_l >= 4 # key_share
+        group = (sh_msg[p_idx].to_i32 << 8) | sh_msg[p_idx + 1].to_i32
+        k_len = (sh_msg[p_idx + 2].to_i32 << 8) | sh_msg[p_idx + 3].to_i32
+        if group == 0x001d && k_len == 32 # x25519
+          key_share_group_valid = true
+          server_pub = sh_msg[p_idx + 4, k_len]
+        end
+      end
+      p_idx = p_idx + ext_l
+    end
+
+    raise "server did not negotiate TLS 1.3 in supported_versions" unless has_supported_version_tls13
+    raise "server did not return valid x25519 key share" unless key_share_group_valid
+
+    cipher_sym = case cs_id
+                 when 0x1301 then :aes_128_gcm
+                 when 0x1303 then :chacha20_poly1305
+                 else             raise "unsupported cipher suite 0x#{cs_id.to_s(16)}"
+                 end
+
+    shared_secret = X25519.scalar_mult(client_priv, server_pub)
+    if X25519.is_all_zero(shared_secret)
+      raise "X25519 shared secret is all-zero (invalid curve point)"
+    end
+
+    # Key schedule
+    zeros32 = Bytes.new(32, 0_u8)
+    early_secret = HKDF.extract(:sha256, zeros32, zeros32)
+    empty_hash = SHA256.digest(Bytes.empty)
+    derived_secret = Std::Tls.derive_secret(early_secret, "derived", empty_hash)
+    handshake_secret = HKDF.extract(:sha256, shared_secret, derived_secret)
+
+    h = SHA256.new
+    h_i = 0; while h_i < handshake_transcript.size
+      h.update(handshake_transcript[h_i]); h_i = h_i + 1
+    end
+    th_sh = h.final
+
+    c_hs_traffic = Std::Tls.derive_secret(handshake_secret, "c hs traffic", th_sh)
+    s_hs_traffic = Std::Tls.derive_secret(handshake_secret, "s hs traffic", th_sh)
+
+    key_len = cipher_sym == :chacha20_poly1305 ? 32 : 16
+    c_hs_key = Std::Tls.hkdf_expand_label(c_hs_traffic, "key", Bytes.empty, key_len)
+    c_hs_iv = Std::Tls.hkdf_expand_label(c_hs_traffic, "iv", Bytes.empty, 12)
+    s_hs_key = Std::Tls.hkdf_expand_label(s_hs_traffic, "key", Bytes.empty, key_len)
+    s_hs_iv = Std::Tls.hkdf_expand_label(s_hs_traffic, "iv", Bytes.empty, 12)
+
+    server_hs_cipher = RecordCipher.new(cipher_sym, s_hs_key, s_hs_iv)
+
+    # Read and decrypt server handshake records
+    handshake_buf = Bytes.empty
+    finished_received = false
+    alpn_selected = nil.as(String?)
+    cert_chain = Array(Certificate).new
+    th_cert = Bytes.empty
+    cert_verify_algo = 0
+    cert_verify_sig = Bytes.empty
+
+    while !finished_received
+      rec_hdr = read_exact_bytes(socket, 5)
+      rec_len = (rec_hdr[3].to_i32 << 8) | rec_hdr[4].to_i32
+      rec_payload = read_exact_bytes(socket, rec_len)
+
+      if rec_hdr[0] == 0x14_u8 # ChangeCipherSpec
+        next
+      end
+
+      raise "expected encrypted record 0x17, got 0x#{rec_hdr[0].to_s(16)}" if rec_hdr[0] != 0x17_u8
+
+      full_rec = Bytes.new(5 + rec_len)
+      i = 0; while i < 5
+        full_rec[i] = rec_hdr[i]; i = i + 1
+      end
+      i = 0; while i < rec_len
+        full_rec[5 + i] = rec_payload[i]; i = i + 1
+      end
+
+      dec_res = server_hs_cipher.decrypt(full_rec)
+      raise "record decryption or authentication failed" if dec_res.nil?
+
+      inner_type, inner_data = dec_res
+      raise "expected Handshake payload (0x16), got 0x#{inner_type.to_s(16)}" if inner_type != 0x16_u8
+
+      new_buf = Bytes.new(handshake_buf.size + inner_data.size)
+      i = 0; while i < handshake_buf.size
+        new_buf[i] = handshake_buf[i]; i = i + 1
+      end
+      i = 0; while i < inner_data.size
+        new_buf[handshake_buf.size + i] = inner_data[i]; i = i + 1
+      end
+      handshake_buf = new_buf
+
+      h_offset = 0
+      while h_offset + 4 <= handshake_buf.size
+        msg_type = handshake_buf[h_offset]
+        msg_len = (handshake_buf[h_offset + 1].to_i32 << 16) | (handshake_buf[h_offset + 2].to_i32 << 8) | handshake_buf[h_offset + 3].to_i32
+        break if h_offset + 4 + msg_len > handshake_buf.size
+
+        msg_data = handshake_buf[h_offset, 4 + msg_len]
+
+        if msg_type == 0x08_u8 # EncryptedExtensions
+          # Parse ALPN if returned
+          ee_len = (msg_data[4].to_i32 << 8) | msg_data[5].to_i32
+          ee_idx = 6
+          ee_end = 6 + ee_len
+          while ee_idx + 4 <= ee_end
+            e_type = (msg_data[ee_idx].to_i32 << 8) | msg_data[ee_idx + 1].to_i32
+            e_l = (msg_data[ee_idx + 2].to_i32 << 8) | msg_data[ee_idx + 3].to_i32
+            ee_idx = ee_idx + 4
+            if e_type == 0x0010 && e_l >= 3 # ALPN
+              alpn_list_l = (msg_data[ee_idx].to_i32 << 8) | msg_data[ee_idx + 1].to_i32
+              str_len = msg_data[ee_idx + 2].to_i32
+              if str_len > 0 && ee_idx + 3 + str_len <= ee_end
+                bytes_sub = msg_data[ee_idx + 3, str_len]
+                alpn_selected = String.new(str_len) { |b| b.copy_from(bytes_sub.to_unsafe, str_len) }
+              end
+            end
+            ee_idx = ee_idx + e_l
+          end
+          handshake_transcript << msg_data
+        elsif msg_type == 0x0b_u8 # Certificate
+          # Extract certificates list
+          ctx_len = msg_data[4].to_i32
+          raise "malformed Certificate message: invalid context length" if 5 + ctx_len + 3 > msg_data.size
+          c_idx = 5 + ctx_len
+          list_len = (msg_data[c_idx].to_i32 << 16) | (msg_data[c_idx + 1].to_i32 << 8) | msg_data[c_idx + 2].to_i32
+          c_idx = c_idx + 3
+          c_end = c_idx + list_len
+          raise "malformed Certificate message: certificate list length overflows message" if c_end > msg_data.size
+          while c_idx < c_end
+            if c_idx + 3 > c_end
+              raise "malformed Certificate message: truncated certificate length header"
+            end
+            cert_len = (msg_data[c_idx].to_i32 << 16) | (msg_data[c_idx + 1].to_i32 << 8) | msg_data[c_idx + 2].to_i32
+            c_idx = c_idx + 3
+            if c_idx + cert_len > c_end
+              raise "malformed Certificate message: certificate length overflows certificate list"
+            end
+            der_cert = msg_data[c_idx, cert_len]
+            parsed_cert = Certificate.parse(der_cert)
+            if parsed_cert.nil?
+              raise "failed to parse server certificate in handshake flight"
+            end
+            cert_chain << parsed_cert
+            c_idx = c_idx + cert_len
+            if c_idx + 2 > c_end
+              raise "malformed Certificate message: truncated certificate extensions header"
+            end
+            ext_l = (msg_data[c_idx].to_i32 << 8) | msg_data[c_idx + 1].to_i32
+            if c_idx + 2 + ext_l > c_end
+              raise "malformed Certificate message: certificate extensions overflow certificate list"
+            end
+            c_idx = c_idx + 2 + ext_l
+          end
+          handshake_transcript << msg_data
+
+          # Save transcript hash up to Certificate for CertificateVerify
+          h_c = SHA256.new
+          hc_i = 0; while hc_i < handshake_transcript.size
+            h_c.update(handshake_transcript[hc_i]); hc_i = hc_i + 1
+          end
+          th_cert = h_c.final
+        elsif msg_type == 0x0f_u8 # CertificateVerify
+          cert_verify_algo = (msg_data[4].to_i32 << 8) | msg_data[5].to_i32
+          sig_l = (msg_data[6].to_i32 << 8) | msg_data[7].to_i32
+          cert_verify_sig = msg_data[8, sig_l]
+          handshake_transcript << msg_data
+        elsif msg_type == 0x14_u8 # Finished
+          # Verify server finished MAC
+          h_fin = SHA256.new
+          hf_i = 0; while hf_i < handshake_transcript.size
+            h_fin.update(handshake_transcript[hf_i]); hf_i = hf_i + 1
+          end
+          th_cv = h_fin.final
+
+          s_finished_key = Std::Tls.hkdf_expand_label(s_hs_traffic, "finished", Bytes.empty, 32)
+          expected_verify_data = HMAC.digest(:sha256, s_finished_key, th_cv)
+          server_verify_data = msg_data[4, 32]
+          if !Std::Crypto.constant_time_compare(server_verify_data, expected_verify_data)
+            raise "server Finished MAC verification failed"
+          end
+
+          handshake_transcript << msg_data
+          finished_received = true
+        else
+          handshake_transcript << msg_data
+        end
+
+        h_offset = h_offset + 4 + msg_len
+      end
+
+      # Slicing handshake buffer to drop parsed complete messages (Finding 3)
+      if h_offset > 0
+        rem_len = handshake_buf.size - h_offset
+        if rem_len > 0
+          sliced_buf = Bytes.new(rem_len)
+          s_i = 0; while s_i < rem_len
+            sliced_buf[s_i] = handshake_buf[h_offset + s_i]; s_i = s_i + 1
+          end
+          handshake_buf = sliced_buf
+        else
+          handshake_buf = Bytes.empty
+        end
+      end
+    end
+
+    # Verify Certificate and CertificateVerify signature
+    peer_cert = cert_chain.empty? ? nil : cert_chain[0]
+    now_sec = current_time || Time.utc.seconds
+
+    if verify_peer
+      raise "server did not present any certificates" if peer_cert.nil?
+
+      # 1. Hostname matching
+      if !peer_cert.matches_hostname(hostname)
+        raise "hostname mismatch: certificate does not match #{hostname}"
+      end
+
+      # 2. Validity dates
+      if !peer_cert.valid_at?(now_sec)
+        raise "certificate has expired or is not yet valid"
+      end
+
+      # 3. CertificateVerify signature
+      # Content to verify: 64 spaces || "TLS 1.3, server CertificateVerify" || 0x00 || th_cert
+      cv_prefix = "                                                                TLS 1.3, server CertificateVerify"
+      cv_input = Bytes.new(cv_prefix.bytesize + 1 + th_cert.size)
+      i = 0; while i < cv_prefix.bytesize
+        cv_input[i] = cv_prefix[i].ord.to_u8; i = i + 1
+      end
+      cv_input[cv_prefix.bytesize] = 0x00_u8
+      i = 0; while i < th_cert.size
+        cv_input[cv_prefix.bytesize + 1 + i] = th_cert[i]; i = i + 1
+      end
+
+      cv_valid = false
+      case cert_verify_algo
+      when 0x0403 # ecdsa_secp256r1_sha256
+        qx = peer_cert.ec_x
+        qy = peer_cert.ec_y
+        if peer_cert.ec_curve == :p256 && !qx.zero? && !qy.zero?
+          th_input = SHA256.digest(cv_input)
+          sig_elem = Std::Tls.read_asn1(cert_verify_sig, 0)
+          if sig_elem
+            sig_parts = Std::Tls.parse_asn1_children(sig_elem)
+            if sig_parts.size >= 2
+              r = Std::Tls.parse_integer(sig_parts[0])
+              s = Std::Tls.parse_integer(sig_parts[1])
+              cv_valid = P256.verify(qx, qy, th_input, r, s)
+            end
+          end
+        end
+      when 0x0804 # rsa_pss_rsae_sha256
+        n = peer_cert.rsa_n
+        e = peer_cert.rsa_e
+        if peer_cert.pubkey_algo == :rsa && !n.zero? && !e.zero?
+          th_input = SHA256.digest(cv_input)
+          cv_valid = RSA.verify_pss(n, e, :sha256, th_input, cert_verify_sig, 32)
+        end
+      when 0x0805 # rsa_pss_rsae_sha384
+        n = peer_cert.rsa_n
+        e = peer_cert.rsa_e
+        if peer_cert.pubkey_algo == :rsa && !n.zero? && !e.zero?
+          th_input = SHA384.digest(cv_input)
+          cv_valid = RSA.verify_pss(n, e, :sha384, th_input, cert_verify_sig, 48)
+        end
+      when 0x0503 # ecdsa_secp384r1_sha384
+        qx = peer_cert.ec_x
+        qy = peer_cert.ec_y
+        if peer_cert.ec_curve == :p384 && !qx.zero? && !qy.zero?
+          th_input = SHA384.digest(cv_input)
+          sig_elem = Std::Tls.read_asn1(cert_verify_sig, 0)
+          if sig_elem
+            sig_parts = Std::Tls.parse_asn1_children(sig_elem)
+            if sig_parts.size >= 2
+              r = Std::Tls.parse_integer(sig_parts[0])
+              s = Std::Tls.parse_integer(sig_parts[1])
+              cv_valid = P384.verify(qx, qy, th_input, r, s)
+            end
+          end
+        end
+      when 0x0807 # ed25519
+        ed_pub = peer_cert.ed25519_pub
+        if peer_cert.pubkey_algo == :ed25519 && ed_pub
+          cv_valid = Ed25519.verify(ed_pub, cv_input, cert_verify_sig)
+        end
+      end
+
+      if !cv_valid
+        raise "CertificateVerify signature verification failed"
+      end
+
+      # 4. Chain verification against trust store
+      trust_store = ca_store || CertificateStore.load_system_store
+      if trust_store.certificates.empty?
+        # Say plainly when trust store cannot be read
+        # If verify_peer requested and trust store has no certificates, we cannot establish trust
+        raise "cannot verify certificate chain: system trust store not found or empty"
+      else
+        chain_ok = trust_store.verify_chain(cert_chain, hostname, now_sec)
+        if !chain_ok
+          raise "certificate chain verification failed: could not chain to trusted root"
+        end
+      end
+    end
+
+    # Derive application traffic keys
+    master_secret = HKDF.extract(:sha256, zeros32, Std::Tls.derive_secret(handshake_secret, "derived", empty_hash))
+    h_sfin = SHA256.new
+    hsf_i = 0; while hsf_i < handshake_transcript.size
+      h_sfin.update(handshake_transcript[hsf_i]); hsf_i = hsf_i + 1
+    end
+    th_s_fin = h_sfin.final
+
+    c_ap_traffic = Std::Tls.derive_secret(master_secret, "c ap traffic", th_s_fin)
+    s_ap_traffic = Std::Tls.derive_secret(master_secret, "s ap traffic", th_s_fin)
+
+    c_ap_key = Std::Tls.hkdf_expand_label(c_ap_traffic, "key", Bytes.empty, key_len)
+    c_ap_iv = Std::Tls.hkdf_expand_label(c_ap_traffic, "iv", Bytes.empty, 12)
+    s_ap_key = Std::Tls.hkdf_expand_label(s_ap_traffic, "key", Bytes.empty, key_len)
+    s_ap_iv = Std::Tls.hkdf_expand_label(s_ap_traffic, "iv", Bytes.empty, 12)
+
+    # Send client Finished
+    c_finished_key = Std::Tls.hkdf_expand_label(c_hs_traffic, "finished", Bytes.empty, 32)
+    c_verify_data = HMAC.digest(:sha256, c_finished_key, th_s_fin)
+
+    c_fin_msg = Bytes.new(4 + 32)
+    c_fin_msg[0] = 0x14_u8
+    c_fin_msg[1] = 0x00_u8; c_fin_msg[2] = 0x00_u8; c_fin_msg[3] = 32_u8
+    i = 0; while i < 32
+      c_fin_msg[4 + i] = c_verify_data[i]; i = i + 1
+    end
+
+    client_hs_cipher = RecordCipher.new(cipher_sym, c_hs_key, c_hs_iv)
+    c_fin_record = client_hs_cipher.encrypt(0x16_u8, c_fin_msg)
+
+    # Send client Finished record
+    socket.write(c_fin_record.to_unsafe, c_fin_record.size)
+
+    # Instantiate Application Data ciphers
+    write_cipher = RecordCipher.new(cipher_sym, c_ap_key, c_ap_iv)
+    read_cipher = RecordCipher.new(cipher_sym, s_ap_key, s_ap_iv)
+
+    Client.new(
+      socket,
+      hostname,
+      cipher_sym,
+      alpn_selected,
+      peer_cert,
+      cert_chain,
+      write_cipher,
+      read_cipher
+    )
+  end
+
+  # --- Application Data I/O ---
+
+  MAX_RECORD_PLAINTEXT = 16384
+
+  def write(data : Bytes) : Nil
+    raise "cannot write to closed TLS client" if @closed
+    offset = 0
+    remaining = data.size
+    while remaining > 0
+      chunk_len = remaining > MAX_RECORD_PLAINTEXT ? MAX_RECORD_PLAINTEXT : remaining
+      chunk = data[offset, chunk_len]
+      rec = @write_cipher.encrypt(0x17_u8, chunk)
+      @socket.write(rec.to_unsafe, rec.size)
+      offset = offset + chunk_len
+      remaining = remaining - chunk_len
+    end
+  end
+
+  def write(str : String) : Nil
+    write(Bytes.new(str.to_unsafe, str.bytesize))
+  end
+
+  def read(max_bytes : Int32 = 4096) : Bytes
+    raise "cannot read from closed TLS client" if @closed
+    while true
+      rec_hdr = Client.read_exact_bytes(@socket, 5)
+      rec_len = (rec_hdr[3].to_i32 << 8) | rec_hdr[4].to_i32
+      rec_payload = Client.read_exact_bytes(@socket, rec_len)
+
+      if rec_hdr[0] == 0x14_u8 # ChangeCipherSpec
+        next
+      end
+
+      full_rec = Bytes.new(5 + rec_len)
+      i = 0; while i < 5
+        full_rec[i] = rec_hdr[i]; i = i + 1
+      end
+      i = 0; while i < rec_len
+        full_rec[5 + i] = rec_payload[i]; i = i + 1
+      end
+
+      dec_res = @read_cipher.decrypt(full_rec)
+      raise "TLS record decryption failed" if dec_res.nil?
+
+      inner_type, inner_payload = dec_res
+      if inner_type == 0x17_u8 # Application Data
+        return inner_payload
+      elsif inner_type == 0x15_u8 # Alert
+        close
+        return Bytes.empty
+      elsif inner_type == 0x16_u8 # Post-handshake (e.g. NewSessionTicket)
+        next
+      end
+    end
+    Bytes.empty
+  end
+
+  def read_string(max_bytes : Int32 = 4096) : String
+    b = read(max_bytes)
+    return "" if b.empty?
+    String.new(b.size) { |buf| buf.copy_from(b.to_unsafe, b.size) }
+  end
+
+  def close : Nil
+    if !@closed
+      @closed = true
+      @socket.close
+    end
+  end
+
+  def closed? : Bool
+    @closed
+  end
+
+  def self.read_exact_bytes(socket : IyiSocket, count : Int32) : Bytes
+    buf = Bytes.new(count)
+    read_bytes = 0
+    while read_bytes < count
+      ptr = (buf.to_unsafe + read_bytes.to_i64).as(Pointer(UInt8))
+      n = socket.read(ptr, count - read_bytes)
+      raise "TLS socket closed prematurely" if n <= 0
+      read_bytes = read_bytes + n
+    end
+    buf
+  end
+end

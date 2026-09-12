@@ -1,0 +1,73 @@
+# SystemError wraps an OS system error (Errno, WinError, or WasiError) in an Exception.
+
+module std/system_error
+
+pub import std/errno
+pub import std/winerror
+pub import std/wasi_error
+
+using std/errno::{Errno}
+using std/winerror::{WinError}
+using std/wasi_error::{WasiError}
+
+pub alias Errno = Std::Errno::Errno
+pub alias WinError = Std::Winerror::WinError
+pub alias WasiError = Std::WasiError::WasiError
+
+module ::SystemError
+  alias Errno = Std::Errno::Errno
+  alias WinError = Std::Winerror::WinError
+  alias WasiError = Std::WasiError::WasiError
+
+  getter os_error : Errno | WinError | WasiError | Nil
+
+  def os_error=(@os_error : Errno | WinError | WasiError | Nil)
+  end
+
+  module ClassMethods
+    def from_os_error(message : String?, os_error : Std::Errno::Errno | Std::Winerror::WinError | Std::WasiError::WasiError | Nil) : self
+      desc = os_error_message(os_error)
+      full = if message && desc
+               "#{message}: #{desc}"
+             elsif message
+               message
+             elsif desc
+               desc
+             else
+               "System error"
+             end
+
+      e = new(full)
+      e.os_error = os_error
+      e
+    end
+
+    def from_errno(message : String? = nil, errno : Std::Errno::Errno = Std::Errno::Errno.value) : self
+      from_os_error(message, errno)
+    end
+
+    def from_winerror(message : String? = nil, winerror : Std::Winerror::WinError = Std::Winerror::WinError.value) : self
+      from_os_error(message, winerror)
+    end
+
+    def from_wsa_error(message : String? = nil, winerror : Std::Winerror::WinError = Std::Winerror::WinError.wsa_value) : self
+      from_os_error(message, winerror)
+    end
+
+    def build_message(message : String?) : String?
+      message
+    end
+
+    def os_error_message(os_error : Std::Errno::Errno | Std::Winerror::WinError | Std::WasiError::WasiError | Nil) : String?
+      if os_error.is_a?(Std::Errno::Errno)
+        os_error.message
+      elsif os_error.is_a?(Std::Winerror::WinError)
+        os_error.message
+      elsif os_error.is_a?(Std::WasiError::WasiError)
+        os_error.message
+      else
+        nil
+      end
+    end
+  end
+end

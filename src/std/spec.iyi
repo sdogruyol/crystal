@@ -1,0 +1,2442 @@
+# Standard specification and testing framework for iyi.
+# Conforms to Crystal Spec framework parity expressible in iyi:
+#   * describe / context / it / pending
+#   * hooks: before_each, after_each, before_all, after_all, around_each, around_all
+#   * expectations and matchers: eq, be, be_true, be_false, be_nil, be_truthy,
+#     be_falsey, be_close, be (<, <=, >, >=), contain, start_with, end_with,
+#     match, be_empty, be_a, expect_raises
+#   * tags, focus, and pending execution
+#   * formatters: DotFormatter (default), VerboseFormatter, TAPFormatter, JUnitFormatter
+#   * randomization via PCG32 PRNG (--order random, --order <seed>)
+#   * CLI runner and option parser (-e, -l, --location, -p, --fail-fast, --tag, --list-tags,
+#     --order, --junit_output, -v, --tap, --color, --no-color, --dry-run)
+#   * spec file execution and exit code handling
+
+module std/spec
+
+import std/time
+using std/time::{Time}
+alias Span = Std::Time::Span
+
+import std/exception
+
+pub class OptionParser
+  property banner : String
+  @flags : Array(String)
+  @handlers : Hash(String, (String? -> Nil))
+
+  def initialize
+    @banner = ""
+    @flags = [] of String
+    @handlers = {} of String => (String? -> Nil)
+  end
+
+  def on(flag : String, description : String, &block : String? -> Nil) : Nil
+    @flags << "    #{flag.ljust(30)} #{description}"
+    parts = flag.split(", ")
+    parts.each do |p|
+      name = p.split(' ')[0]
+      @handlers[name] = block
+    end
+  end
+
+  def on(short_flag : String, long_flag : String, description : String, &block : String? -> Nil) : Nil
+    flags_str = short_flag.empty? ? long_flag : "#{short_flag}, #{long_flag}"
+    @flags << "    #{flags_str.ljust(30)} #{description}"
+    unless short_flag.empty?
+      s_name = short_flag.split(' ')[0]
+      @handlers[s_name] = block
+    end
+    unless long_flag.empty?
+      l_name = long_flag.split(' ')[0]
+      @handlers[l_name] = block
+    end
+  end
+
+  def parse(args : Array(String)) : Array(String)
+    unhandled = [] of String
+    i = 0
+    while i < args.size
+      arg = args[i]
+      if arg == "--"
+        i = i + 1
+        while i < args.size
+          unhandled << args[i]
+          i = i + 1
+        end
+        break
+      end
+
+      arg_name = arg
+      arg_val : String? = nil
+      if arg.starts_with?("--") && arg.includes?("=")
+        idx = arg.index('=')
+        if idx
+          arg_name = arg[0...idx]
+          arg_val = arg[(idx + 1)...arg.size]
+        end
+      end
+
+      handler = @handlers[arg_name]?
+      if handler
+        if arg_val.nil? && i + 1 < args.size && !args[i + 1].starts_with?("-")
+          arg_val = args[i + 1]
+          i = i + 1
+        end
+        handler.call(arg_val)
+      else
+        unhandled << arg
+      end
+      i = i + 1
+    end
+    unhandled
+  end
+
+  def to_s : String
+    header = @banner.empty? ? "" : "#{@banner}\n"
+    header + @flags.join("\n")
+  end
+end
+
+import std/regex
+using std/regex::{Regex}
+
+lib LibC
+  fun system(command : UInt8*) : Int32
+end
+
+# -----------------------------------------------------------------------------
+# Spec Errors
+# -----------------------------------------------------------------------------
+
+pub class SpecError < Exception
+  getter file : String
+  getter line : Int32
+
+  def initialize(message : String, @file : String = "", @line : Int32 = 0)
+    super(message)
+  end
+end
+
+pub class AssertionFailed < SpecError
+end
+
+pub class ExamplePending < SpecError
+end
+
+pub class NestingSpecError < SpecError
+end
+
+# -----------------------------------------------------------------------------
+# Status and Info Kinds
+# -----------------------------------------------------------------------------
+
+pub enum Status
+  Success
+  Fail
+  Error
+  Pending
+
+  def letter : Char
+    case self
+    when Success then '.'
+    when Fail    then 'F'
+    when Error   then 'E'
+    when Pending then '*'
+    else              '?'
+    end
+  end
+
+  def color_code : String
+    case self
+    when Success then "32" # Green
+    when Fail    then "31" # Red
+    when Error   then "31" # Red
+    when Pending then "33" # Yellow
+    else              "0"
+    end
+  end
+end
+
+pub enum InfoKind
+  Comment
+  Focus
+  Order
+
+  def color_code : String
+    case self
+    when Comment then "36" # Cyan
+    when Focus   then "36" # Cyan
+    when Order   then "36" # Cyan
+    else              "0"
+    end
+  end
+end
+
+# -----------------------------------------------------------------------------
+# Split Filter & Result Record
+# -----------------------------------------------------------------------------
+
+pub struct SplitFilter
+  getter remainder : Int32
+  getter quotient : Int32
+
+  def initialize(@remainder : Int32, @quotient : Int32)
+  end
+end
+
+pub class Result
+  getter kind : Status
+  getter description : String
+  getter file : String
+  getter line : Int32
+  getter elapsed : Span?
+  getter exception : Exception?
+
+  def initialize(@kind : Status, @description : String, @file : String = "", @line : Int32 = 0, @elapsed : Span? = nil, @exception : Exception? = nil)
+  end
+end
+
+# -----------------------------------------------------------------------------
+# Randomizer: PCG32
+# -----------------------------------------------------------------------------
+
+module Random
+  class PCG32
+    PCG_DEFAULT_MULTIPLIER_64 = 6364136223846793005_u64
+
+    @state : UInt64
+    @inc : UInt64
+
+    def initialize(initstate : UInt64 = 42_u64, initseq : UInt64 = 54_u64)
+      @state = 0_u64
+      @inc = 0_u64
+      new_seed(initstate, initseq)
+    end
+
+    def new_seed(initstate : UInt64, initseq : UInt64 = 54_u64) : UInt64
+      @state = 0_u64
+      @inc = initseq.unsafe_shl(1_u64) | 1_u64
+      next_u
+      @state = @state &+ initstate
+      next_u
+    end
+
+    def next_u : UInt64
+      oldstate = @state
+      @state = oldstate &* PCG_DEFAULT_MULTIPLIER_64 &+ @inc
+      xorshifted = (oldstate.unsafe_shr(18_u64) ^ oldstate).unsafe_shr(27_u64) & 0xFFFFFFFF_u64
+      rot = oldstate.unsafe_shr(59_u64) & 31_u64
+      if rot == 0_u64
+        xorshifted
+      else
+        (xorshifted.unsafe_shr(rot) | xorshifted.unsafe_shl(32_u64 - rot)) & 0xFFFFFFFF_u64
+      end
+    end
+  end
+end
+
+# -----------------------------------------------------------------------------
+# Item Module (common attributes for Context and Example)
+# -----------------------------------------------------------------------------
+
+module Item
+  getter description : String
+  getter file : String
+  getter line : Int32
+  getter end_line : Int32
+  @focus : Bool = false
+
+  def focus? : Bool
+    @focus
+  end
+
+  getter tags : Set(String)?
+
+  def set_focus(f : Bool) : Nil
+    @focus = f
+  end
+
+  def set_tags(t : Set(String)?) : Nil
+    @tags = t
+  end
+
+  def matches_pattern?(pattern : Regex) : Bool
+    pattern.match(@description) != nil
+  end
+
+  def matches_pattern?(pattern_str : String) : Bool
+    @description.includes?(pattern_str)
+  end
+
+  def matches_line?(line_num : Int32) : Bool
+    @line == line_num || (@line <= line_num && line_num <= @end_line)
+  end
+
+  def matches_locations?(locations : Hash(String, Array(Int32))) : Bool
+    return false if @file.empty?
+    lines = locations[@file]?
+    return false unless lines
+    lines.each do |target_line|
+      return true if matches_line?(target_line)
+    end
+    false
+  end
+
+  def matches_tags?(tag_set : Set(String)) : Bool
+    if t = @tags
+      t.each do |tag|
+        return true if tag_set.includes?(tag)
+      end
+    end
+    false
+  end
+end
+
+# -----------------------------------------------------------------------------
+# Context Hierarchy
+# -----------------------------------------------------------------------------
+
+abstract class Context
+  getter children : Array(ExampleGroup | Example)
+
+  def initialize
+    @children = [] of ExampleGroup | Example
+    @before_each = nil
+    @after_each = nil
+    @before_all = nil
+    @after_all = nil
+    @around_each = nil
+    @around_all = nil
+  end
+
+  abstract def cli : CLI
+
+  def randomize(randomizer : Random::PCG32) : Nil
+    @children.each do |child|
+      if child.is_a?(ExampleGroup)
+        child.randomize(randomizer)
+      end
+    end
+    i = @children.size - 1
+    while i > 0
+      j = (randomizer.next_u % (i + 1).to_u64).to_i32
+      tmp = @children[i]
+      @children[i] = @children[j]
+      @children[j] = tmp
+      i = i - 1
+    end
+  end
+
+  protected def internal_run : Nil
+    run_before_all_hooks
+    @children.each do |child|
+      child.run
+    end
+    run_after_all_hooks
+  end
+
+  def before_each(&block : -> Nil) : Nil
+    list = @before_each ||= [] of -> Nil
+    list << block
+  end
+
+  def run_before_each_hooks : Nil
+    if list = @before_each
+      list.each do |hook|
+        hook.call
+      end
+    end
+  end
+
+  def after_each(&block : -> Nil) : Nil
+    list = @after_each ||= [] of -> Nil
+    list << block
+  end
+
+  def run_after_each_hooks : Nil
+    if list = @after_each
+      idx = list.size - 1
+      while idx >= 0
+        list[idx].call
+        idx = idx - 1
+      end
+    end
+  end
+
+  def before_all(&block : -> Nil) : Nil
+    list = @before_all ||= [] of -> Nil
+    list << block
+  end
+
+  def run_before_all_hooks : Nil
+    if list = @before_all
+      list.each do |hook|
+        hook.call
+      end
+    end
+  end
+
+  def after_all(&block : -> Nil) : Nil
+    list = @after_all ||= [] of -> Nil
+    list << block
+  end
+
+  def run_after_all_hooks : Nil
+    if list = @after_all
+      idx = list.size - 1
+      while idx >= 0
+        list[idx].call
+        idx = idx - 1
+      end
+    end
+  end
+
+  def around_each(&block : Example::Procsy -> Nil) : Nil
+    list = @around_each ||= [] of Example::Procsy -> Nil
+    list << block
+  end
+
+  def run_around_each_hooks(procsy : Example::Procsy) : Bool
+    list = @around_each
+    return false unless list
+    return false if list.empty?
+    run_around_each_hook(list, procsy, 0)
+    true
+  end
+
+  protected def run_around_each_hook(hooks : Array(Example::Procsy -> Nil), procsy : Example::Procsy, index : Int32) : Nil
+    if index == hooks.size - 1
+      hooks[index].call(procsy)
+    else
+      next_procsy = Example::Procsy.new(procsy.example) do
+        run_around_each_hook(hooks, procsy, index + 1)
+      end
+      hooks[index].call(next_procsy)
+    end
+  end
+
+  def around_all(&block : ExampleGroup::Procsy -> Nil) : Nil
+    list = @around_all ||= [] of ExampleGroup::Procsy -> Nil
+    list << block
+  end
+
+  def run_around_all_hooks(procsy : ExampleGroup::Procsy) : Bool
+    list = @around_all
+    return false unless list
+    return false if list.empty?
+    run_around_all_hook(list, procsy, 0)
+    true
+  end
+
+  protected def run_around_all_hook(hooks : Array(ExampleGroup::Procsy -> Nil), procsy : ExampleGroup::Procsy, index : Int32) : Nil
+    if index == hooks.size - 1
+      hooks[index].call(procsy)
+    else
+      next_procsy = ExampleGroup::Procsy.new(procsy.example_group) do
+        run_around_all_hook(hooks, procsy, index + 1)
+      end
+      hooks[index].call(next_procsy)
+    end
+  end
+end
+
+# -----------------------------------------------------------------------------
+# RootContext
+# -----------------------------------------------------------------------------
+
+pub class RootContext < Context
+  @cli : CLI
+  @results : Hash(Status, Array(Result))
+  @spec_nesting : Bool
+
+  def cli : CLI
+    @cli
+  end
+
+  def results_for(status : Status) : Array(Result)
+    @results[status]
+  end
+
+  def initialize(@cli : CLI)
+    super()
+    @results = {} of Status => Array(Result)
+    @results[Status::Success] = [] of Result
+    @results[Status::Fail] = [] of Result
+    @results[Status::Error] = [] of Result
+    @results[Status::Pending] = [] of Result
+    @spec_nesting = false
+  end
+
+  def run : Nil
+    print_order_message(@cli.stdout)
+    internal_run
+  end
+
+  def report(status : Status, full_description : String, file : String = "", line : Int32 = 0, elapsed : Span? = nil, ex : Exception? = nil) : Nil
+    result = Result.new(status, full_description, file, line, elapsed, ex)
+    report_formatters(result)
+    @results[status] << result
+  end
+
+  def report_formatters(result : Result) : Nil
+    @cli.formatters.each do |formatter|
+      formatter.report(result)
+    end
+  end
+
+  def succeeded : Bool
+    @results[Status::Fail].empty? && @results[Status::Error].empty?
+  end
+
+  def finish(elapsed_time : Span, aborted : Bool = false) : Nil
+    @cli.formatters.each do |f|
+      f.finish(elapsed_time, aborted)
+    end
+    if @cli.formatters.any? { |f| f.should_print_summary? }
+      print_summary(@cli.stdout, elapsed_time, aborted)
+    end
+  end
+
+  def print_summary(io : IyiIO, elapsed_time : Span, aborted : Bool = false) : Nil
+    pendings = results_for(Status::Pending)
+    unless pendings.empty?
+      io.puts ""
+      io.puts "Pending:"
+      pendings.each do |pending|
+        io.puts @cli.colorize("  #{pending.description}", Status::Pending)
+      end
+    end
+
+    failures = results_for(Status::Fail)
+    errors = results_for(Status::Error)
+    failures_and_errors = [] of Result
+    failures.each { |r| failures_and_errors << r }
+    errors.each { |r| failures_and_errors << r }
+
+    unless failures_and_errors.empty?
+      io.puts ""
+      io.puts "Failures:"
+      failures_and_errors.each_with_index do |fail_res, i|
+        io.puts ""
+        io.puts "#{(i + 1).to_s.rjust(3, ' ')}) #{fail_res.description}"
+
+        if ex = fail_res.exception
+          if ex.is_a?(SpecError) && !ex.file.empty?
+            source_line = Spec.read_line(ex.file, ex.line)
+            if source_line
+              io.puts @cli.colorize("     Failure/Error: #{source_line.strip}", Status::Error)
+            end
+          end
+          io.puts ""
+          lines = ex.message || ex.to_s
+          lines.split('\n').each do |line|
+            io.print "       "
+            io.puts @cli.colorize(line, Status::Error)
+          end
+          if ex.is_a?(SpecError) && !ex.file.empty?
+            io.puts ""
+            io.puts @cli.colorize("     # #{ex.file}:#{ex.line}", InfoKind::Comment)
+          end
+        end
+      end
+    end
+
+    if slowest_count = @cli.slowest
+      io.puts ""
+      all_results = [] of Result
+      results_for(Status::Success).each { |r| all_results << r }
+      results_for(Status::Fail).each { |r| all_results << r }
+      all_results.sort_in_place do |a, b|
+        sa = if el = a.elapsed
+               el.total_seconds
+             else
+               0.0
+             end
+        sb = if el = b.elapsed
+               el.total_seconds
+             else
+               0.0
+             end
+        sb > sa ? 1 : (sb < sa ? -1 : 0)
+      end
+      limit = slowest_count < all_results.size ? slowest_count : all_results.size
+      io.puts "Top #{limit} slowest examples:"
+      idx = 0
+      while idx < limit
+        r = all_results[idx]
+        sec_str = if el = r.elapsed
+                    "#{el.total_seconds} seconds"
+                  else
+                    "0.0 seconds"
+                  end
+        io.puts "  #{r.description}"
+        io.puts "    #{sec_str} #{r.file}:#{r.line}"
+        idx = idx + 1
+      end
+    end
+
+    io.puts ""
+    total = results_for(Status::Success).size + failures.size + errors.size + pendings.size
+
+    final_status = if aborted
+                     Status::Error
+                   elsif (failures.size + errors.size) > 0
+                     Status::Fail
+                   elsif pendings.size > 0
+                     Status::Pending
+                   else
+                     Status::Success
+                   end
+
+    io.puts "Aborted!" if aborted
+    io.puts "Finished in #{Spec.to_human(elapsed_time)}"
+    summary_text = "#{total} examples, #{failures.size} failures, #{errors.size} errors, #{pendings.size} pending"
+    io.puts @cli.colorize(summary_text, final_status)
+    if @cli.focus?
+      io.puts @cli.colorize("Only running `focus: true`", InfoKind::Focus)
+    end
+
+    unless failures_and_errors.empty?
+      io.puts ""
+      io.puts "Failed examples:"
+      io.puts ""
+      failures_and_errors.each do |failed|
+        io.print @cli.colorize("spec #{failed.file}:#{failed.line}", Status::Error)
+        io.puts @cli.colorize(" # #{failed.description}", InfoKind::Comment)
+      end
+    end
+
+    print_order_message(io)
+  end
+
+  def print_order_message(io : IyiIO) : Nil
+    if seed = @cli.randomizer_seed
+      io.puts @cli.colorize("Randomized with seed: #{seed}", InfoKind::Order)
+    end
+  end
+
+  def describe(description : String, file : String, line : Int32, end_line : Int32, focus : Bool, tags : Set(String)?, &block : -> Nil) : Nil
+    @cli.set_focus(true) if focus
+    parent_ctx = @cli.current_context
+    group = ExampleGroup.new(parent_ctx, description, file, line, end_line, focus, tags)
+    parent_ctx.children << group
+
+    old_context = @cli.current_context
+    @cli.current_context = group
+    begin
+      block.call
+    ensure
+      @cli.current_context = old_context
+    end
+  end
+
+  def it(description : String, file : String, line : Int32, end_line : Int32, focus : Bool, tags : Set(String)?, &block : -> Nil) : Nil
+    add_example(description, file, line, end_line, focus, tags, block)
+  end
+
+  def pending(description : String, file : String, line : Int32, end_line : Int32, focus : Bool, tags : Set(String)?) : Nil
+    add_example(description, file, line, end_line, focus, tags, nil)
+  end
+
+  private def add_example(description : String, file : String, line : Int32, end_line : Int32, focus : Bool, tags : Set(String)?, block : (-> Nil)?) : Nil
+    check_nesting_spec(file, line) do
+      @cli.set_focus(true) if focus
+      cur_ctx = @cli.current_context
+      example = Example.new(cur_ctx, description, file, line, end_line, focus, tags, block)
+      cur_ctx.children << example
+    end
+  end
+
+  def check_nesting_spec(file : String, line : Int32, &block : -> Nil) : Nil
+    if @spec_nesting
+      raise "Can't nest `it` or `pending`", file, line
+    end
+    @spec_nesting = true
+    begin
+      block.call
+    ensure
+      @spec_nesting = false
+    end
+  end
+
+  def run_filters(pattern : String? = nil, line : Int32? = nil, locations : Hash(String, Array(Int32))? = nil, split_filter : SplitFilter? = nil, focus : Bool? = nil, tags : Set(String)? = nil, anti_tags : Set(String)? = nil) : Nil
+    filter_by_pattern(pattern) if pattern
+    filter_by_line(line) if line
+    filter_by_locations(locations) if locations
+    filter_by_split(split_filter) if split_filter
+    filter_by_focus if focus
+    filter_by_tags(tags) if tags
+    filter_by_anti_tags(anti_tags) if anti_tags
+  end
+
+  def filter_by_pattern(pattern : String) : Nil
+    @children = @children.select do |child|
+      if child.is_a?(ExampleGroup)
+        child.filter_by_pattern(pattern)
+      else
+        child.filter_by_pattern(pattern)
+      end
+    end
+  end
+
+  def filter_by_line(line_num : Int32) : Nil
+    @children = @children.select do |child|
+      if child.is_a?(ExampleGroup)
+        child.filter_by_line(line_num)
+      else
+        child.filter_by_line(line_num)
+      end
+    end
+  end
+
+  def filter_by_locations(locations : Hash(String, Array(Int32))) : Nil
+    @children = @children.select do |child|
+      if child.is_a?(ExampleGroup)
+        child.filter_by_locations(locations)
+      else
+        child.filter_by_locations(locations)
+      end
+    end
+  end
+
+  def filter_by_focus : Nil
+    @children = @children.select do |child|
+      if child.is_a?(ExampleGroup)
+        child.filter_by_focus
+      else
+        child.filter_by_focus
+      end
+    end
+  end
+
+  def filter_by_tags(tag_set : Set(String)) : Nil
+    @children = @children.select do |child|
+      if child.is_a?(ExampleGroup)
+        child.filter_by_tags(tag_set)
+      else
+        child.filter_by_tags(tag_set)
+      end
+    end
+  end
+
+  def filter_by_anti_tags(anti_tag_set : Set(String)) : Nil
+    @children = @children.select do |child|
+      if child.is_a?(ExampleGroup)
+        child.filter_by_anti_tags(anti_tag_set)
+      else
+        child.filter_by_anti_tags(anti_tag_set)
+      end
+    end
+  end
+
+  def filter_by_split(filter : SplitFilter) : Nil
+    @children = @children.select do |child|
+      if child.is_a?(ExampleGroup)
+        child.filter_by_split(filter)
+      else
+        child.filter_by_split(filter)
+      end
+    end
+  end
+end
+
+# -----------------------------------------------------------------------------
+# ExampleGroup
+# -----------------------------------------------------------------------------
+
+pub class ExampleGroup < Context
+  include Item
+
+  getter parent : Context
+
+  def initialize(@parent : Context, @description : String, @file : String, @line : Int32, @end_line : Int32, @focus : Bool, @tags : Set(String)?)
+    super()
+  end
+
+  def cli : CLI
+    @parent.cli
+  end
+
+  def run : Nil
+    cli.formatters.each do |f|
+      f.push(self)
+    end
+
+    procsy = ExampleGroup::Procsy.new(self) do
+      internal_run
+    end
+    ran = run_around_all_hooks(procsy)
+    unless ran
+      internal_run
+    end
+
+    cli.formatters.each do |f|
+      f.pop
+    end
+  end
+
+  def report(status : Status, desc : String, file : String = "", line : Int32 = 0, elapsed : Span? = nil, ex : Exception? = nil) : Nil
+    full = @description.empty? ? desc : "#{@description} #{desc}"
+    if @parent.is_a?(RootContext)
+      @parent.as(RootContext).report(status, full, file, line, elapsed, ex)
+    else
+      @parent.as(ExampleGroup).report(status, full, file, line, elapsed, ex)
+    end
+  end
+
+  def run_before_each_hooks : Nil
+    @parent.run_before_each_hooks
+    super
+  end
+
+  def run_after_each_hooks : Nil
+    super
+    @parent.run_after_each_hooks
+  end
+
+  def run_around_each_hooks(procsy : Example::Procsy) : Bool
+    parent_procsy = Example::Procsy.new(procsy.example) do
+      if list = @around_each
+        run_around_each_hook(list, procsy, 0)
+      else
+        procsy.run
+      end
+    end
+    ran = @parent.run_around_each_hooks(parent_procsy)
+    return true if ran
+    if list = @around_each
+      run_around_each_hook(list, procsy, 0)
+      true
+    else
+      false
+    end
+  end
+
+  def filter_by_pattern(pattern : String) : Bool
+    return true if matches_pattern?(pattern)
+    @children = @children.select do |child|
+      if child.is_a?(ExampleGroup)
+        child.filter_by_pattern(pattern)
+      else
+        child.filter_by_pattern(pattern)
+      end
+    end
+    !@children.empty?
+  end
+
+  def filter_by_line(line_num : Int32) : Bool
+    if @children.any? { |c| c.matches_line?(line_num) }
+      @children = @children.select do |child|
+        if child.is_a?(ExampleGroup)
+          child.filter_by_line(line_num)
+        else
+          child.filter_by_line(line_num)
+        end
+      end
+      return true
+    end
+    matches_line?(line_num)
+  end
+
+  def filter_by_locations(locations : Hash(String, Array(Int32))) : Bool
+    if @children.any? { |c| c.matches_locations?(locations) }
+      @children = @children.select do |child|
+        if child.is_a?(ExampleGroup)
+          child.filter_by_locations(locations)
+        else
+          child.filter_by_locations(locations)
+        end
+      end
+      return true
+    end
+    matches_locations?(locations)
+  end
+
+  def filter_by_focus : Bool
+    return true if focus?
+    @children = @children.select do |child|
+      if child.is_a?(ExampleGroup)
+        child.filter_by_focus
+      else
+        child.filter_by_focus
+      end
+    end
+    !@children.empty?
+  end
+
+  def filter_by_tags(tag_set : Set(String)) : Bool
+    return true if matches_tags?(tag_set)
+    @children = @children.select do |child|
+      if child.is_a?(ExampleGroup)
+        child.filter_by_tags(tag_set)
+      else
+        child.filter_by_tags(tag_set)
+      end
+    end
+    !@children.empty?
+  end
+
+  def filter_by_anti_tags(anti_tag_set : Set(String)) : Bool
+    return false if matches_tags?(anti_tag_set)
+    @children = @children.select do |child|
+      if child.is_a?(ExampleGroup)
+        child.filter_by_anti_tags(anti_tag_set)
+      else
+        child.filter_by_anti_tags(anti_tag_set)
+      end
+    end
+    !@children.empty?
+  end
+
+  def filter_by_split(split_filter : SplitFilter) : Bool
+    @children = @children.select do |child|
+      if child.is_a?(ExampleGroup)
+        child.filter_by_split(split_filter)
+      else
+        child.filter_by_split(split_filter)
+      end
+    end
+    !@children.empty?
+  end
+
+  struct Procsy
+    getter example_group : ExampleGroup
+
+    def initialize(@example_group : ExampleGroup, &@proc : -> Nil)
+    end
+
+    def run : Nil
+      @proc.call
+    end
+  end
+end
+
+# -----------------------------------------------------------------------------
+# Example
+# -----------------------------------------------------------------------------
+
+pub class Example
+  include Item
+
+  getter parent : Context
+  getter block : (-> Nil)?
+  @failed : Bool
+  getter failure_message : String?
+  @pending_state : Bool
+  getter pending_message : String?
+
+  def failed? : Bool
+    @failed
+  end
+
+  def pending_state? : Bool
+    @pending_state
+  end
+
+  getter exception : Exception?
+
+  @@example_counter : Int32 = -1
+
+  def self.reset_example_counter : Nil
+    @@example_counter = -1
+  end
+
+  def initialize(@parent : Context, @description : String, @file : String, @line : Int32, @end_line : Int32, @focus : Bool, @tags : Set(String)?, @block : (-> Nil)?)
+    @failed = false
+    @failure_message = nil
+    @pending_state = false
+    @pending_message = nil
+    @exception = nil
+  end
+
+  def record_failure(msg : String, file : String, line : Int32, ex : Exception? = nil) : Nil
+    return if @failed
+    @failed = true
+    @failure_message = msg
+    @exception = ex || AssertionFailed.new(msg, file, line)
+  end
+
+  def record_pending(msg : String, file : String, line : Int32, ex : Exception? = nil) : Nil
+    return if @pending_state
+    @pending_state = true
+    @pending_message = msg
+    @exception = ex || ExamplePending.new(msg, file, line)
+  end
+
+  def run : Nil
+    @parent.cli.set_current_example(self)
+    @parent.cli.formatters.each do |f|
+      f.before_example(@description)
+    end
+
+    if @parent.cli.dry_run?
+      report_result(Status::Success, nil, nil)
+      @parent.cli.set_current_example(nil)
+      return
+    end
+
+    blk = @block
+    unless blk
+      report_result(Status::Pending, nil, nil)
+      @parent.cli.set_current_example(nil)
+      return
+    end
+
+    start_ns = __iyi_monotonic_ns
+    procsy = Example::Procsy.new(self) do
+      internal_run(start_ns, blk)
+    end
+
+    ran = @parent.run_around_each_hooks(procsy)
+    unless ran
+      internal_run(start_ns, blk)
+    end
+
+    @parent.cli.set_current_example(nil)
+  end
+
+  private def internal_run(start_ns : Int64, blk : -> Nil) : Nil
+    @parent.run_before_each_hooks
+
+    # Execute test body safely
+    blk.call
+
+    elapsed_ns = __iyi_monotonic_ns - start_ns
+    elapsed_span = Span.nanoseconds(elapsed_ns)
+
+    if @pending_state
+      report_result(Status::Pending, elapsed_span, @exception)
+    elsif @failed
+      report_result(Status::Fail, elapsed_span, @exception)
+      if @parent.cli.fail_fast?
+        @parent.cli.abort_run
+      end
+    else
+      report_result(Status::Success, elapsed_span, nil)
+    end
+  ensure
+    @parent.run_after_each_hooks
+  end
+
+  private def report_result(status : Status, elapsed : Span?, ex : Exception?) : Nil
+    if @parent.is_a?(RootContext)
+      @parent.as(RootContext).report(status, @description, @file, @line, elapsed, ex)
+    else
+      @parent.as(ExampleGroup).report(status, @description, @file, @line, elapsed, ex)
+    end
+  end
+
+  def filter_by_pattern(pattern : String) : Bool
+    matches_pattern?(pattern)
+  end
+
+  def filter_by_line(line_num : Int32) : Bool
+    matches_line?(line_num)
+  end
+
+  def filter_by_locations(locations : Hash(String, Array(Int32))) : Bool
+    matches_locations?(locations)
+  end
+
+  def filter_by_focus : Bool
+    @focus
+  end
+
+  def filter_by_tags(tag_set : Set(String)) : Bool
+    matches_tags?(tag_set)
+  end
+
+  def filter_by_anti_tags(anti_tag_set : Set(String)) : Bool
+    !matches_tags?(anti_tag_set)
+  end
+
+  def filter_by_split(filter : SplitFilter) : Bool
+    @@example_counter = @@example_counter + 1
+    (@@example_counter % filter.quotient) == filter.remainder
+  end
+
+  struct Procsy
+    getter example : Example
+
+    def initialize(@example : Example, &@proc : -> Nil)
+    end
+
+    def run : Nil
+      @proc.call
+    end
+  end
+end
+
+# -----------------------------------------------------------------------------
+# Expectations and Matchers
+# -----------------------------------------------------------------------------
+
+pub struct EqualExpectation(T)
+  getter expected_value : T
+
+  def initialize(@expected_value : T)
+  end
+
+  def match(actual_value) : Bool
+    actual_value == @expected_value
+  end
+
+  def failure_message(actual_value) : String
+    "Expected: #{@expected_value.inspect}\n     got: #{actual_value.inspect}"
+  end
+
+  def negative_failure_message(actual_value) : String
+    "Expected: actual_value != #{@expected_value.inspect}\n     got: #{actual_value.inspect}"
+  end
+end
+
+pub struct BeExpectation(T)
+  getter expected_value : T
+
+  def initialize(@expected_value : T)
+  end
+
+  def match(actual_value) : Bool
+    actual_value == @expected_value
+  end
+
+  def failure_message(actual_value) : String
+    "Expected: #{@expected_value.inspect}\n     got: #{actual_value.inspect}"
+  end
+
+  def negative_failure_message(actual_value) : String
+    "Expected: not #{@expected_value.inspect}\n     got: #{actual_value.inspect}"
+  end
+end
+
+pub struct BeTruthyExpectation
+  def match(actual_value) : Bool
+    if actual_value.nil?
+      false
+    elsif actual_value == false
+      false
+    else
+      true
+    end
+  end
+
+  def failure_message(actual_value) : String
+    "Expected: #{actual_value.inspect} to be truthy"
+  end
+
+  def negative_failure_message(actual_value) : String
+    "Expected: #{actual_value.inspect} not to be truthy"
+  end
+end
+
+pub struct BeFalseyExpectation
+  def match(actual_value) : Bool
+    if actual_value.nil?
+      true
+    elsif actual_value == false
+      true
+    else
+      false
+    end
+  end
+
+  def failure_message(actual_value) : String
+    "Expected: #{actual_value.inspect} to be falsey"
+  end
+
+  def negative_failure_message(actual_value) : String
+    "Expected: #{actual_value.inspect} not to be falsey"
+  end
+end
+
+pub struct BeNilExpectation
+  def match(actual_value) : Bool
+    actual_value.nil?
+  end
+
+  def failure_message(actual_value) : String
+    "Expected: #{actual_value.inspect} to be nil"
+  end
+
+  def negative_failure_message(actual_value) : String
+    "Expected: #{actual_value.inspect} not to be nil"
+  end
+end
+
+pub struct CloseExpectation(T, D)
+  getter expected : T
+  getter delta : D
+
+  def initialize(@expected : T, @delta : D)
+  end
+
+  def match(actual_value) : Bool
+    diff = (actual_value - @expected).to_f
+    diff = 0.0 - diff if diff < 0.0
+    diff <= @delta.to_f
+  end
+
+  def failure_message(actual_value) : String
+    "Expected #{actual_value.inspect} to be within #{@delta} of #{@expected.inspect}"
+  end
+
+  def negative_failure_message(actual_value) : String
+    "Expected #{actual_value.inspect} not to be within #{@delta} of #{@expected.inspect}"
+  end
+end
+
+pub struct Be(T)
+  enum Relation
+    LessThan
+    LessOrEqual
+    GreaterThan
+    GreaterOrEqual
+  end
+
+  def self.<(other)
+    Be.new(other, Relation::LessThan)
+  end
+
+  def self.<=(other)
+    Be.new(other, Relation::LessOrEqual)
+  end
+
+  def self.>(other)
+    Be.new(other, Relation::GreaterThan)
+  end
+
+  def self.>=(other)
+    Be.new(other, Relation::GreaterOrEqual)
+  end
+
+  getter expected_value : T
+  getter op : Relation
+
+  def initialize(@expected_value : T, @op : Relation)
+  end
+
+  def match(actual_value) : Bool
+    case @op
+    when Relation::LessThan
+      actual_value < @expected_value
+    when Relation::LessOrEqual
+      actual_value <= @expected_value
+    when Relation::GreaterThan
+      actual_value > @expected_value
+    when Relation::GreaterOrEqual
+      actual_value >= @expected_value
+    else
+      false
+    end
+  end
+
+  def failure_message(actual_value) : String
+    op_str = case @op
+             when Relation::LessThan       then "<"
+             when Relation::LessOrEqual    then "<="
+             when Relation::GreaterThan    then ">"
+             when Relation::GreaterOrEqual then ">="
+             else                               "?"
+             end
+    "Expected #{actual_value.inspect} to be #{op_str} #{@expected_value.inspect}"
+  end
+
+  def negative_failure_message(actual_value) : String
+    op_str = case @op
+             when Relation::LessThan       then "<"
+             when Relation::LessOrEqual    then "<="
+             when Relation::GreaterThan    then ">"
+             when Relation::GreaterOrEqual then ">="
+             else                               "?"
+             end
+    "Expected #{actual_value.inspect} not to be #{op_str} #{@expected_value.inspect}"
+  end
+end
+
+pub struct MatchExpectation(T)
+  getter pattern : T
+
+  def initialize(@pattern : T)
+  end
+
+  def match(actual_value) : Bool
+    pat = @pattern
+    if pat.is_a?(Regex)
+      pat.match(actual_value.to_s) != nil
+    else
+      actual_value.to_s.includes?(pat.to_s)
+    end
+  end
+
+  def failure_message(actual_value) : String
+    "Expected: #{actual_value.inspect}\nto match: #{@pattern.inspect}"
+  end
+
+  def negative_failure_message(actual_value) : String
+    "Expected: #{actual_value.inspect}\nnot to match: #{@pattern.inspect}"
+  end
+end
+
+pub struct ContainExpectation(T)
+  getter expected : T
+
+  def initialize(@expected : T)
+  end
+
+  def match(actual_value) : Bool
+    actual_value.includes?(@expected)
+  end
+
+  def failure_message(actual_value) : String
+    "Expected:   #{actual_value.inspect}\nto include: #{@expected.inspect}"
+  end
+
+  def negative_failure_message(actual_value) : String
+    "Expected:   #{actual_value.inspect}\nnot to include: #{@expected.inspect}"
+  end
+end
+
+pub struct StartWithExpectation(T)
+  getter expected : T
+
+  def initialize(@expected : T)
+  end
+
+  def match(actual_value) : Bool
+    actual_value.to_s.starts_with?(@expected.to_s)
+  end
+
+  def failure_message(actual_value) : String
+    "Expected:   #{actual_value.inspect}\nto start with: #{@expected.inspect}"
+  end
+
+  def negative_failure_message(actual_value) : String
+    "Expected:   #{actual_value.inspect}\nnot to start with: #{@expected.inspect}"
+  end
+end
+
+pub struct EndWithExpectation(T)
+  getter expected : T
+
+  def initialize(@expected : T)
+  end
+
+  def match(actual_value) : Bool
+    actual_value.to_s.ends_with?(@expected.to_s)
+  end
+
+  def failure_message(actual_value) : String
+    "Expected:   #{actual_value.inspect}\nto end with: #{@expected.inspect}"
+  end
+
+  def negative_failure_message(actual_value) : String
+    "Expected:   #{actual_value.inspect}\nnot to end with: #{@expected.inspect}"
+  end
+end
+
+pub struct BeEmptyExpectation
+  def match(actual_value) : Bool
+    actual_value.empty?
+  end
+
+  def failure_message(actual_value) : String
+    "Expected: #{actual_value.inspect} to be empty"
+  end
+
+  def negative_failure_message(actual_value) : String
+    "Expected: #{actual_value.inspect} not to be empty"
+  end
+end
+
+pub struct BeAExpectation(T)
+  def match(actual_value) : Bool
+    actual_value.is_a?(T)
+  end
+
+  def failure_message(actual_value) : String
+    "Expected #{actual_value.inspect} (#{actual_value.class}) to be a #{T}"
+  end
+
+  def negative_failure_message(actual_value) : String
+    "Expected #{actual_value.inspect} (#{actual_value.class}) not to be a #{T}"
+  end
+end
+
+# -----------------------------------------------------------------------------
+# Expectations Module
+# -----------------------------------------------------------------------------
+
+module Expectations
+  def eq(value : T) : EqualExpectation(T) forall T
+    EqualExpectation(T).new(value)
+  end
+
+  def be(value : T) : BeExpectation(T) forall T
+    BeExpectation(T).new(value)
+  end
+
+  def be_true : EqualExpectation(Bool)
+    eq(true)
+  end
+
+  def be_false : EqualExpectation(Bool)
+    eq(false)
+  end
+
+  def be_truthy : BeTruthyExpectation
+    BeTruthyExpectation.new
+  end
+
+  def be_falsey : BeFalseyExpectation
+    BeFalseyExpectation.new
+  end
+
+  def be_nil : BeNilExpectation
+    BeNilExpectation.new
+  end
+
+  def be_close(expected : T, delta : D) : CloseExpectation(T, D) forall T, D
+    CloseExpectation(T, D).new(expected, delta)
+  end
+
+  def be : Be.class
+    Be
+  end
+
+  def match(value : T) : MatchExpectation(T) forall T
+    MatchExpectation(T).new(value)
+  end
+
+  def contain(expected : T) : ContainExpectation(T) forall T
+    ContainExpectation(T).new(expected)
+  end
+
+  def start_with(expected : T) : StartWithExpectation(T) forall T
+    StartWithExpectation(T).new(expected)
+  end
+
+  def end_with(expected : T) : EndWithExpectation(T) forall T
+    EndWithExpectation(T).new(expected)
+  end
+
+  def be_empty : BeEmptyExpectation
+    BeEmptyExpectation.new
+  end
+
+  macro be_a(type)
+    ::Std::Spec::BeAExpectation({{type}}).new
+  end
+
+  def expect_raises(expected_message : String? = nil, file : String = __FILE__, line : Int32 = __LINE__, &block : -> Nil) : Bool
+    panicked = false
+    msg = ""
+    group do |g|
+      t = g.spawn do
+        block.call
+        0
+      end
+      v = t.value
+      if v.is_a?(Panicked)
+        panicked = true
+        msg = v.message
+      end
+    end
+    unless panicked
+      fail("Expected exception but nothing was raised", file, line)
+      return false
+    end
+    if expected_message && !msg.includes?(expected_message)
+      fail("Expected exception with message containing #{expected_message.inspect}, got #{msg.inspect}", file, line)
+      return false
+    end
+    true
+  end
+end
+
+# -----------------------------------------------------------------------------
+# ObjectExtensions (should and should_not)
+# -----------------------------------------------------------------------------
+
+module ObjectExtensions
+  def should(expectation, failure_message : String? = nil, *, file : String = __FILE__, line : Int32 = __LINE__)
+    if expectation.match(self)
+      self
+    else
+      msg = failure_message || expectation.failure_message(self)
+      Spec.fail(msg, file, line)
+      self
+    end
+  end
+
+  def should_not(expectation, failure_message : String? = nil, *, file : String = __FILE__, line : Int32 = __LINE__)
+    if expectation.match(self)
+      msg = failure_message || expectation.negative_failure_message(self)
+      Spec.fail(msg, file, line)
+      self
+    else
+      self
+    end
+  end
+end
+
+class ::Object
+  include Std::Spec::ObjectExtensions
+end
+
+# -----------------------------------------------------------------------------
+# Formatters
+# -----------------------------------------------------------------------------
+
+pub abstract class Formatter
+  getter cli : CLI
+  getter io : IyiIO
+
+  def initialize(@cli : CLI, @io : IyiIO = cli.stdout)
+  end
+
+  def push(context : ExampleGroup) : Nil
+  end
+
+  def pop : Nil
+  end
+
+  def before_example(description : String) : Nil
+  end
+
+  def report(result : Result) : Nil
+  end
+
+  def finish(elapsed_time : Span, aborted : Bool) : Nil
+  end
+
+  def should_print_summary? : Bool
+    false
+  end
+end
+
+pub class DotFormatter < Formatter
+  @count : Int32
+  @split : Int32
+
+  def initialize(cli : CLI, io : IyiIO = cli.stdout)
+    super(cli, io)
+    @count = 0
+    @split = 0
+  end
+
+  def report(result : Result) : Nil
+    @io.print @cli.colorize(result.kind.letter.to_s, result.kind)
+    if @split > 0
+      @count = @count + 1
+      if @count >= @split
+        @io.puts ""
+        @count = 0
+      end
+    end
+  end
+
+  def finish(elapsed_time : Span, aborted : Bool) : Nil
+    @io.puts ""
+  end
+
+  def should_print_summary? : Bool
+    true
+  end
+end
+
+pub class VerboseFormatter < Formatter
+  class IndentItem
+    getter indent : Int32
+    getter description : String
+    @printed : Bool = false
+
+    def printed? : Bool
+      @printed
+    end
+
+    def printed=(@printed : Bool)
+    end
+
+    def initialize(@indent : Int32, @description : String)
+      @printed = false
+    end
+
+    def print(io : IyiIO) : Nil
+      return if @printed
+      @printed = true
+      @indent.times { io.print "  " }
+      io.puts @description
+    end
+  end
+
+  @indent : Int32
+  @last_description : String
+  @items : Array(IndentItem)
+
+  def initialize(cli : CLI, io : IyiIO = cli.stdout)
+    super(cli, io)
+    @indent = 0
+    @last_description = ""
+    @items = [] of IndentItem
+  end
+
+  def push(context : ExampleGroup) : Nil
+    @items << IndentItem.new(@indent, context.description)
+    @indent = @indent + 1
+  end
+
+  def pop : Nil
+    @items.pop if @items.size > 0
+    @indent = @indent - 1 if @indent > 0
+  end
+
+  def before_example(description : String) : Nil
+    @items.each { |item| item.print(@io) }
+    @last_description = description
+  end
+
+  def report(result : Result) : Nil
+    @indent.times { @io.print "  " }
+    @io.puts @cli.colorize(@last_description, result.kind)
+  end
+
+  def should_print_summary? : Bool
+    true
+  end
+end
+
+pub class TAPFormatter < Formatter
+  @counter : Int32
+
+  def initialize(cli : CLI, io : IyiIO = cli.stdout)
+    super(cli, io)
+    @counter = 0
+  end
+
+  def report(result : Result) : Nil
+    @counter = @counter + 1
+    status_str = case result.kind
+                 when Status::Success then "ok"
+                 when Status::Pending then "ok"
+                 else                      "not ok"
+                 end
+    pending_suffix = result.kind == Status::Pending ? " # SKIP" : ""
+    @io.puts "#{status_str} #{@counter} -#{pending_suffix} #{result.description}"
+  end
+
+  def finish(elapsed_time : Span, aborted : Bool) : Nil
+    @io.puts "1..#{@counter}"
+  end
+
+  def should_print_summary? : Bool
+    false
+  end
+end
+
+pub class JUnitFormatter < Formatter
+  @results : Array(Result)
+  @output_path : String
+
+  def initialize(cli : CLI, @output_path : String)
+    super(cli, cli.stdout)
+    @results = [] of Result
+  end
+
+  def report(result : Result) : Nil
+    @results << result
+  end
+
+  def finish(elapsed_time : Span, aborted : Bool) : Nil
+    failures = 0
+    errors = 0
+    skipped = 0
+
+    @results.each do |r|
+      case r.kind
+      when Status::Fail    then failures = failures + 1
+      when Status::Error   then errors = errors + 1
+      when Status::Pending then skipped = skipped + 1
+      end
+    end
+
+    buf = [] of String
+    buf << %(<?xml version="1.0"?>)
+    buf << %(<testsuite tests="#{@results.size}" skipped="#{skipped}" errors="#{errors}" failures="#{failures}" time="#{elapsed_time.total_seconds}">)
+
+    @results.each do |r|
+      sec = if el = r.elapsed
+              el.total_seconds
+            else
+              0.0
+            end
+      case r.kind
+      when Status::Success
+        buf << %(  <testcase file="#{escape_xml(r.file)}" name="#{escape_xml(r.description)}" line="#{r.line}" time="#{sec}"/>)
+      when Status::Pending
+        buf << %(  <testcase file="#{escape_xml(r.file)}" name="#{escape_xml(r.description)}" line="#{r.line}" time="#{sec}">)
+        buf << %(    <skipped/>)
+        buf << %(  </testcase>)
+      when Status::Fail
+        msg = if ex = r.exception
+                ex.message || "Assertion failed"
+              else
+                "Assertion failed"
+              end
+        buf << %(  <testcase file="#{escape_xml(r.file)}" name="#{escape_xml(r.description)}" line="#{r.line}" time="#{sec}">)
+        buf << %(    <failure message="#{escape_xml(msg)}"/>)
+        buf << %(  </testcase>)
+      when Status::Error
+        msg = if ex = r.exception
+                ex.message || "Error"
+              else
+                "Error"
+              end
+        buf << %(  <testcase file="#{escape_xml(r.file)}" name="#{escape_xml(r.description)}" line="#{r.line}" time="#{sec}">)
+        buf << %(    <error message="#{escape_xml(msg)}"/>)
+        buf << %(  </testcase>)
+      end
+    end
+
+    buf << %(</testsuite>)
+    xml_content = buf.join("\n") + "\n"
+
+    f = File.open(@output_path, "w")
+    f.print xml_content
+    f.close
+  end
+
+  private def escape_xml(str : String) : String
+    str.gsub("&", "&amp;").gsub("<", "&lt;").gsub(">", "&gt;").gsub("\"", "&quot;")
+  end
+end
+
+# -----------------------------------------------------------------------------
+# Spec CLI
+# -----------------------------------------------------------------------------
+
+pub class CLI
+  @color : Bool
+  @fail_fast : Bool
+  @focus : Bool
+  @dry_run : Bool
+  @list_tags : Bool
+  @aborted : Bool
+  @exit_after_run : Bool
+
+  property pattern : String?
+  property line : Int32?
+  property slowest : Int32?
+  property stdout : IyiIO
+  property stderr : IyiIO
+  @root_context : RootContext? = nil
+  @current_context : Context? = nil
+
+  def root_context : RootContext
+    if ctx = @root_context
+      ctx
+    else
+      raise "root_context not initialized"
+    end
+  end
+
+  def root_context=(@root_context : RootContext?)
+  end
+
+  def current_context : Context
+    if ctx = @current_context
+      ctx
+    else
+      raise "current_context not initialized"
+    end
+  end
+
+  def current_context=(@current_context : Context?)
+  end
+
+  property current_example : Example?
+  property formatters : Array(Formatter)
+  property locations : Hash(String, Array(Int32))
+  property tags : Set(String)
+  property anti_tags : Set(String)
+  property randomizer_seed : UInt64?
+  property randomizer : Random::PCG32?
+  property exit_code : Int32
+
+  def color? : Bool
+    @color
+  end
+
+  def color=(@color : Bool)
+  end
+
+  def fail_fast? : Bool
+    @fail_fast
+  end
+
+  def fail_fast=(@fail_fast : Bool)
+  end
+
+  def focus? : Bool
+    @focus
+  end
+
+  def focus=(@focus : Bool)
+  end
+
+  def dry_run? : Bool
+    @dry_run
+  end
+
+  def dry_run=(@dry_run : Bool)
+  end
+
+  def list_tags? : Bool
+    @list_tags
+  end
+
+  def list_tags=(@list_tags : Bool)
+  end
+
+  def aborted? : Bool
+    @aborted
+  end
+
+  def aborted=(@aborted : Bool)
+  end
+
+  def exit_after_run? : Bool
+    @exit_after_run
+  end
+
+  def exit_after_run=(@exit_after_run : Bool)
+  end
+
+  def initialize(@stdout : IyiIO = STDOUT, stderr : IyiIO? = nil)
+    @stderr = stderr || @stdout
+    @color = true
+    @fail_fast = false
+    @focus = false
+    @dry_run = false
+    @list_tags = false
+    @pattern = nil
+    @line = nil
+    @slowest = nil
+    @current_example = nil
+    @locations = {} of String => Array(Int32)
+    @tags = Set(String).new
+    @anti_tags = Set(String).new
+    @randomizer_seed = nil
+    @randomizer = nil
+    @aborted = false
+    @exit_code = 0
+    @exit_after_run = true
+    @formatters = [] of Formatter
+    @root_context = RootContext.new(self)
+    @current_context = @root_context
+    @formatters << DotFormatter.new(self, @stdout)
+  end
+
+  def set_focus(f : Bool) : Nil
+    @focus = f
+  end
+
+  def set_current_example(ex : Example?) : Nil
+    @current_example = ex
+  end
+
+  def add_location(file : String, line_num : Int32) : Nil
+    list = @locations[file]?
+    unless list
+      list = [] of Int32
+      @locations[file] = list
+    end
+    list << line_num
+  end
+
+  def add_tag(tag : String) : Nil
+    if tag.starts_with?("~")
+      @anti_tags.add(tag[1...tag.size])
+    else
+      @tags.add(tag)
+    end
+  end
+
+  def order=(mode : String | UInt64) : Nil
+    seed : UInt64? = nil
+    if mode.is_a?(UInt64)
+      seed = mode
+    elsif mode == "default"
+      seed = nil
+    elsif mode == "random"
+      # Generate random seed
+      now_ns = __iyi_monotonic_ns.to_u64
+      seed = (now_ns % 90000_u64) + 10000_u64
+    elsif parsed = mode.to_i64?
+      seed = parsed.to_u64
+    else
+      raise "Order must be either 'default', 'random', or a numeric seed value"
+    end
+
+    @randomizer_seed = seed
+    @randomizer = if s = seed
+                    Random::PCG32.new(s)
+                  else
+                    nil
+                  end
+  end
+
+  def override_default_formatter(formatter : Formatter) : Nil
+    if @formatters.empty?
+      @formatters << formatter
+    else
+      @formatters[0] = formatter
+    end
+  end
+
+  def add_formatter(formatter : Formatter) : Nil
+    @formatters << formatter
+  end
+
+  def configure_formatter(formatter_name : String, output_path : String? = nil) : Nil
+    case formatter_name
+    when "verbose"
+      override_default_formatter(VerboseFormatter.new(self, @stdout))
+    when "tap"
+      override_default_formatter(TAPFormatter.new(self, @stdout))
+    when "junit"
+      if output_path
+        add_formatter(JUnitFormatter.new(self, output_path))
+      end
+    end
+  end
+
+  def build_option_parser(without_p : Bool = false) : OptionParser
+    parser = OptionParser.new
+    parser.banner = "iyi spec runner"
+
+    parser.on("-e STRING", "--example STRING", "run examples whose full names include STRING") do |pat|
+      @pattern = pat
+    end
+
+    parser.on("-l LINE", "--line LINE", "run examples whose line matches LINE") do |l|
+      @line = l ? l.to_i? : nil
+    end
+
+    unless without_p
+      parser.on("-p", "--profile", "print the slowest specs") do
+        @slowest = 10
+      end
+    end
+
+    parser.on("--fail-fast", "abort run on first failure") do
+      @fail_fast = true
+    end
+
+    parser.on("--location FILE:LINE", "run example at line in file") do |loc|
+      if val = loc
+        idx = val.index(':')
+        if idx
+          file = val[0...idx]
+          line_num = val[(idx + 1)...val.size].to_i? || 0
+          add_location(file, line_num)
+        end
+      end
+    end
+
+    parser.on("--tag TAG", "run examples with tag (or ~TAG to exclude)") do |t|
+      add_tag(t) if t
+    end
+
+    parser.on("--list-tags", "list all tags used") do
+      @list_tags = true
+    end
+
+    parser.on("--order MODE", "run in random order or with specific seed") do |m|
+      self.order = m if m
+    end
+
+    parser.on("-v", "--verbose", "verbose output") do
+      configure_formatter("verbose")
+    end
+
+    parser.on("--tap", "TAP output") do
+      configure_formatter("tap")
+    end
+
+    parser.on("--junit_output PATH", "generate JUnit XML output") do |out_path|
+      configure_formatter("junit", out_path)
+    end
+
+    parser.on("--color", "enable ANSI color") do
+      @color = true
+    end
+
+    parser.on("--no-color", "disable ANSI color") do
+      @color = false
+    end
+
+    parser.on("--dry-run", "pass tests without execution") do
+      @dry_run = true
+    end
+
+    parser.on("-h", "--help", "show help") do
+      @stdout.puts parser.to_s
+    end
+
+    parser
+  end
+
+  def parse(args : Array(String)) : Array(String)
+    parser = build_option_parser
+    parser.parse(args)
+  end
+
+  def colorize(str : String, status : Status) : String
+    if @color
+      "\e[#{status.color_code}m#{str}\e[0m"
+    else
+      str
+    end
+  end
+
+  def colorize(str : String, kind : InfoKind) : String
+    if @color
+      "\e[#{kind.color_code}m#{str}\e[0m"
+    else
+      str
+    end
+  end
+
+  def abort_run : Nil
+    @aborted = true
+  end
+
+  def abort : Nil
+    @aborted = true
+  end
+
+  def run : Int32
+    start_ns = __iyi_monotonic_ns
+
+    if @list_tags
+      execute_list_tags
+      @exit_code = 0
+      return 0
+    end
+
+    execute_examples
+
+    elapsed_ns = __iyi_monotonic_ns - start_ns
+    elapsed_span = Span.nanoseconds(elapsed_ns)
+
+    root_context.finish(elapsed_span, @aborted)
+
+    succeeded = root_context.succeeded && !@aborted
+    @exit_code = succeeded ? 0 : 1
+    @exit_code
+  end
+
+  def execute_examples : Nil
+    if rnd = @randomizer
+      root_context.randomize(rnd)
+    end
+    run_filters
+    root_context.run
+  end
+
+  def execute_list_tags : Nil
+    run_filters
+    counts = {} of String => Int32
+    collect_tags(root_context, counts)
+    if counts.empty?
+      @stdout.puts "No tags found"
+      return
+    end
+    counts.each do |tag, count|
+      @stdout.puts "#{tag}: #{count}"
+    end
+  end
+
+  private def collect_tags(ctx : Context, counts : Hash(String, Int32)) : Nil
+    ctx.children.each do |child|
+      if child.is_a?(ExampleGroup)
+        if t = child.tags
+          t.each do |tag|
+            c = counts[tag]? || 0
+            counts[tag] = c + 1
+          end
+        end
+        collect_tags(child, counts)
+      elsif child.is_a?(Example)
+        if t = child.tags
+          t.each do |tag|
+            c = counts[tag]? || 0
+            counts[tag] = c + 1
+          end
+        else
+          c = counts["untagged"]? || 0
+          counts["untagged"] = c + 1
+        end
+      end
+    end
+  end
+
+  def run_filters : Nil
+    tag_filter = @tags.empty? ? nil : @tags
+    anti_filter = @anti_tags.empty? ? nil : @anti_tags
+    loc_filter = @locations.empty? ? nil : @locations
+    focus_filter = @focus ? true : nil
+    root_context.run_filters(@pattern, @line, loc_filter, nil, focus_filter, tag_filter, anti_filter)
+  end
+
+  def main(args : Array(String) = Program.args) : Int32
+    parse(args)
+    code = run
+    if @exit_after_run
+      __iyi_exit(code)
+    end
+    code
+  end
+
+  def self.run_file(file_path : String, args : Array(String) = [] of String) : Int32
+    cmd = "./bin/iyi run #{file_path}"
+    unless args.empty?
+      cmd = cmd + " -- " + args.join(" ")
+    end
+    raw = LibC.system(cmd.to_unsafe)
+    (raw >> 8) & 0xFF
+  end
+
+  def self.run_files(file_paths : Array(String), args : Array(String) = [] of String) : Int32
+    final_code = 0
+    file_paths.each do |path|
+      code = run_file(path, args)
+      if code != 0
+        final_code = code
+      end
+    end
+    final_code
+  end
+end
+
+# -----------------------------------------------------------------------------
+# Methods Module
+# -----------------------------------------------------------------------------
+
+module Methods
+  def describe(description : String = "", file : String = __FILE__, line : Int32 = __LINE__, end_line : Int32 = __LINE__, focus : Bool = false, tags : String | Array(String) | Set(String) | Nil = nil, &block : -> Nil) : Nil
+    tag_set = Spec.to_tag_set(tags)
+    Spec.cli.root_context.describe(description, file, line, end_line, focus, tag_set, &block)
+  end
+
+  def context(description : String = "", file : String = __FILE__, line : Int32 = __LINE__, end_line : Int32 = __LINE__, focus : Bool = false, tags : String | Array(String) | Set(String) | Nil = nil, &block : -> Nil) : Nil
+    describe(description, file, line, end_line, focus, tags, &block)
+  end
+
+  def it(description : String = "assert", file : String = __FILE__, line : Int32 = __LINE__, end_line : Int32 = __LINE__, focus : Bool = false, tags : String | Array(String) | Set(String) | Nil = nil, &block : -> Nil) : Nil
+    tag_set = Spec.to_tag_set(tags)
+    Spec.cli.root_context.it(description, file, line, end_line, focus, tag_set, &block)
+  end
+
+  def pending(description : String = "assert", file : String = __FILE__, line : Int32 = __LINE__, end_line : Int32 = __LINE__, focus : Bool = false, tags : String | Array(String) | Set(String) | Nil = nil, &block : -> Nil) : Nil
+    pending(description, file, line, end_line, focus, tags)
+  end
+
+  def pending(description : String = "assert", file : String = __FILE__, line : Int32 = __LINE__, end_line : Int32 = __LINE__, focus : Bool = false, tags : String | Array(String) | Set(String) | Nil = nil) : Nil
+    tag_set = Spec.to_tag_set(tags)
+    Spec.cli.root_context.pending(description, file, line, end_line, focus, tag_set)
+  end
+
+  def fail(msg : String, file : String = __FILE__, line : Int32 = __LINE__) : Nil
+    Spec.fail(msg, file, line)
+  end
+
+  def pending_example(msg : String = "Cannot run example", file : String = __FILE__, line : Int32 = __LINE__) : Nil
+    Spec.pending_example(msg, file, line)
+  end
+
+  def before_each(&block : -> Nil) : Nil
+    Spec.cli.current_context.before_each(&block)
+  end
+
+  def after_each(&block : -> Nil) : Nil
+    Spec.cli.current_context.after_each(&block)
+  end
+
+  def before_all(&block : -> Nil) : Nil
+    Spec.cli.current_context.before_all(&block)
+  end
+
+  def after_all(&block : -> Nil) : Nil
+    Spec.cli.current_context.after_all(&block)
+  end
+
+  def around_each(&block : Example::Procsy -> Nil) : Nil
+    Spec.cli.current_context.around_each(&block)
+  end
+
+  def around_all(&block : ExampleGroup::Procsy -> Nil) : Nil
+    Spec.cli.current_context.around_all(&block)
+  end
+end
+
+# -----------------------------------------------------------------------------
+# Top-level Spec Module Methods & Hooks
+# -----------------------------------------------------------------------------
+
+module Spec
+  include Expectations
+  extend Expectations
+  include Methods
+  extend Methods
+
+  @@cli : CLI? = nil
+  @@lines_cache = {} of String => Array(String)
+
+  def self.cli : CLI
+    if c = @@cli
+      c
+    else
+      c = CLI.new
+      @@cli = c
+      c
+    end
+  end
+
+  def self.reset : Nil
+    @@cli = CLI.new
+    Example.reset_example_counter
+  end
+
+  def self.fail(msg : String, file : String = "", line : Int32 = 0) : Nil
+    ex = AssertionFailed.new(msg, file, line)
+    if cur = self.cli.current_example
+      cur.record_failure(msg, file, line, ex)
+    else
+      raise msg, file, line
+    end
+  end
+
+  def self.pending_example(msg : String = "Cannot run example", file : String = "", line : Int32 = 0) : Nil
+    ex = ExamplePending.new(msg, file, line)
+    if cur = self.cli.current_example
+      cur.record_pending(msg, file, line, ex)
+    end
+  end
+
+  def self.before_each(&block : -> Nil) : Nil
+    self.cli.root_context.before_each(&block)
+  end
+
+  def self.after_each(&block : -> Nil) : Nil
+    self.cli.root_context.after_each(&block)
+  end
+
+  def self.before_suite(&block : -> Nil) : Nil
+    self.cli.root_context.before_all(&block)
+  end
+
+  def self.after_suite(&block : -> Nil) : Nil
+    self.cli.root_context.after_all(&block)
+  end
+
+  def self.around_each(&block : Example::Procsy -> Nil) : Nil
+    self.cli.root_context.around_each(&block)
+  end
+
+  def self.add_formatter(formatter : Formatter) : Nil
+    self.cli.add_formatter(formatter)
+  end
+
+  def self.override_default_formatter(formatter : Formatter) : Nil
+    self.cli.override_default_formatter(formatter)
+  end
+
+  def self.finish_run : Nil
+    self.cli.run
+  end
+
+  def self.run(args : Array(String) = Program.args, exit_after_run : Bool = true) : Int32
+    c = self.cli
+    c.exit_after_run = exit_after_run
+    c.main(args)
+  end
+
+  def self.run_file(file_path : String, args : Array(String) = [] of String) : Int32
+    CLI.run_file(file_path, args)
+  end
+
+  def self.run_files(file_paths : Array(String), args : Array(String) = [] of String) : Int32
+    CLI.run_files(file_paths, args)
+  end
+
+  def self.read_line(file : String, line : Int32) : String?
+    return nil if file.empty? || !File.exists?(file)
+    lines = @@lines_cache[file]?
+    unless lines
+      content = File.read(file)
+      lines = content.split('\n')
+      @@lines_cache[file] = lines
+    end
+    if line >= 1 && line <= lines.size
+      lines[line - 1]
+    else
+      nil
+    end
+  end
+
+  def self.to_human(span : Span) : String
+    total_ms = span.total_milliseconds
+    if total_ms < 1.0
+      return "#{(total_ms * 1000.0).round.to_i} microseconds"
+    end
+    total_sec = span.total_seconds
+    if total_sec < 1.0
+      return "#{total_ms.round(2)} milliseconds"
+    end
+    if total_sec < 60.0
+      return "#{total_sec.round(2)} seconds"
+    end
+    mins = span.minutes
+    secs = span.seconds
+    sec_str = secs < 10 ? "0#{secs}" : "#{secs}"
+    "#{mins}:#{sec_str} minutes"
+  end
+
+  def self.to_tag_set(tags : String | Array(String) | Set(String) | Nil) : Set(String)?
+    case tags
+    when String
+      s = Set(String).new
+      s.add(tags)
+      s
+    when Array(String)
+      s = Set(String).new
+      tags.each { |t| s.add(t) }
+      s
+    when Set(String)
+      tags
+    else
+      nil
+    end
+  end
+end
+
+alias ::Spec = Std::Spec::Spec
+
+# Public exports for `using std/spec::{...}`
+pub def describe(description : String = "", file : String = __FILE__, line : Int32 = __LINE__, end_line : Int32 = __LINE__, focus : Bool = false, tags : String | Array(String) | Set(String) | Nil = nil, &block : -> Nil) : Nil
+  Spec.describe(description, file, line, end_line, focus, tags, &block)
+end
+
+pub def context(description : String = "", file : String = __FILE__, line : Int32 = __LINE__, end_line : Int32 = __LINE__, focus : Bool = false, tags : String | Array(String) | Set(String) | Nil = nil, &block : -> Nil) : Nil
+  Spec.context(description, file, line, end_line, focus, tags, &block)
+end
+
+pub def it(description : String = "assert", file : String = __FILE__, line : Int32 = __LINE__, end_line : Int32 = __LINE__, focus : Bool = false, tags : String | Array(String) | Set(String) | Nil = nil, &block : -> Nil) : Nil
+  Spec.it(description, file, line, end_line, focus, tags, &block)
+end
+
+pub def pending(description : String = "assert", file : String = __FILE__, line : Int32 = __LINE__, end_line : Int32 = __LINE__, focus : Bool = false, tags : String | Array(String) | Set(String) | Nil = nil, &block : -> Nil) : Nil
+  Spec.pending(description, file, line, end_line, focus, tags, &block)
+end
+
+pub def pending(description : String = "assert", file : String = __FILE__, line : Int32 = __LINE__, end_line : Int32 = __LINE__, focus : Bool = false, tags : String | Array(String) | Set(String) | Nil = nil) : Nil
+  Spec.pending(description, file, line, end_line, focus, tags)
+end
+
+pub def fail(msg : String, file : String = __FILE__, line : Int32 = __LINE__) : Nil
+  Spec.fail(msg, file, line)
+end
+
+pub def pending_example(msg : String = "Cannot run example", file : String = __FILE__, line : Int32 = __LINE__) : Nil
+  Spec.pending_example(msg, file, line)
+end
+
+pub def before_each(&block : -> Nil) : Nil
+  Spec.before_each(&block)
+end
+
+pub def after_each(&block : -> Nil) : Nil
+  Spec.after_each(&block)
+end
+
+pub def before_all(&block : -> Nil) : Nil
+  Spec.before_suite(&block)
+end
+
+pub def after_all(&block : -> Nil) : Nil
+  Spec.after_suite(&block)
+end
+
+pub def around_each(&block : Example::Procsy -> Nil) : Nil
+  Spec.around_each(&block)
+end
+
+pub def around_all(&block : ExampleGroup::Procsy -> Nil) : Nil
+  Spec.around_all(&block)
+end
+
+pub def eq(value : T) : EqualExpectation(T) forall T
+  EqualExpectation(T).new(value)
+end
+
+pub def be(value : T) : BeExpectation(T) forall T
+  BeExpectation(T).new(value)
+end
+
+pub def be_true : EqualExpectation(Bool)
+  eq(true)
+end
+
+pub def be_false : EqualExpectation(Bool)
+  eq(false)
+end
+
+pub def be_truthy : BeTruthyExpectation
+  BeTruthyExpectation.new
+end
+
+pub def be_falsey : BeFalseyExpectation
+  BeFalseyExpectation.new
+end
+
+pub def be_nil : BeNilExpectation
+  BeNilExpectation.new
+end
+
+pub def be_close(expected : T, delta : D) : CloseExpectation(T, D) forall T, D
+  CloseExpectation(T, D).new(expected, delta)
+end
+
+pub def be : Be.class
+  Be
+end
+
+pub def match(value : T) : MatchExpectation(T) forall T
+  MatchExpectation(T).new(value)
+end
+
+pub def contain(expected : T) : ContainExpectation(T) forall T
+  ContainExpectation(T).new(expected)
+end
+
+pub def start_with(expected : T) : StartWithExpectation(T) forall T
+  StartWithExpectation(T).new(expected)
+end
+
+pub def end_with(expected : T) : EndWithExpectation(T) forall T
+  EndWithExpectation(T).new(expected)
+end
+
+pub def be_empty : BeEmptyExpectation
+  BeEmptyExpectation.new
+end
+
+pub def expect_raises(expected_message : String? = nil, file : String = __FILE__, line : Int32 = __LINE__, &block : -> Nil) : Bool
+  Spec.expect_raises(expected_message, file, line, &block)
+end
+
+pub macro be_a(type)
+  ::Std::Spec::BeAExpectation({{type}}).new
+end

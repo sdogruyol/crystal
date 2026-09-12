@@ -1,0 +1,66 @@
+# Every integer the prelude has, compared with itself.
+#
+# The prelude generates its comparison operators from one list of type names,
+# and four types were missing from it: Int8, Int16, UInt16 and UInt32. A
+# missing name does not fail to compile. It falls through to a comparison that
+# answers `false` for two values that are plainly equal, so `8_u16 == 8_u16`
+# was false and every check written on top of it quietly agreed. The security
+# library found it the hard way, comparing a Zip compression method.
+#
+# So this file compares each type against itself and against its neighbours,
+# and asserts the orderings too, because a type that answers `==` wrongly
+# usually answers `<` wrongly as well.
+
+def assert(cond : Bool, what : String) : Nil
+  unless cond
+    print "ASSERTION FAILED: "
+    print what
+    print "\n"
+    raise what
+  end
+end
+
+puts "== equality, every integer type against itself"
+
+assert(5_i8 == 5_i8, "Int8 equality")
+assert(5_i16 == 5_i16, "Int16 equality")
+assert(5 == 5, "Int32 equality")
+assert(5_i64 == 5_i64, "Int64 equality")
+assert(5_u8 == 5_u8, "UInt8 equality")
+assert(5_u16 == 5_u16, "UInt16 equality")
+assert(5_u32 == 5_u32, "UInt32 equality")
+assert(5_u64 == 5_u64, "UInt64 equality")
+puts "  eight integer types compare equal to themselves"
+
+puts "== inequality answers the other way"
+
+assert(5_i8 != 6_i8, "Int8 inequality")
+assert(5_i16 != 6_i16, "Int16 inequality")
+assert(5_u16 != 6_u16, "UInt16 inequality")
+assert(5_u32 != 6_u32, "UInt32 inequality")
+assert(!(5_u16 == 6_u16), "UInt16 unequal values are not equal")
+puts "  unequal values are reported unequal"
+
+puts "== ordering, on the types the list had dropped"
+
+assert(1_i8 < 2_i8, "Int8 less than")
+assert(2_i16 > 1_i16, "Int16 greater than")
+assert(1_u16 <= 1_u16, "UInt16 less or equal")
+assert(2_u32 >= 2_u32, "UInt32 greater or equal")
+assert(!(2_u16 < 1_u16), "UInt16 ordering is not inverted")
+puts "  orderings hold on Int8, Int16, UInt16 and UInt32"
+
+puts "== the widths still hold their own values"
+
+# A generated comparison that reached for the wrong width would answer these
+# wrongly rather than not compile, so the boundary values are the check.
+assert(255_u8 == 255_u8, "UInt8 holds its maximum")
+assert(65535_u16 == 65535_u16, "UInt16 holds its maximum")
+assert(4294967295_u32 == 4294967295_u32, "UInt32 holds its maximum")
+assert(127_i8 == 127_i8, "Int8 holds its maximum")
+assert(-128_i8 == -128_i8, "Int8 holds its minimum")
+assert(32767_i16 == 32767_i16, "Int16 holds its maximum")
+assert(-32768_i16 == -32768_i16, "Int16 holds its minimum")
+puts "  boundary values compare equal at every width"
+
+puts "all primitive comparison checks passed"

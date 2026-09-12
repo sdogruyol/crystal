@@ -1,0 +1,327 @@
+# Pretty printing library for iyi.
+#
+# Implements line breaks and indentation for structured data.
+
+module std/pretty_print
+
+import std/text
+
+class ::Array(T)
+  def delete_at(index : Int32) : T
+    asked = index
+    index = @size + index if index < 0
+    raise "index #{asked} out of range for #{@size} elements" if index < 0 || index >= @size
+    elem = @buffer[index]
+    at = index
+    while at < @size - 1
+      @buffer[at] = @buffer[at + 1]
+      at += 1
+    end
+    @size -= 1
+    elem
+  end
+
+  def clear : Nil
+    @size = 0
+  end
+end
+
+class ::PrettyPrint
+  protected getter group_queue : GroupQueue
+  protected getter newline : String
+  protected getter indent : Int32
+
+  abstract class Item
+    abstract def width : Int32
+    abstract def output(io, output_width : Int32) : Int32
+  end
+
+  class Text < Item
+    getter width : Int32
+    @objs : Array(String)
+
+    def initialize
+      @objs = [] of String
+      @width = 0
+    end
+
+    def output(io, output_width : Int32) : Int32
+      @objs.each { |obj| io.print(obj) }
+      output_width + @width
+    end
+
+    def add(obj : String, width : Int32) : Nil
+      @objs << obj
+      @width += width
+    end
+  end
+
+  class Breakable < Item
+    @indent : Int32
+    @group : Group
+    getter width : Int32
+    @obj : String
+    @pp : PrettyPrint
+
+    def initialize(@obj : String, @width : Int32, @pp : PrettyPrint)
+      @indent = @pp.indent
+      @group = @pp.current_group
+      @group.breakables << self
+    end
+
+    def output(io, output_width : Int32) : Int32
+      @group.breakables.shift
+      if @group.break?
+        io.print(@pp.newline)
+        i = 0
+        while i < @indent
+          io.print(" ")
+          i += 1
+        end
+        @indent
+      else
+        @pp.group_queue.delete(@group) if @group.breakables.empty?
+        io.print(@obj)
+        output_width + @width
+      end
+    end
+  end
+
+  class Group
+    getter depth : Int32
+    getter breakables : Array(Breakable)
+
+    def break? : Bool
+      @break
+    end
+
+    def initialize(@depth : Int32)
+      @breakables = [] of Breakable
+      @break = false
+    end
+
+    def break : Nil
+      @break = true
+    end
+  end
+
+  class GroupQueue
+    def initialize
+      @queue = [] of Array(Group)
+    end
+
+    def enq(group : Group) : Nil
+      depth = group.depth
+      while depth >= @queue.size
+        @queue << [] of Group
+      end
+      @queue[depth] << group
+    end
+
+    def deq : Group?
+      @queue.each do |gs|
+        i = gs.size - 1
+        while i >= 0
+          unless gs[i].breakables.empty?
+            group = gs.delete_at(i)
+            group.break
+            return group
+          end
+          i -= 1
+        end
+        gs.each &.break
+        gs.clear
+      end
+      nil
+    end
+
+    def delete(group : Group) : Nil
+      if group.depth < @queue.size
+        @queue[group.depth].delete(group)
+      end
+    end
+  end
+
+  @output : String::Builder | IyiIO
+  @output_width : Int32
+  @buffer_width : Int32
+  @buffer : Array(Item)
+  @group_stack : Array(Group)
+
+  def initialize(@output : String::Builder | IyiIO, @maxwidth : Int32 = 79, @newline : String = "\n", @indent : Int32 = 0)
+    @output_width = @indent
+    @buffer_width = 0
+    @buffer = [] of Item
+
+    root_group = Group.new(0)
+    @group_stack = [] of Group
+    @group_stack << root_group
+
+    @group_queue = GroupQueue.new
+    @group_queue.enq(root_group)
+  end
+
+  protected def current_group : Group
+    @group_stack.last
+  end
+
+  protected def break_outmost_groups : Nil
+    while @maxwidth < @output_width + @buffer_width
+      group = @group_queue.deq
+      return unless group
+
+      until group.breakables.empty?
+        data = @buffer.shift
+        @output_width = data.output(@output, @output_width)
+        @buffer_width -= data.width
+      end
+
+      while !@buffer.empty? && @buffer.first.is_a?(Text)
+        text = @buffer.shift.as(Text)
+        @output_width = text.output(@output, @output_width)
+        @buffer_width -= text.width
+      end
+    end
+  end
+
+  def text(obj) : Nil
+    str = obj.to_s
+    width = str.size
+    return if width == 0
+
+    if @buffer.empty?
+      @output.print(str)
+      @output_width += width
+    else
+      last_item = @buffer.last
+      text_item = last_item.is_a?(Text) ? last_item.as(Text) : nil
+      unless text_item
+        text_item = Text.new
+        @buffer << text_item
+      end
+      text_item.add(str, width)
+      @buffer_width += width
+      break_outmost_groups
+    end
+  end
+
+  def breakable(sep : String = " ") : Nil
+    width = sep.size
+    group = @group_stack.last
+    if group.break?
+      flush
+      @output.print(@newline)
+      i = 0
+      while i < @indent
+        @output.print(" ")
+        i += 1
+      end
+      @output_width = @indent
+      @buffer_width = 0
+    else
+      @buffer << Breakable.new(sep, width, self)
+      @buffer_width += width
+      break_outmost_groups
+    end
+  end
+
+  def fill_breakable(sep : String = " ") : Nil
+    group { breakable(sep) }
+  end
+
+  def group(indent : Int32 = 0, open_obj : String = "", close_obj : String = "", &block) : Nil
+    text(open_obj)
+    group_sub do
+      nest(indent) do
+        yield
+      end
+    end
+    text(close_obj)
+  end
+
+  def group_sub(&block) : Nil
+    group = Group.new(@group_stack.last.depth + 1)
+    @group_stack << group
+    @group_queue.enq(group)
+    yield
+    @group_stack.pop
+    if group.breakables.empty?
+      @group_queue.delete(group)
+    end
+  end
+
+  def nest(indent : Int32 = 1, &block) : Nil
+    @indent += indent
+    yield
+    @indent -= indent
+  end
+
+  def comma : Nil
+    text(",")
+    breakable(" ")
+  end
+
+  def surround(left : String, right : String, left_break : String = "", right_break : String = "", &block) : Nil
+    group(1, left, right) do
+      breakable(left_break) unless left_break.empty?
+      yield
+      breakable(right_break) unless right_break.empty?
+    end
+  end
+
+  def list(left : String, elements, right : String, &block) : Nil
+    group(1, left, right) do
+      i = 0
+      elements.each do |elem|
+        comma if i > 0
+        yield elem
+        i += 1
+      end
+    end
+  end
+
+  def list(left : String, elements, right : String) : Nil
+    list(left, elements, right) do |elem|
+      elem.pretty_print(self)
+    end
+  end
+
+  def flush : Nil
+    @buffer.each do |data|
+      @output_width = data.output(@output, @output_width)
+    end
+    @buffer.clear
+    @buffer_width = 0
+  end
+
+  def self.format(obj, io : String::Builder | IyiIO, width : Int32 = 79, newline : String = "\n", indent : Int32 = 0)
+    format(io, width, newline, indent) do |printer|
+      obj.pretty_print(printer)
+    end
+  end
+
+  def self.format(io : String::Builder | IyiIO, width : Int32 = 79, newline : String = "\n", indent : Int32 = 0, &block : PrettyPrint -> Nil)
+    printer = PrettyPrint.new(io, width, newline, indent)
+    yield printer
+    printer.flush
+    io
+  end
+end
+
+class ::Object
+  def pretty_print(pp : PrettyPrint) : Nil
+    pp.text(inspect)
+  end
+
+  def pretty_inspect(width : Int32 = 79, newline : String = "\n", indent : Int32 = 0) : String
+    String.build do |io|
+      PrettyPrint.format(self, io, width, newline, indent)
+    end
+  end
+end
+
+def pp(object)
+  print object.pretty_inspect
+  puts
+  object
+end

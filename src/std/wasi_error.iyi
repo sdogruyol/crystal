@@ -1,0 +1,269 @@
+# WasiError represents WASI preview 1 error codes.
+
+module std/wasi_error
+
+pub import std/errno
+using std/errno::{Errno}
+
+struct ::UInt16
+  @[Primitive(:convert)]
+  def to_i32 : Int32
+  end
+
+  @[Primitive(:convert)]
+  def to_u64 : UInt64
+  end
+
+  @[Primitive(:binary)]
+  def ==(other : UInt16) : Bool
+  end
+
+  @[Primitive(:binary)]
+  def !=(other : UInt16) : Bool
+  end
+end
+
+pub enum WasiError : UInt16
+  SUCCESS         =  0
+  E2BIG           =  1
+  EACCES          =  2
+  EADDRINUSE      =  3
+  EADDRNOTAVAIL   =  4
+  EAFNOSUPPORT    =  5
+  EAGAIN          =  6
+  EALREADY        =  7
+  EBADF           =  8
+  EBADMSG         =  9
+  EBUSY           = 10
+  ECANCELED       = 11
+  ECHILD          = 12
+  ECONNABORTED    = 13
+  ECONNREFUSED    = 14
+  ECONNRESET      = 15
+  EDEADLK         = 16
+  EDESTADDRREQ    = 17
+  EDOM            = 18
+  EDQUOT          = 19
+  EEXIST          = 20
+  EFAULT          = 21
+  EFBIG           = 22
+  EHOSTUNREACH    = 23
+  EIDRM           = 24
+  EILSEQ          = 25
+  EINPROGRESS     = 26
+  EINTR           = 27
+  EINVAL          = 28
+  EIO             = 29
+  EISCONN         = 30
+  EISDIR          = 31
+  ELOOP           = 32
+  EMFILE          = 33
+  EMLINK          = 34
+  EMSGSIZE        = 35
+  EMULTIHOP       = 36
+  ENAMETOOLONG    = 37
+  ENETDOWN        = 38
+  ENETRESET       = 39
+  ENETUNREACH     = 40
+  ENFILE          = 41
+  ENOBUFS         = 42
+  ENODEV          = 43
+  ENOENT          = 44
+  ENOEXEC         = 45
+  ENOLCK          = 46
+  ENOLINK         = 47
+  ENOMEM          = 48
+  ENOMSG          = 49
+  ENOPROTOOPT     = 50
+  ENOSPC          = 51
+  ENOSYS          = 52
+  ENOTCONN        = 53
+  ENOTDIR         = 54
+  ENOTEMPTY       = 55
+  ENOTRECOVERABLE = 56
+  ENOTSOCK        = 57
+  ENOTSUP         = 58
+  ENOTTY          = 59
+  ENXIO           = 60
+  EOVERFLOW       = 61
+  EOWNERDEAD      = 62
+  EPERM           = 63
+  EPIPE           = 64
+  EPROTO          = 65
+  EPROTONOSUPPORT = 66
+  EPROTOTYPE      = 67
+  ERANGE          = 68
+  EROFS           = 69
+  ESPIPE          = 70
+  ESRCH           = 71
+  ESTALE          = 72
+  ETIMEDOUT       = 73
+  ETXTBSY         = 74
+  EXDEV           = 75
+  ENOTCAPABLE     = 76
+
+  def message : String
+    case self
+    when SUCCESS         then "No error occurred. System call completed successfully."
+    when E2BIG           then "Argument list too long."
+    when EACCES          then "Permission denied."
+    when EADDRINUSE      then "Address in use."
+    when EADDRNOTAVAIL   then "Address not available."
+    when EAFNOSUPPORT    then "Address family not supported."
+    when EAGAIN          then "Resource unavailable, or operation would block."
+    when EALREADY        then "Connection already in progress."
+    when EBADF           then "Bad file descriptor."
+    when EBADMSG         then "Bad message."
+    when EBUSY           then "Device or resource busy."
+    when ECANCELED       then "Operation canceled."
+    when ECHILD          then "No child processes."
+    when ECONNABORTED    then "Connection aborted."
+    when ECONNREFUSED    then "Connection refused."
+    when ECONNRESET      then "Connection reset."
+    when EDEADLK         then "Resource deadlock would occur."
+    when EDESTADDRREQ    then "Destination address required."
+    when EDOM            then "Mathematics argument out of domain of function."
+    when EDQUOT          then "Reserved."
+    when EEXIST          then "File exists."
+    when EFAULT          then "Bad address."
+    when EFBIG           then "File too large."
+    when EHOSTUNREACH    then "Host is unreachable."
+    when EIDRM           then "Identifier removed."
+    when EILSEQ          then "Illegal byte sequence."
+    when EINPROGRESS     then "Operation in progress."
+    when EINTR           then "Interrupted function."
+    when EINVAL          then "Invalid argument."
+    when EIO             then "I/O error."
+    when EISCONN         then "Socket is connected."
+    when EISDIR          then "Is a directory."
+    when ELOOP           then "Too many levels of symbolic links."
+    when EMFILE          then "File descriptor value too large."
+    when EMLINK          then "Too many links."
+    when EMSGSIZE        then "Message too large."
+    when EMULTIHOP       then "Reserved."
+    when ENAMETOOLONG    then "Filename too long."
+    when ENETDOWN        then "Network is down."
+    when ENETRESET       then "Connection aborted by network."
+    when ENETUNREACH     then "Network unreachable."
+    when ENFILE          then "Too many files open in system."
+    when ENOBUFS         then "No buffer space available."
+    when ENODEV          then "No such device."
+    when ENOENT          then "No such file or directory."
+    when ENOEXEC         then "Executable file format error."
+    when ENOLCK          then "No locks available."
+    when ENOLINK         then "Reserved."
+    when ENOMEM          then "Not enough space."
+    when ENOMSG          then "No message of the desired type."
+    when ENOPROTOOPT     then "Protocol not available."
+    when ENOSPC          then "No space left on device."
+    when ENOSYS          then "Function not supported."
+    when ENOTCONN        then "The socket is not connected."
+    when ENOTDIR         then "Not a directory or a symbolic link to a directory."
+    when ENOTEMPTY       then "Directory not empty."
+    when ENOTRECOVERABLE then "State not recoverable."
+    when ENOTSOCK        then "Not a socket."
+    when ENOTSUP         then "Not supported, or operation not supported on socket."
+    when ENOTTY          then "Inappropriate I/O control operation."
+    when ENXIO           then "No such device or address."
+    when EOVERFLOW       then "Value too large to be stored in data type."
+    when EOWNERDEAD      then "Previous owner died."
+    when EPERM           then "Operation not permitted."
+    when EPIPE           then "Broken pipe."
+    when EPROTO          then "Protocol error."
+    when EPROTONOSUPPORT then "Protocol not supported."
+    when EPROTOTYPE      then "Protocol wrong type for socket."
+    when ERANGE          then "Result too large."
+    when EROFS           then "Read-only file system."
+    when ESPIPE          then "Invalid seek."
+    when ESRCH           then "No such process."
+    when ESTALE          then "Reserved."
+    when ETIMEDOUT       then "Connection timed out."
+    when ETXTBSY         then "Text file busy."
+    when EXDEV           then "Cross-device link."
+    when ENOTCAPABLE     then "Extension: Capabilities insufficient."
+    else                      "Unknown error."
+    end
+  end
+
+  def to_errno : Errno
+    case self
+    when SUCCESS         then Errno::NONE
+    when E2BIG           then Errno::E2BIG
+    when EACCES          then Errno::EACCES
+    when EADDRINUSE      then Errno::EADDRINUSE
+    when EADDRNOTAVAIL   then Errno::EADDRNOTAVAIL
+    when EAFNOSUPPORT    then Errno::EAFNOSUPPORT
+    when EAGAIN          then Errno::EAGAIN
+    when EALREADY        then Errno::EALREADY
+    when EBADF           then Errno::EBADF
+    when EBADMSG         then Errno::EBADMSG
+    when EBUSY           then Errno::EBUSY
+    when ECANCELED       then Errno::ECANCELED
+    when ECHILD          then Errno::ECHILD
+    when ECONNABORTED    then Errno::ECONNABORTED
+    when ECONNREFUSED    then Errno::ECONNREFUSED
+    when ECONNRESET      then Errno::ECONNRESET
+    when EDEADLK         then Errno::EDEADLK
+    when EDESTADDRREQ    then Errno::EDESTADDRREQ
+    when EDOM            then Errno::EDOM
+    when EDQUOT          then Errno::EDQUOT
+    when EEXIST          then Errno::EEXIST
+    when EFAULT          then Errno::EFAULT
+    when EFBIG           then Errno::EFBIG
+    when EHOSTUNREACH    then Errno::EHOSTUNREACH
+    when EIDRM           then Errno::EIDRM
+    when EILSEQ          then Errno::EILSEQ
+    when EINPROGRESS     then Errno::EINPROGRESS
+    when EINTR           then Errno::EINTR
+    when EINVAL          then Errno::EINVAL
+    when EIO             then Errno::EIO
+    when EISCONN         then Errno::EISCONN
+    when EISDIR          then Errno::EISDIR
+    when ELOOP           then Errno::ELOOP
+    when EMFILE          then Errno::EMFILE
+    when EMLINK          then Errno::EMLINK
+    when EMSGSIZE        then Errno::EMSGSIZE
+    when EMULTIHOP       then Errno::EMULTIHOP
+    when ENAMETOOLONG    then Errno::ENAMETOOLONG
+    when ENETDOWN        then Errno::ENETDOWN
+    when ENETRESET       then Errno::ENETRESET
+    when ENETUNREACH     then Errno::ENETUNREACH
+    when ENFILE          then Errno::ENFILE
+    when ENOBUFS         then Errno::ENOBUFS
+    when ENODEV          then Errno::ENODEV
+    when ENOENT          then Errno::ENOENT
+    when ENOEXEC         then Errno::ENOEXEC
+    when ENOLCK          then Errno::ENOLCK
+    when ENOLINK         then Errno::ENOLINK
+    when ENOMEM          then Errno::ENOMEM
+    when ENOMSG          then Errno::ENOMSG
+    when ENOPROTOOPT     then Errno::ENOPROTOOPT
+    when ENOSPC          then Errno::ENOSPC
+    when ENOSYS          then Errno::ENOSYS
+    when ENOTCONN        then Errno::ENOTCONN
+    when ENOTDIR         then Errno::ENOTDIR
+    when ENOTEMPTY       then Errno::ENOTEMPTY
+    when ENOTRECOVERABLE then Errno::ENOTRECOVERABLE
+    when ENOTSOCK        then Errno::ENOTSOCK
+    when ENOTSUP         then Errno::EOPNOTSUPP
+    when ENOTTY          then Errno::ENOTTY
+    when ENXIO           then Errno::ENXIO
+    when EOVERFLOW       then Errno::EOVERFLOW
+    when EOWNERDEAD      then Errno::EOWNERDEAD
+    when EPERM           then Errno::EPERM
+    when EPIPE           then Errno::EPIPE
+    when EPROTO          then Errno::EPROTO
+    when EPROTONOSUPPORT then Errno::EPROTONOSUPPORT
+    when EPROTOTYPE      then Errno::EPROTOTYPE
+    when ERANGE          then Errno::ERANGE
+    when EROFS           then Errno::EROFS
+    when ESPIPE          then Errno::ESPIPE
+    when ESRCH           then Errno::ESRCH
+    when ESTALE          then Errno::ESTALE
+    when ETIMEDOUT       then Errno::ETIMEDOUT
+    when ETXTBSY         then Errno::ETXTBSY
+    when EXDEV           then Errno::EXDEV
+    else                      Errno::EINVAL
+    end
+  end
+end

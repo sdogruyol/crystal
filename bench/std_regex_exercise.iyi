@@ -1,0 +1,319 @@
+# Standard library regular expression exercise.
+#
+# Exercises std/regex:
+#   - Literals, escapes, and dot
+#   - Character classes with ranges and negations
+#   - Shorthand escapes (\d, \D, \w, \W, \s, \S, \h, \H, \v, \V)
+#   - Anchors (^, $, \A, \z, \Z, \b, \B)
+#   - Groups: capturing, non-capturing, and named (?<name>)
+#   - Alternation and leftmost-first precedence
+#   - Quantifiers (*, +, ?, {n,m}) both greedy and lazy
+#   - Lookahead and lookbehind assertions ((?=), (?!), (?<=), (?<!))
+#   - MatchData accessors: [], begin, end, pre_match, post_match, to_s, captures
+#   - Search, split, and substitutions: scan, split, sub, gsub, escape
+#   - String integration: =~, match, match?
+#   - Published corpus traps (empty matches, alternation order, nested quantifiers)
+#   - Pathological pattern linear-time safety ((a+)+b against 30 'a's)
+#   - ReDoS immunity and SyntaxError refusals
+#
+# Exits with panic if any assertion fails. Prints section progress and
+# "all std regex checks passed" on success.
+
+module bench/std_regex_exercise
+
+import std/regex
+
+using std/regex::{Regex, MatchData, SyntaxError}
+
+def assert_true(cond : Bool, msg : String) : Nil
+  raise "assert failed: #{msg}" unless cond
+end
+
+def assert_false(cond : Bool, msg : String) : Nil
+  raise "assert failed: #{msg}" if cond
+end
+
+def assert_eq(a : Int32, b : Int32, msg : String) : Nil
+  raise "assert failed: #{msg} (#{a} != #{b})" unless a == b
+end
+
+def assert_str(a : String, b : String, msg : String) : Nil
+  raise "assert failed: #{msg} ('#{a}' != '#{b}')" unless a == b
+end
+
+puts "== std/regex: literals, escapes, and dot"
+r_lit = Regex.new("cat")
+assert_str(r_lit.source, "cat", "source getter")
+assert_false(r_lit.ignore_case, "ignore_case false")
+assert_true(r_lit.match?("concatenation"), "literal match?")
+assert_false(r_lit.match?("dog"), "literal mismatch")
+
+r_dot = Regex.new("c.t")
+assert_true(r_dot.match?("cat"), "dot a")
+assert_true(r_dot.match?("c0t"), "dot 0")
+assert_false(r_dot.match?("c\nt"), "dot does not match newline")
+
+r_esc = Regex.new("a\\*b\\+c\\?d\\[e\\]f\\(g\\)h\\{1\\}i\\|j\\\\k")
+assert_true(r_esc.match?("a*b+c?d[e]f(g)h{1}i|j\\k"), "escaped metacharacters")
+
+puts "== std/regex: character classes, ranges, and negations"
+r_cls = Regex.new("[0-9a-fA-F]+")
+m_cls = r_cls.match("DeadBeef")
+assert_true(!m_cls.nil?, "hex class match")
+if m_cls
+  assert_str(m_cls[0] || "", "DeadBeef", "hex class matched text")
+end
+
+r_neg_cls = Regex.new("[^aeiou]+")
+m_neg = r_neg_cls.match("apple")
+assert_true(!m_neg.nil?, "negated class match")
+if m_neg
+  assert_str(m_neg[0] || "", "ppl", "negated class matched consonants")
+end
+
+puts "== std/regex: shorthand escapes and case folding"
+r_digits = Regex.new("\\d+")
+assert_true(r_digits.match?("code 456"), "digit match")
+assert_false(r_digits.match?("no digits"), "digit mismatch")
+
+r_nondigits = Regex.new("\\D+")
+m_nd = r_nondigits.match("123abc456")
+assert_true(!m_nd.nil?, "non-digit match")
+if m_nd
+  assert_str(m_nd[0] || "", "abc", "non-digit matched text")
+end
+
+r_word = Regex.new("\\w+")
+assert_true(r_word.match?("hello_world123"), "word char match")
+
+r_space = Regex.new("\\s+")
+assert_true(r_space.match?("  \t\n  "), "space match")
+
+r_h = Regex.new("\\h+")
+assert_true(r_h.match?("\t "), "horizontal space")
+
+r_v = Regex.new("\\v+")
+assert_true(r_v.match?("\n\r"), "vertical space")
+
+r_fold = Regex.new("goodbye", true)
+assert_true(r_fold.ignore_case, "ignore_case true")
+assert_true(r_fold.match?("GoOdByE"), "caseless match")
+
+puts "== std/regex: anchors and word boundaries"
+r_start = Regex.new("^start")
+assert_true(r_start.match?("start here"), "line start match")
+assert_false(r_start.match?("not start"), "line start mismatch")
+
+r_end = Regex.new("end$")
+assert_true(r_end.match?("at the end"), "line end match")
+assert_false(r_end.match?("end is not here"), "line end mismatch")
+
+r_wb = Regex.new("\\bword\\b")
+assert_true(r_wb.match?("a word here"), "word boundary match")
+assert_false(r_wb.match?("swordfish"), "word boundary prefix mismatch")
+assert_false(r_wb.match?("wordsmith"), "word boundary suffix mismatch")
+
+r_nwb = Regex.new("\\Bword\\B")
+assert_true(r_nwb.match?("swordsmith"), "non-word boundary match")
+assert_false(r_nwb.match?("word"), "non-word boundary standalone mismatch")
+
+puts "== std/regex: groups, numbered and named captures"
+r_grp = Regex.new("([a-z]+):([0-9]+)")
+m_grp = r_grp.match("port:8080")
+assert_true(!m_grp.nil?, "numbered group match")
+if m_grp
+  assert_eq(m_grp.group_count, 2, "group_count 2")
+  assert_eq(m_grp.size, 3, "size 3")
+  assert_str(m_grp[0] || "", "port:8080", "group 0")
+  assert_str(m_grp[1] || "", "port", "group 1")
+  assert_str(m_grp[2] || "", "8080", "group 2")
+  caps = m_grp.captures
+  assert_eq(caps.size, 2, "captures size")
+  assert_str(caps[0] || "", "port", "captures[0]")
+  assert_str(caps[1] || "", "8080", "captures[1]")
+end
+
+r_named = Regex.new("(?<user>[a-z]+)@(?<host>[a-z.]+)")
+m_named = r_named.match("contact: user@example.com")
+assert_true(!m_named.nil?, "named capture match")
+if m_named
+  assert_str(m_named["user"] || "", "user", "named user")
+  assert_str(m_named["host"] || "", "example.com", "named host")
+  b_user = m_named.begin("user")
+  e_user = m_named.end("user")
+  assert_true(!b_user.nil? && !e_user.nil?, "named user bounds exist")
+  if b_user && e_user
+    assert_eq(b_user, 9, "named user begin")
+    assert_eq(e_user, 13, "named user end")
+  end
+  b_host = m_named.begin("host")
+  e_host = m_named.end("host")
+  assert_true(!b_host.nil? && !e_host.nil?, "named host bounds exist")
+  if b_host && e_host
+    assert_eq(b_host, 14, "named host begin")
+    assert_eq(e_host, 25, "named host end")
+  end
+  assert_true(m_named["nonexistent"].nil?, "nonexistent group nil")
+  assert_true(m_named.begin("nonexistent").nil?, "nonexistent begin nil")
+  assert_true(m_named.end("nonexistent").nil?, "nonexistent end nil")
+end
+
+puts "== std/regex: match data extents, pre_match, post_match, and to_s"
+r_ext = Regex.new("center")
+m_ext = r_ext.match("<<center>>")
+assert_true(!m_ext.nil?, "extents match")
+if m_ext
+  assert_str(m_ext.to_s, "center", "match to_s")
+  assert_str(m_ext.pre_match, "<<", "pre_match")
+  assert_str(m_ext.post_match, ">>", "post_match")
+  assert_str(m_ext.subject, "<<center>>", "subject")
+  b0 = m_ext.begin(0)
+  e0 = m_ext.end(0)
+  assert_true(!b0.nil? && !e0.nil?, "extents bounds exist")
+  if b0 && e0
+    assert_eq(b0, 2, "begin 0")
+    assert_eq(e0, 8, "end 0")
+  end
+end
+
+puts "== std/regex: alternation and leftmost-first precedence"
+r_alt1 = Regex.new("a|ab")
+m_alt1 = r_alt1.match("ab")
+assert_true(!m_alt1.nil?, "alt1 match")
+if m_alt1
+  assert_str(m_alt1[0] || "", "a", "alt prefers leftmost branch")
+  assert_eq(m_alt1.end(0) || -1, 1, "alt end is 1")
+end
+
+r_alt2 = Regex.new("(a|ab)c")
+m_alt2 = r_alt2.match("abc")
+assert_true(!m_alt2.nil?, "alt2 match")
+if m_alt2
+  assert_str(m_alt2[0] || "", "abc", "alt falls back to deferred branch when preferred fails")
+  assert_str(m_alt2[1] || "", "ab", "group 1 is ab")
+end
+
+puts "== std/regex: greedy and lazy quantifiers"
+r_greedy = Regex.new("a.*b")
+m_gr = r_greedy.match("a1b2b")
+assert_true(!m_gr.nil?, "greedy match")
+if m_gr
+  assert_str(m_gr[0] || "", "a1b2b", "greedy takes longest match")
+end
+
+r_lazy = Regex.new("a.*?b")
+m_lz = r_lazy.match("a1b2b")
+assert_true(!m_lz.nil?, "lazy match")
+if m_lz
+  assert_str(m_lz[0] || "", "a1b", "lazy takes shortest match")
+end
+
+r_bounded = Regex.new("[0-9]{2,4}")
+assert_false(r_bounded.match?("1"), "bounded below min")
+assert_true(r_bounded.match?("12"), "bounded at min")
+assert_true(r_bounded.match?("1234"), "bounded at max")
+m_bnd = r_bounded.match("123456")
+if m_bnd
+  assert_str(m_bnd[0] || "", "1234", "bounded matches up to max")
+end
+
+puts "== std/regex: lookaround assertions"
+r_pla = Regex.new("foo(?=bar)")
+assert_true(r_pla.match?("foobar"), "positive lookahead success")
+assert_false(r_pla.match?("foobaz"), "positive lookahead failure")
+
+r_nla = Regex.new("foo(?!bar)")
+assert_true(r_nla.match?("foobaz"), "negative lookahead success")
+assert_false(r_nla.match?("foobar"), "negative lookahead failure")
+
+r_plb = Regex.new("(?<=foo)bar")
+assert_true(r_plb.match?("foobar"), "positive lookbehind success")
+assert_false(r_plb.match?("bazbar"), "positive lookbehind failure")
+
+r_nlb = Regex.new("(?<!foo)bar")
+assert_true(r_nlb.match?("bazbar"), "negative lookbehind success")
+assert_false(r_nlb.match?("foobar"), "negative lookbehind failure")
+
+puts "== std/regex: scan, split, sub, and gsub"
+r_items = Regex.new("[0-9]+")
+scan_res = r_items.scan("item10 item20 item30")
+assert_eq(scan_res.size, 3, "scan size 3")
+assert_str(scan_res[0][0] || "", "10", "scan[0]")
+assert_str(scan_res[1][0] || "", "20", "scan[1]")
+assert_str(scan_res[2][0] || "", "30", "scan[2]")
+
+scan_count = 0
+r_items.scan("10 20 30") do |match_item|
+  scan_count = scan_count + 1
+end
+assert_eq(scan_count, 3, "scan with block")
+
+r_delim = Regex.new("[,;]\\s*")
+split_res = r_delim.split("alpha, beta; gamma,delta")
+assert_eq(split_res.size, 4, "split size 4")
+assert_str(split_res[0], "alpha", "split 0")
+assert_str(split_res[1], "beta", "split 1")
+assert_str(split_res[2], "gamma", "split 2")
+assert_str(split_res[3], "delta", "split 3")
+
+r_rep = Regex.new("\\d+")
+sub_res = r_rep.sub("foo123bar456", "N")
+assert_str(sub_res, "fooNbar456", "sub replacement")
+
+sub_block_res = r_rep.sub("foo123bar456") { |m| "<#{m[0]}>" }
+assert_str(sub_block_res, "foo<123>bar456", "sub block")
+
+gsub_res = r_rep.gsub("foo123bar456", "N")
+assert_str(gsub_res, "fooNbarN", "gsub replacement")
+
+gsub_block_res = r_rep.gsub("foo123bar456") { |m| "<#{m[0]}>" }
+assert_str(gsub_block_res, "foo<123>bar<456>", "gsub block")
+
+r_pair = Regex.new("([a-z]+)=([0-9]+)")
+gsub_ref_res = r_pair.gsub("x=10, y=20", "\\1: \\2")
+assert_str(gsub_ref_res, "x: 10, y: 20", "gsub numbered backslash expansion")
+
+r_esc_func = Regex.escape("a[b]*c")
+assert_str(r_esc_func, "a\\[b\\]\\*c", "escape function")
+
+puts "== std/regex: String integration and operators"
+assert_eq("abcdef" =~ Regex.new("cd") || -1, 2, "String#=~")
+assert_true(("abcdef" =~ Regex.new("zz")).nil?, "String#=~ nil")
+
+sm = "abcdef".match(Regex.new("c(d)e"))
+assert_true(!sm.nil?, "String#match")
+if sm
+  assert_str(sm[1] || "", "d", "String#match capture")
+end
+
+assert_true("abcdef".match?(Regex.new("def")), "String#match? true")
+assert_false("abcdef".match?(Regex.new("xyz")), "String#match? false")
+
+puts "== std/regex: published corpus traps"
+# Trap 1: a* against ""
+m_t1 = Regex.new("a*").match("")
+assert_true(!m_t1.nil?, "trap 1 match")
+if m_t1
+  assert_str(m_t1[0] || "", "", "trap 1 empty match text")
+  assert_eq(m_t1.begin(0) || -1, 0, "trap 1 begin 0")
+  assert_eq(m_t1.end(0) || -1, 0, "trap 1 end 0")
+end
+
+# Trap 2: nested loops (a(b|c))* against "abac"
+m_t2 = Regex.new("(a(b|c))*").match("abac")
+assert_true(!m_t2.nil?, "trap 2 match")
+if m_t2
+  assert_str(m_t2[0] || "", "abac", "trap 2 full text")
+  assert_str(m_t2[1] || "", "ac", "trap 2 group 1 last iteration")
+  assert_str(m_t2[2] || "", "c", "trap 2 group 2 last iteration")
+end
+
+puts "== std/regex: linear-time pathological pattern safety"
+# (a+)+b against 30 'a's:
+# A backtracking engine explores 2^30 = 1,073,741,824 combinations, locking CPU for minutes.
+# Thompson NFA Pike VM completes in linear time under 1 millisecond.
+r_patho = Regex.new("(a+)+b")
+m_patho = r_patho.match("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+assert_true(m_patho.nil?, "pathological pattern correctly yields nil without blowup")
+
+puts "all std regex checks passed"

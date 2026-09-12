@@ -1,8 +1,8 @@
 require "../../support/syntax"
 
-private def assert_parser_warning(source, *messages, file = __FILE__, line = __LINE__)
+private def assert_parser_warning(source, *messages, filename = "/test.cr", file = __FILE__, line = __LINE__)
   parser = Parser.new(source)
-  parser.filename = "/test.cr"
+  parser.filename = filename
   parser.parse
 
   warnings = parser.warnings.infos
@@ -68,6 +68,14 @@ describe "Parser warnings" do
     it "in return type restriction" do
       assert_parser_warning("def foo: Foo\nend", "warning in /test.cr:1\nWarning: space required before colon in return type restriction (run `crystal tool format` to fix this)")
       assert_no_parser_warning("def foo : Foo\nend")
+    end
+
+    it "names the formatter that owns the source language" do
+      assert_parser_warning(
+        "x: Int32",
+        "warning in /test.iyi:1\nWarning: space required before colon in type declaration (run `iyi tool format` to fix this)",
+        filename: "/test.iyi",
+      )
     end
   end
 

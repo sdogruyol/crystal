@@ -1,0 +1,308 @@
+# `std/crypto` standard library exercise.
+# Comprehensive verification of native digests, MACs, KDFs, AEAD ciphers, and CSPRNG.
+#
+# Notice: this implementation has not undergone independent cryptographic review.
+#
+# Every primitive is verified against published test vectors:
+#   * MD5: RFC 1321
+#   * SHA-1: RFC 3174 / FIPS 180-1
+#   * SHA-256, SHA-384, SHA-512: NIST CAVP / FIPS 180-4
+#   * HMAC: RFC 2202 and RFC 4231
+#   * HKDF: RFC 5869
+#   * ChaCha20-Poly1305: RFC 8439
+#   * AES-128-GCM and AES-256-GCM: NIST SP 800-38D
+#   * Constant-time comparison for tags and MACs
+#   * Tampered ciphertext and tag rejection on all AEAD ciphers
+
+module bench/std_crypto_exercise
+
+import std/slice
+using std/slice::{Slice}
+alias Bytes = Std::Slice::Bytes
+
+import std/digest
+using std/digest::{MD5, SHA1, SHA256, SHA384, SHA512}
+
+import std/crypto
+using std/crypto::{constant_time_compare, random_bytes, HMAC, HKDF, ChaCha20Poly1305, AES128GCM, AES256GCM, HeaderProtection}
+
+def hex_to_bytes(h : String) : Bytes
+  len = h.bytesize // 2
+  b = Bytes.new(len)
+  i = 0
+  while i < len
+    c1 = h.to_unsafe[i * 2].to_i32
+    c2 = h.to_unsafe[i * 2 + 1].to_i32
+    v1 = c1 >= 97 ? c1 - 87 : (c1 >= 65 ? c1 - 55 : c1 - 48)
+    v2 = c2 >= 97 ? c2 - 87 : (c2 >= 65 ? c2 - 55 : c2 - 48)
+    b[i] = ((v1 << 4) | v2).to_u8
+    i = i + 1
+  end
+  b
+end
+
+def assert_eq(label : String, actual : String, expected : String) : Nil
+  if actual != expected
+    puts "FAILED #{label}:"
+    puts "  actual:   #{actual}"
+    puts "  expected: #{expected}"
+    raise "assertion failed: #{label}"
+  end
+end
+
+def assert_true(label : String, condition : Bool) : Nil
+  unless condition
+    puts "FAILED #{label}: expected true, got false"
+    raise "assertion failed: #{label}"
+  end
+end
+
+def main : Nil
+  puts "== 1. MD5 published test vectors (RFC 1321)"
+  empty_s = ""
+  assert_eq("RFC 1321 Test 1 (empty)", MD5.hexdigest(empty_s), "d41d8cd98f00b204e9800998ecf8427e")
+  assert_eq("RFC 1321 Test 2 ('a')", MD5.hexdigest("a"), "0cc175b9c0f1b6a831c399e269772661")
+  assert_eq("RFC 1321 Test 3 ('abc')", MD5.hexdigest("abc"), "900150983cd24fb0d6963f7d28e17f72")
+  assert_eq("RFC 1321 Test 4 ('message digest')", MD5.hexdigest("message digest"), "f96b697d7cb7938d525a2f31aaf161d0")
+  assert_eq("RFC 1321 Test 5 (alphabet)", MD5.hexdigest("abcdefghijklmnopqrstuvwxyz"), "c3fcd3d76192e4007dfb496cca67e13b")
+  assert_eq("RFC 1321 Test 6 (alphanumeric)", MD5.hexdigest("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"), "d174ab98d277d9f5a5611c2c9f419d9f")
+  assert_eq("RFC 1321 Test 7 (80 digits multi-block)", MD5.hexdigest("12345678901234567890123456789012345678901234567890123456789012345678901234567890"), "57edf4a22be3c955ac49da2e2107b67a")
+  puts "  md5: RFC 1321 7 test vectors passed"
+
+  puts "== 2. SHA-1 published test vectors (RFC 3174 / FIPS 180-1)"
+  assert_eq("RFC 3174 Test 1 (empty)", SHA1.hexdigest(empty_s), "da39a3ee5e6b4b0d3255bfef95601890afd80709")
+  assert_eq("RFC 3174 Test 2 ('abc')", SHA1.hexdigest("abc"), "a9993e364706816aba3e25717850c26c9cd0d89d")
+  s_sha1_multi = "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
+  assert_eq("RFC 3174 Test 3 (multi-block 56 bytes)", SHA1.hexdigest(s_sha1_multi), "84983e441c3bd26ebaae4aa1f95129e5e54670f1")
+  puts "  sha1: RFC 3174 3 test vectors passed"
+
+  puts "== 3. SHA-256 published test vectors (NIST CAVP / FIPS 180-4)"
+  assert_eq("NIST CAVP SHA-256 (empty)", SHA256.hexdigest(empty_s), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+  assert_eq("NIST CAVP SHA-256 ('abc')", SHA256.hexdigest("abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+  assert_eq("NIST CAVP SHA-256 (multi-block 56 bytes)", SHA256.hexdigest(s_sha1_multi), "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1")
+  puts "  sha256: NIST CAVP 3 test vectors passed"
+
+  puts "== 4. SHA-384 published test vectors (NIST CAVP / FIPS 180-4)"
+  assert_eq("NIST CAVP SHA-384 (empty)", SHA384.hexdigest(empty_s), "38b060a751ac96384cd9327eb1b1e36a21fdb71114be07434c0cc7bf63f6e1da274edebfe76f65fbd51ad2f14898b95b")
+  assert_eq("NIST CAVP SHA-384 ('abc')", SHA384.hexdigest("abc"), "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7")
+  s_sha512_multi = "abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu"
+  assert_eq("NIST CAVP SHA-384 (multi-block 112 bytes)", SHA384.hexdigest(s_sha512_multi), "09330c33f71147e83d192fc782cd1b4753111b173b3b05d22fa08086e3b0f712fcc7c71a557e2db966c3e9fa91746039")
+  puts "  sha384: NIST CAVP 3 test vectors passed"
+
+  puts "== 5. SHA-512 published test vectors (NIST CAVP / FIPS 180-4)"
+  assert_eq("NIST CAVP SHA-512 (empty)", SHA512.hexdigest(empty_s), "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e")
+  assert_eq("NIST CAVP SHA-512 ('abc')", SHA512.hexdigest("abc"), "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f")
+  assert_eq("NIST CAVP SHA-512 (multi-block 112 bytes)", SHA512.hexdigest(s_sha512_multi), "8e959b75dae313da8cf4f72814fc143f8f7779c6eb9f7fa17299aeadb6889018501d289e4900f7e4331b99dec4b5433ac7d329eeb6dd26545e96e55b874be909")
+  puts "  sha512: NIST CAVP 3 test vectors passed"
+
+  puts "== 6. Incremental streaming updates"
+  # Streaming SHA-256 chunk by chunk
+  hasher = SHA256.new
+  hasher.update("abcdbcde")
+  hasher.update("cdefdefg")
+  hasher.update("efghfghi")
+  hasher.update("ghijhijk")
+  hasher.update("ijkljklm")
+  hasher.update("klmnlmno")
+  hasher.update("mnopnopq")
+  assert_eq("Streaming SHA-256 in 7 chunks", hasher.hexdigest, "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1")
+
+  # Streaming MD5 chunk by chunk
+  md5_hasher = MD5.new
+  md5_hasher.update("message ")
+  md5_hasher.update("digest")
+  assert_eq("Streaming MD5 in 2 chunks", md5_hasher.hexdigest, "f96b697d7cb7938d525a2f31aaf161d0")
+  puts "  streaming: chunk-by-chunk incremental hashing passed"
+
+  puts "== 7. Constant-time comparison"
+  ct1 = hex_to_bytes("abcdef0123456789")
+  ct2 = hex_to_bytes("abcdef0123456789")
+  ct3 = hex_to_bytes("abcdef0123456788")
+  ct4 = hex_to_bytes("abcdef012345")
+  assert_true("constant-time equal slices", constant_time_compare(ct1, ct2))
+  assert_true("constant-time unequal slices (last bit differs)", !constant_time_compare(ct1, ct3))
+  assert_true("constant-time different lengths", !constant_time_compare(ct1, ct4))
+  puts "  compare: constant_time_compare correctly discriminates"
+
+  puts "== 8. OS CSPRNG"
+  # Obtain random bytes
+  r16 = random_bytes(16)
+  r300 = random_bytes(300) # crosses the 256-byte kernel chunking threshold
+  assert_true("CSPRNG returns 16 bytes", r16.size == 16)
+  assert_true("CSPRNG returns 300 bytes", r300.size == 300)
+  # Ensure non-zero entropy (statistically impossible for 32 consecutive zero bytes from CSPRNG)
+  non_zero = false
+  idx = 0
+  while idx < r16.size
+    non_zero = true if r16[idx] != 0_u8
+    idx = idx + 1
+  end
+  assert_true("CSPRNG produced non-zero entropy", non_zero)
+  # Distinct successive calls
+  r16_2 = random_bytes(16)
+  assert_true("successive CSPRNG calls produce distinct output", !constant_time_compare(r16, r16_2))
+  puts "  csprng: OS high-entropy generation passed"
+
+  puts "== 9. HMAC published test vectors (RFC 2202 and RFC 4231)"
+  # RFC 2202 Test Case 1 (MD5)
+  k_md5_1 = Bytes.new(16, 0x0b_u8)
+  d_md5_1 = Bytes.new("Hi There".to_unsafe, 8)
+  assert_eq("RFC 2202 HMAC-MD5 Case 1", HMAC.md5(k_md5_1, d_md5_1).hexstring, "9294727a3638bb1c13f48ef8158bfc9d")
+
+  # RFC 2202 Test Case 1 (SHA-1)
+  k_sha1_1 = Bytes.new(20, 0x0b_u8)
+  assert_eq("RFC 2202 HMAC-SHA1 Case 1", HMAC.sha1(k_sha1_1, d_md5_1).hexstring, "b617318655057264e28bc0b6fb378c8ef146be00")
+
+  # RFC 4231 Test Case 1 (SHA-256)
+  k_sha256_1 = Bytes.new(20, 0x0b_u8)
+  assert_eq("RFC 4231 HMAC-SHA256 Case 1", HMAC.sha256(k_sha256_1, d_md5_1).hexstring, "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7")
+
+  # RFC 4231 Test Case 2 (SHA-256): key="Jefe", data="what do ya want for nothing?"
+  k_jefe = Bytes.new("Jefe".to_unsafe, 4)
+  d_jefe = Bytes.new("what do ya want for nothing?".to_unsafe, 28)
+  assert_eq("RFC 4231 HMAC-SHA256 Case 2 ('Jefe')", HMAC.sha256(k_jefe, d_jefe).hexstring, "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843")
+
+  # RFC 4231 Test Case 1 (SHA-384)
+  assert_eq("RFC 4231 HMAC-SHA384 Case 1", HMAC.sha384(k_sha256_1, d_md5_1).hexstring, "afd03944d84895626b0825f4ab46907f15f9dadbe4101ec682aa034c7cebc59cfaea9ea9076ede7f4af152e8b2fa9cb6")
+
+  # RFC 4231 Test Case 1 (SHA-512)
+  assert_eq("RFC 4231 HMAC-SHA512 Case 1", HMAC.sha512(k_sha256_1, d_md5_1).hexstring, "87aa7cdea5ef619d4ff0b4241a1d6cb02379f4e2ce4ec2787ad0b30545e17cdedaa833b7d6b8a702038b274eaea3f4e4be9d914eeb61f1702e696c203a126854")
+
+  # HMAC verify with constant-time comparison
+  expected_mac = hex_to_bytes("5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843")
+  assert_true("HMAC.verify valid", HMAC.verify(:sha256, k_jefe, d_jefe, expected_mac))
+  bad_mac = hex_to_bytes("5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3844")
+  assert_true("HMAC.verify rejected bad mac", !HMAC.verify(:sha256, k_jefe, d_jefe, bad_mac))
+  puts "  hmac: RFC 2202 and RFC 4231 test vectors passed"
+
+  puts "== 10. HKDF published test vectors (RFC 5869)"
+  # RFC 5869 Test Case 1 (SHA-256)
+  ikm_1 = Bytes.new(22, 0x0b_u8)
+  salt_1 = hex_to_bytes("000102030405060708090a0b0c")
+  info_1 = hex_to_bytes("f0f1f2f3f4f5f6f7f8f9")
+  prk_1 = HKDF.extract(:sha256, ikm_1, salt_1)
+  assert_eq("RFC 5869 Case 1 PRK", prk_1.hexstring, "077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5")
+  okm_1 = HKDF.expand(:sha256, prk_1, info_1, 42)
+  assert_eq("RFC 5869 Case 1 OKM", okm_1.hexstring, "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865")
+  # HKDF full derive helper
+  derive_okm = HKDF.derive(:sha256, ikm_1, salt_1, info_1, 42)
+  assert_eq("RFC 5869 Case 1 full derive", derive_okm.hexstring, "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865")
+  puts "  hkdf: RFC 5869 extract and expand test vectors passed"
+
+  puts "== 11. ChaCha20-Poly1305 published test vectors (RFC 8439)"
+  # RFC 8439 Section 2.8.2
+  cc_key = hex_to_bytes("808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f")
+  cc_nonce = hex_to_bytes("070000004041424344454647")
+  cc_aad = hex_to_bytes("50515253c0c1c2c3c4c5c6c7")
+  cc_pt_str = "Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it."
+  cc_pt = Bytes.new(cc_pt_str.to_unsafe, cc_pt_str.bytesize)
+
+  cc_ct, cc_tag = ChaCha20Poly1305.encrypt_detached(cc_key, cc_nonce, cc_pt, cc_aad)
+  expected_cc_ct = "d31a8d34648e60db7b86afbc53ef7ec2a4aded51296e08fea9e2b5a736ee62d63dbea45e8ca9671282fafb69da92728b1a71de0a9e060b2905d6a5b67ecd3b3692ddbd7f2d778b8c9803aee328091b58fab324e4fad675945585808b4831d7bc3ff4def08e4b7a9de576d26586cec64b6116"
+  expected_cc_tag = "1ae10b594f09e26a7e902ecbd0600691"
+  assert_eq("RFC 8439 2.8.2 Ciphertext", cc_ct.hexstring, expected_cc_ct)
+  assert_eq("RFC 8439 2.8.2 Tag", cc_tag.hexstring, expected_cc_tag)
+
+  # Decrypt and round-trip
+  decrypted_cc = ChaCha20Poly1305.decrypt_detached(cc_key, cc_nonce, cc_ct, cc_tag, cc_aad)
+  assert_true("ChaCha20-Poly1305 valid decryption", !decrypted_cc.nil?)
+  if d = decrypted_cc
+    assert_eq("ChaCha20-Poly1305 plaintext match", d.hexstring, cc_pt.hexstring)
+  end
+
+  # Tamper tag rejection
+  tampered_cc_tag = hex_to_bytes(expected_cc_tag)
+  tampered_cc_tag[0] = tampered_cc_tag[0] ^ 0x01_u8
+  rejected_tag = ChaCha20Poly1305.decrypt_detached(cc_key, cc_nonce, cc_ct, tampered_cc_tag, cc_aad)
+  assert_true("ChaCha20-Poly1305 rejected tampered tag", rejected_tag.nil?)
+
+  # Tamper ciphertext rejection
+  tampered_cc_ct = hex_to_bytes(expected_cc_ct)
+  tampered_cc_ct[0] = tampered_cc_ct[0] ^ 0x01_u8
+  rejected_ct = ChaCha20Poly1305.decrypt_detached(cc_key, cc_nonce, tampered_cc_ct, cc_tag, cc_aad)
+  assert_true("ChaCha20-Poly1305 rejected tampered ciphertext", rejected_ct.nil?)
+  puts "  chacha20-poly1305: RFC 8439 vector verified, tampered tag and ciphertext rejected"
+
+  puts "== 12. AES-128-GCM published test vectors (NIST SP 800-38D)"
+  # NIST SP 800-38D Test Case 1: 128-bit key, empty PT, empty AAD
+  k_case1 = hex_to_bytes("00000000000000000000000000000000")
+  iv_case1 = hex_to_bytes("000000000000000000000000")
+  ct1, tag1 = AES128GCM.encrypt_detached(k_case1, iv_case1, Bytes.empty, Bytes.empty)
+  assert_eq("NIST Case 1 (empty) tag", tag1.hexstring, "58e2fccefa7e3061367f1d57a4e7455a")
+  dec1 = AES128GCM.decrypt_detached(k_case1, iv_case1, ct1, tag1, Bytes.empty)
+  assert_true("NIST Case 1 decrypt ok", !dec1.nil?)
+
+  # NIST SP 800-38D Test Case 2: 128-bit key, 16-byte PT, empty AAD
+  pt_case2 = Bytes.new(16, 0_u8)
+  ct2, tag2 = AES128GCM.encrypt_detached(k_case1, iv_case1, pt_case2, Bytes.empty)
+  assert_eq("NIST Case 2 CT", ct2.hexstring, "0388dace60b6a392f328c2b971b2fe78")
+  assert_eq("NIST Case 2 tag", tag2.hexstring, "ab6e47d42cec13bdf53a67b21257bddf")
+  dec2 = AES128GCM.decrypt_detached(k_case1, iv_case1, ct2, tag2, Bytes.empty)
+  assert_true("NIST Case 2 decrypt ok", !dec2.nil?)
+
+  # NIST SP 800-38D Test Case 4: 128-bit key, 64-byte PT, 20-byte AAD
+  k_case4 = hex_to_bytes("feffe9928665731c6d6a8f9467308308")
+  iv_case4 = hex_to_bytes("cafebabefacedbaddecaf888")
+  pt_case4 = hex_to_bytes("d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a721c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b391aafd255")
+  aad_case4 = hex_to_bytes("feedfacedeadbeeffeedfacedeadbeefabaddadb")
+  ct4, tag4 = AES128GCM.encrypt_detached(k_case4, iv_case4, pt_case4, aad_case4)
+  assert_eq("NIST Case 4 CT", ct4.hexstring, "42831ec2217774244b7221b784d0d49ce3aa212f2c02a4e035c17e2329aca12e21d514b25466931c7d8f6a5aac84aa051ba30b396a0aac973d58e091473f5985")
+  assert_eq("NIST Case 4 tag", tag4.hexstring, "048e2d7157eceb220cfeb3940db4c971")
+  dec4 = AES128GCM.decrypt_detached(k_case4, iv_case4, ct4, tag4, aad_case4)
+  assert_true("NIST Case 4 decrypt ok", !dec4.nil?)
+
+  # Tampering rejection on AES-128-GCM
+  tamper_tag4 = hex_to_bytes(tag4.hexstring)
+  tamper_tag4[0] = tamper_tag4[0] ^ 0x01_u8
+  rej_tag4 = AES128GCM.decrypt_detached(k_case4, iv_case4, ct4, tamper_tag4, aad_case4)
+  assert_true("AES-128-GCM rejected tampered tag", rej_tag4.nil?)
+
+  tamper_ct4 = hex_to_bytes(ct4.hexstring)
+  tamper_ct4[0] = tamper_ct4[0] ^ 0x01_u8
+  rej_ct4 = AES128GCM.decrypt_detached(k_case4, iv_case4, tamper_ct4, tag4, aad_case4)
+  assert_true("AES-128-GCM rejected tampered ciphertext", rej_ct4.nil?)
+  puts "  aes-128-gcm: NIST SP 800-38D Cases 1, 2, 4 verified, tampered tag and CT rejected"
+
+  puts "== 13. AES-256-GCM published test vectors (NIST SP 800-38D)"
+  # NIST SP 800-38D Test Case 13: 256-bit key, empty PT, empty AAD
+  k_case13 = Bytes.new(32, 0_u8)
+  ct13, tag13 = AES256GCM.encrypt_detached(k_case13, iv_case1, Bytes.empty, Bytes.empty)
+  assert_eq("NIST Case 13 (empty) tag", tag13.hexstring, "530f8afbc74536b9a963b4f1c4cb738b")
+  dec13 = AES256GCM.decrypt_detached(k_case13, iv_case1, ct13, tag13, Bytes.empty)
+  assert_true("NIST Case 13 decrypt ok", !dec13.nil?)
+
+  # NIST SP 800-38D Test Case 16: 256-bit key, 64-byte PT, 20-byte AAD
+  k_case16 = hex_to_bytes("feffe9928665731c6d6a8f9467308308feffe9928665731c6d6a8f9467308308")
+  ct16, tag16 = AES256GCM.encrypt_detached(k_case16, iv_case4, pt_case4, aad_case4)
+  assert_eq("NIST Case 16 CT", ct16.hexstring, "522dc1f099567d07f47f37a32a84427d643a8cdcbfe5c0c97598a2bd2555d1aa8cb08e48590dbb3da7b08b1056828838c5f61e6393ba7a0abcc9f662898015ad")
+  assert_eq("NIST Case 16 tag", tag16.hexstring, "0adb21a13b23bad4143bb6faccd00a5f")
+  dec16 = AES256GCM.decrypt_detached(k_case16, iv_case4, ct16, tag16, aad_case4)
+  assert_true("NIST Case 16 decrypt ok", !dec16.nil?)
+
+  # Tampering rejection on AES-256-GCM
+  tamper_tag16 = hex_to_bytes(tag16.hexstring)
+  tamper_tag16[0] = tamper_tag16[0] ^ 0x01_u8
+  rej_tag16 = AES256GCM.decrypt_detached(k_case16, iv_case4, ct16, tamper_tag16, aad_case4)
+  assert_true("AES-256-GCM rejected tampered tag", rej_tag16.nil?)
+  puts "  aes-256-gcm: NIST SP 800-38D Cases 13, 16 verified, tampered tag rejected"
+
+  # QUIC header protection, against RFC 9001's own worked packets rather than
+  # against itself: the client and server Initials of A.2 and A.3, and the
+  # ChaCha20 short header of A.5.
+  puts "  == 14. QUIC header protection (RFC 9001 appendix A)"
+  assert_eq("A.2 client Initial mask",
+    HeaderProtection.aes_mask(hex_to_bytes("9f50449e04a0e810283a1e9933adedd2"),
+      hex_to_bytes("d1b1c98dd7689fb8ec11d242b123dc9b")).hexstring, "437b9aec36")
+  assert_eq("A.3 server Initial mask",
+    HeaderProtection.aes_mask(hex_to_bytes("c206b8d9b9f0f37644430b490eeaa314"),
+      hex_to_bytes("2cd0991cd25b0aac406a5816b6394100")).hexstring, "2ec0d8356a")
+  assert_eq("A.5 ChaCha20 short header mask",
+    HeaderProtection.chacha_mask(hex_to_bytes("25a282b9e82f06f21f488917a4fc8f1b73573685608597d0efcb076b0ab7a7a4"),
+      hex_to_bytes("5e5cd55c41f69080575d7999c25a5bfb")).hexstring, "aefefe7d03")
+  puts "    header protection: RFC 9001 A.2, A.3 and A.5 masks matched"
+
+  puts
+  puts "all std/crypto checks passed"
+end
+
+main

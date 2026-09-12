@@ -496,7 +496,7 @@ class Iyi::Command
 
     begin
       client = UNIXSocket.new(path)
-    rescue ex : Socket::Error | File::Error
+    rescue ex : Socket::Error | File::Error | ArgumentError
       if fallback
         STDERR.puts "#{Command.program_name}: daemon at #{path} did not answer, building without it"
         return

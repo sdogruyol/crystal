@@ -1,0 +1,271 @@
+import std/spec
+using std/spec::{describe, context, it, pending, pending_example, eq, be, be_true, be_false, be_nil, be_truthy, be_falsey, be_close, contain, start_with, end_with, match, be_empty, be_a, expect_raises, before_each, after_each, before_all, after_all, around_each, around_all}
+
+puts "== std/spec: describe, context, and it structure"
+
+Spec.reset
+test_counts = 0
+
+describe "Math operations" do
+  context "addition" do
+    it "adds numbers" do
+      test_counts = test_counts + 1
+      (1 + 2).should eq(3)
+    end
+  end
+
+  context "multiplication" do
+    it "multiplies numbers" do
+      test_counts = test_counts + 1
+      (3 * 4).should eq(12)
+    end
+  end
+end
+
+code = Spec.run([] of String, exit_after_run: false)
+raise "Spec run failed: structure" if code != 0
+raise "Expected 2 tests to run" if test_counts != 2
+puts "  structure: describe, context, and it executed cleanly"
+
+puts "== std/spec: hooks (before/after/around each and all)"
+
+Spec.reset
+hooks_order = [] of String
+
+describe "Hook tracking" do
+  before_all do
+    hooks_order << "before_all"
+  end
+
+  after_all do
+    hooks_order << "after_all"
+  end
+
+  before_each do
+    hooks_order << "before_each"
+  end
+
+  after_each do
+    hooks_order << "after_each"
+  end
+
+  around_each do |procsy|
+    hooks_order << "around_before"
+    procsy.run
+    hooks_order << "around_after"
+  end
+
+  it "first example" do
+    hooks_order << "example_1"
+  end
+
+  it "second example" do
+    hooks_order << "example_2"
+  end
+end
+
+code = Spec.run([] of String, exit_after_run: false)
+raise "Spec run failed: hooks" if code != 0
+raise "Missing before_all hook" unless hooks_order.includes?("before_all")
+raise "Missing after_all hook" unless hooks_order.includes?("after_all")
+raise "Missing before_each hook" unless hooks_order.includes?("before_each")
+raise "Missing after_each hook" unless hooks_order.includes?("after_each")
+raise "Missing around_before hook" unless hooks_order.includes?("around_before")
+raise "Missing around_after hook" unless hooks_order.includes?("around_after")
+puts "  hooks: all lifecycle hooks executed in sequence"
+
+puts "== std/spec: expectations and matchers"
+
+Spec.reset
+
+describe "All matchers" do
+  it "checks equality" do
+    42.should eq(42)
+    42.should_not eq(43)
+  end
+
+  it "checks identity" do
+    true.should be(true)
+    false.should_not be(true)
+  end
+
+  it "checks booleans" do
+    true.should be_true
+    false.should be_false
+  end
+
+  it "checks nil" do
+    nil.should be_nil
+    "something".should_not be_nil
+  end
+
+  it "checks truthy and falsey" do
+    "hello".should be_truthy
+    1.should be_truthy
+    nil.should be_falsey
+    false.should be_falsey
+  end
+
+  it "checks close comparison" do
+    10.005.should be_close(10.0, 0.01)
+    10.05.should_not be_close(10.0, 0.01)
+  end
+
+  it "checks relational comparisons" do
+    10.should be > 5
+    10.should be >= 10
+    5.should be < 10
+    5.should be <= 5
+  end
+
+  it "checks containment" do
+    "source and iyi".should contain("iyi")
+    "source and iyi".should_not contain("python")
+    [10, 20, 30].should contain(20)
+    [10, 20, 30].should_not contain(99)
+  end
+
+  it "checks start_with and end_with" do
+    "framework".should start_with("frame")
+    "framework".should_not start_with("work")
+    "framework".should end_with("work")
+    "framework".should_not end_with("frame")
+  end
+
+  it "checks match" do
+    "error 404 not found".should match("404")
+  end
+
+  it "checks be_empty" do
+    "".should be_empty
+    ([] of Int32).should be_empty
+    "data".should_not be_empty
+    [1].should_not be_empty
+  end
+
+  it "checks be_a" do
+    "text".should be_a(String)
+    123.should be_a(Int32)
+    123.should_not be_a(String)
+  end
+
+  it "checks expect_raises" do
+    expect_raises("boom") do
+      raise "boom"
+    end
+  end
+end
+
+code = Spec.run([] of String, exit_after_run: false)
+raise "Spec run failed: matchers" if code != 0
+puts "  expectations: eq, be, booleans, nil, truthy/falsey, close, comparisons, contain, start/end, match, empty, be_a, expect_raises passed"
+
+puts "== std/spec: pending examples"
+
+Spec.reset
+describe "Pending tests" do
+  pending "pending with block" do
+    (1 + 1).should eq(3)
+  end
+
+  pending "pending without block"
+
+  it "marks pending inside body" do
+    pending_example("work in progress")
+  end
+end
+
+code = Spec.run([] of String, exit_after_run: false)
+raise "Spec run failed: pending" if code != 0
+pendings_count = Spec.cli.root_context.results_for(Std::Spec::Status::Pending).size
+raise "Expected 3 pending examples, got #{pendings_count}" if pendings_count != 3
+puts "  pending: pending blocks and dynamic pending_example verified"
+
+puts "== std/spec: tags and focus filtering"
+
+Spec.reset
+describe "Tag and Focus Suite" do
+  it "unit test", tags: "unit" do
+    1.should eq(1)
+  end
+
+  it "integration test", tags: "integration" do
+    2.should eq(2)
+  end
+end
+
+code = Spec.run(["--tag", "unit"], exit_after_run: false)
+raise "Tag filter failed" if code != 0
+successes = Spec.cli.root_context.results_for(Std::Spec::Status::Success).size
+raise "Expected 1 tagged example, got #{successes}" if successes != 1
+
+Spec.reset
+describe "Focus Suite" do
+  it "normal test" do
+    1.should eq(1)
+  end
+
+  it "focused test", focus: true do
+    2.should eq(2)
+  end
+end
+
+code = Spec.run([] of String, exit_after_run: false)
+raise "Focus filter failed" if code != 0
+successes = Spec.cli.root_context.results_for(Std::Spec::Status::Success).size
+raise "Expected 1 focused example, got #{successes}" if successes != 1
+puts "  filters: tag inclusion and focus isolation verified"
+
+puts "== std/spec: formatters"
+
+Spec.reset
+describe "Formatter Suite" do
+  it "formatter item" do
+    100.should eq(100)
+  end
+end
+
+Spec.cli.configure_formatter("verbose")
+code = Spec.run([] of String, exit_after_run: false)
+raise "Verbose formatter failed" if code != 0
+
+Spec.cli.configure_formatter("tap")
+code = Spec.run([] of String, exit_after_run: false)
+raise "TAP formatter failed" if code != 0
+
+junit_xml_path = "/tmp/spec_junit_out.xml"
+Spec.cli.configure_formatter("junit", junit_xml_path)
+code = Spec.run([] of String, exit_after_run: false)
+raise "JUnit formatter failed" if code != 0
+raise "JUnit file missing" unless File.exists?(junit_xml_path)
+junit_xml = File.read(junit_xml_path)
+raise "Invalid JUnit XML" unless junit_xml.includes?("<testsuite tests=\"1\"") && junit_xml.includes?("</testsuite>")
+puts "  formatters: Dot, Verbose, TAP, and JUnit XML verified"
+
+puts "== std/spec: randomization"
+
+Spec.reset
+describe "Random Suite" do
+  it "test 1" do; end
+  it "test 2" do; end
+  it "test 3" do; end
+end
+
+code = Spec.run(["--order", "12345"], exit_after_run: false)
+raise "Randomization failed" if code != 0
+raise "Expected seed 12345" if Spec.cli.randomizer_seed != 12345_u64
+puts "  randomization: PCG32 seeded ordering verified"
+
+puts "== std/spec: CLI runner and exit codes"
+
+File.write("/tmp/bench_spec_pass.iyi", "import std/spec\nusing std/spec::{describe, it, eq}\ndescribe(\"Pass\") { it(\"ok\") { 10.should eq(10) } }\nSpec.run\n")
+File.write("/tmp/bench_spec_fail.iyi", "import std/spec\nusing std/spec::{describe, it, eq}\ndescribe(\"Fail\") { it(\"bad\") { 10.should eq(99) } }\nSpec.run\n")
+
+pass_code = Spec.run_file("/tmp/bench_spec_pass.iyi")
+raise "Expected pass file to exit 0, got #{pass_code}" if pass_code != 0
+
+fail_code = Spec.run_file("/tmp/bench_spec_fail.iyi")
+raise "Expected fail file to exit 1, got #{fail_code}" if fail_code != 1
+puts "  runner: run_file returns 0 on success and 1 on failure"
+
+puts "all std/spec framework checks passed"

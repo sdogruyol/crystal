@@ -1,0 +1,671 @@
+# Standard OAuth 2.0 (RFC 6749) protocol implementation for iyi.
+#
+# Fully native: zero external C library dependencies.
+# Uses std/crypto for HMAC-SHA1/HMAC-SHA256 and CSPRNG, std/http for requests/responses,
+# std/uri for parameter encoding, and std/json for token serialization.
+
+module std/oauth2
+
+pub import std/http
+pub import std/http1
+pub import std/uri
+pub import std/crypto
+pub import std/digest
+pub import std/base64
+pub import std/time
+pub import std/json
+pub import std/random
+pub import std/oauth
+
+using std/http::{Request, Response, Headers, Status}
+using std/uri::{URI, Params}
+using std/crypto::{HMAC}
+using std/base64::{Base64}
+using std/time::{Time, Span}
+using std/json::{JSON, Builder, PullParser}
+
+# -----------------------------------------------------------------------------
+# OAuth2::AuthScheme
+# -----------------------------------------------------------------------------
+
+pub enum AuthScheme
+  HTTPBasic   = 0
+  RequestBody = 1
+
+  def http_basic? : Bool
+    self == HTTPBasic
+  end
+
+  def request_body? : Bool
+    self == RequestBody
+  end
+end
+
+# -----------------------------------------------------------------------------
+# OAuth2::Error
+# -----------------------------------------------------------------------------
+
+pub class Error < Exception
+  getter message : String
+  getter cause : Exception?
+
+  def initialize(@message : String, @cause : Exception? = nil)
+  end
+
+  def message : String
+    @message
+  end
+end
+
+def raise(err : Error, file : String = __FILE__, line : Int32 = __LINE__) : NoReturn
+  m = err.message
+  ::raise(m ? m : "OAuth2::Error", file, line)
+end
+
+# -----------------------------------------------------------------------------
+# OAuth2::ErrorResponse
+# -----------------------------------------------------------------------------
+
+pub struct ErrorResponse
+  getter error : String
+  getter error_description : String?
+  getter error_uri : String?
+
+  def initialize(@error : String, @error_description : String? = nil, @error_uri : String? = nil)
+  end
+
+  def self.new(pull : PullParser) : self
+    err = ""
+    desc : String? = nil
+    uri : String? = nil
+
+    pull.read_object do |key|
+      case key
+      when "error"
+        err = pull.read_string
+      when "error_description"
+        if pull.kind == PullParser::Kind::Null
+          pull.read_null
+        elsif pull.kind == PullParser::Kind::String
+          desc = pull.read_string
+        else
+          pull.skip
+        end
+      when "error_uri"
+        if pull.kind == PullParser::Kind::Null
+          pull.read_null
+        elsif pull.kind == PullParser::Kind::String
+          uri = pull.read_string
+        else
+          pull.skip
+        end
+      else
+        pull.skip
+      end
+    end
+
+    new(err, desc, uri)
+  end
+
+  def self.from_json(json_str : String) : self
+    new(PullParser.new(json_str))
+  end
+
+  def to_json(json : Builder) : Nil
+    json.object do
+      json.field "error", @error
+      if d = @error_description
+        json.field "error_description", d
+      end
+      if u = @error_uri
+        json.field "error_uri", u
+      end
+    end
+  end
+
+  def to_json : String
+    JSON.build do |b|
+      to_json(b)
+    end
+  end
+end
+
+# -----------------------------------------------------------------------------
+# OAuth2::AccessToken (Abstract Base)
+# -----------------------------------------------------------------------------
+
+pub abstract class AccessToken
+  property access_token : String
+  property expires_in : Int64?
+  property refresh_token : String?
+  property scope : String?
+  property extra : Hash(String, String)?
+
+  def initialize(@access_token : String,
+                 expires_in : Int? = nil,
+                 @refresh_token : String? = nil,
+                 @scope : String? = nil,
+                 @extra : Hash(String, String)? = nil)
+    @expires_in = if exp = expires_in
+                    exp.to_i64
+                  else
+                    nil.as(Int64?)
+                  end
+  end
+
+  abstract def token_type : String
+
+  abstract def authenticate(request : HTTP::Request, tls : Bool) : Nil
+
+  def authenticate(client : HTTP::Client) : Nil
+    client.before_request do |request|
+      authenticate(request, client.tls?)
+    end
+  end
+
+  abstract def to_json(json : Builder) : Nil
+
+  def to_json : String
+    JSON.build do |b|
+      to_json(b)
+    end
+  end
+
+  def self.from_json(json_str : String) : AccessToken
+    new(PullParser.new(json_str))
+  end
+
+  def self.new(pull : PullParser) : AccessToken
+    token_type : String? = nil
+    acc_tok : String? = nil
+    exp_in : Int64? = nil
+    ref_tok : String? = nil
+    scp : String? = nil
+    mac_algo : String? = nil
+    mac_k : String? = nil
+    extra_map : Hash(String, String)? = nil
+
+    pull.read_object do |key|
+      case key
+      when "token_type"
+        token_type = pull.read_string
+      when "access_token"
+        acc_tok = pull.read_string
+      when "expires_in"
+        exp_in = pull.read_int
+      when "refresh_token"
+        if pull.kind == PullParser::Kind::String
+          ref_tok = pull.read_string
+        elsif pull.kind == PullParser::Kind::Null
+          pull.read_null
+        else
+          pull.skip
+        end
+      when "scope"
+        if pull.kind == PullParser::Kind::String
+          scp = pull.read_string
+        elsif pull.kind == PullParser::Kind::Null
+          pull.read_null
+        else
+          pull.skip
+        end
+      when "mac_algorithm"
+        mac_algo = pull.read_string
+      when "mac_key"
+        mac_k = pull.read_string
+      else
+        m = extra_map ||= {} of String => String
+        if pull.kind == PullParser::Kind::String
+          m[key] = pull.read_string
+        elsif pull.kind == PullParser::Kind::Int
+          m[key] = pull.read_int.to_s
+        elsif pull.kind == PullParser::Kind::Bool
+          m[key] = pull.read_bool ? "true" : "false"
+        else
+          pull.skip
+        end
+      end
+    end
+
+    unless acc_tok
+      raise Error.new("Missing access token in JSON response")
+    end
+
+    tt = token_type ? token_type.downcase : "bearer"
+    if tt == "bearer"
+      Bearer.new(acc_tok, exp_in, ref_tok, scp, extra_map)
+    elsif tt == "mac"
+      unless mac_algo && mac_k
+        raise Error.new("Missing mac_algorithm or mac_key in MAC access token")
+      end
+      Mac.new(acc_tok, exp_in, mac_algo, mac_k, ref_tok, scp, Time.utc.to_unix, extra_map)
+    else
+      raise Error.new("Unknown token_type in access token json: " + tt)
+    end
+  end
+end
+
+# -----------------------------------------------------------------------------
+# OAuth2::AccessToken::Bearer (RFC 6750)
+# -----------------------------------------------------------------------------
+
+pub class Bearer < AccessToken
+  def initialize(access_token : String,
+                 expires_in : Int? = nil,
+                 refresh_token : String? = nil,
+                 scope : String? = nil,
+                 extra : Hash(String, String)? = nil)
+    super(access_token, expires_in, refresh_token, scope, extra)
+  end
+
+  def self.new(pull : PullParser) : self
+    AccessToken.new(pull).as(Bearer)
+  end
+
+  def token_type : String
+    "Bearer"
+  end
+
+  def authenticate(request : HTTP::Request, tls : Bool) : Nil
+    request.headers["Authorization"] = "Bearer " + @access_token
+  end
+
+  def to_json(json : Builder) : Nil
+    json.object do
+      json.field "token_type", "bearer"
+      json.field "access_token", @access_token
+      if exp = @expires_in
+        json.field "expires_in", exp
+      end
+      if ref = @refresh_token
+        json.field "refresh_token", ref
+      end
+      if scp = @scope
+        json.field "scope", scp
+      end
+      if ex = @extra
+        ex.each do |k, v|
+          json.field k, v
+        end
+      end
+    end
+  end
+
+  def ==(other : AccessToken) : Bool
+    return false unless other.is_a?(Bearer)
+    b = other.as(Bearer)
+    @access_token == b.access_token &&
+      @expires_in == b.expires_in &&
+      @refresh_token == b.refresh_token &&
+      @scope == b.scope &&
+      (@extra || ({} of String => String)) == (b.extra || ({} of String => String))
+  end
+
+  def hash(hasher)
+    hasher = @access_token.hash(hasher)
+    hasher = @expires_in.hash(hasher)
+    hasher = @refresh_token.hash(hasher)
+    @scope.hash(hasher)
+  end
+
+  def to_s(io : IO) : Nil
+    io << "OAuth2::AccessToken::Bearer(access_token=" << @access_token << ")"
+  end
+end
+
+# -----------------------------------------------------------------------------
+# OAuth2::AccessToken::Mac (draft-ietf-oauth-v2-http-mac)
+# -----------------------------------------------------------------------------
+
+pub class Mac < AccessToken
+  property mac_algorithm : String
+  property mac_key : String
+  property issued_at : Int64
+
+  def initialize(access_token : String,
+                 expires_in : Int?,
+                 @mac_algorithm : String,
+                 @mac_key : String,
+                 refresh_token : String? = nil,
+                 scope : String? = nil,
+                 @issued_at : Int64 = Time.utc.to_unix,
+                 extra : Hash(String, String)? = nil)
+    super(access_token, expires_in, refresh_token, scope, extra)
+  end
+
+  def self.new(pull : PullParser) : self
+    AccessToken.new(pull).as(Mac)
+  end
+
+  def token_type : String
+    "Mac"
+  end
+
+  def authenticate(request : HTTP::Request, tls : Bool) : Nil
+    ts = Time.utc.to_unix
+    diff = ts - @issued_at
+    nonce = diff.to_s + ":" + Std::Crypto.random_bytes(8).hexstring
+    method = request.method
+    uri = request.target
+    h, p = host_and_port(request, tls)
+    ext = ""
+
+    mac = Mac.signature(ts.to_s, nonce, method, uri, h, p, ext, @mac_algorithm, @mac_key)
+    header = "MAC id=\"" + @access_token + "\", nonce=\"" + nonce + "\", ts=\"" + ts.to_s + "\", mac=\"" + mac + "\""
+    request.headers["Authorization"] = header
+  end
+
+  def self.signature(ts : String,
+                     nonce : String,
+                     method : String,
+                     uri : String,
+                     host : String,
+                     port : Int32 | String,
+                     ext : String,
+                     mac_algorithm : String,
+                     mac_key : String) : String
+    normalized = ts + "\n" + nonce + "\n" + method + "\n" + uri + "\n" + host + "\n" + port.to_s + "\n" + ext + "\n"
+    algo = case mac_algorithm.downcase
+           when "hmac-sha-1", "hmac-sha1"
+             :sha1
+           when "hmac-sha-256", "hmac-sha256"
+             :sha256
+           else
+             raise Error.new("Unsupported algorithm: " + mac_algorithm)
+           end
+    digest = HMAC.digest(algo, mac_key, normalized)
+    Base64.strict_encode(digest)
+  end
+
+  def to_json(json : Builder) : Nil
+    json.object do
+      json.field "token_type", "mac"
+      json.field "access_token", @access_token
+      if exp = @expires_in
+        json.field "expires_in", exp
+      end
+      if ref = @refresh_token
+        json.field "refresh_token", ref
+      end
+      if scp = @scope
+        json.field "scope", scp
+      end
+      json.field "mac_algorithm", @mac_algorithm
+      json.field "mac_key", @mac_key
+      if ex = @extra
+        ex.each do |k, v|
+          json.field k, v
+        end
+      end
+    end
+  end
+
+  def ==(other : AccessToken) : Bool
+    return false unless other.is_a?(Mac)
+    m = other.as(Mac)
+    @access_token == m.access_token &&
+      @expires_in == m.expires_in &&
+      @mac_algorithm == m.mac_algorithm &&
+      @mac_key == m.mac_key &&
+      @refresh_token == m.refresh_token &&
+      @scope == m.scope &&
+      (@extra || ({} of String => String)) == (m.extra || ({} of String => String))
+  end
+
+  def hash(hasher)
+    hasher = @access_token.hash(hasher)
+    hasher = @mac_algorithm.hash(hasher)
+    hasher = @mac_key.hash(hasher)
+    @refresh_token.hash(hasher)
+  end
+
+  def to_s(io : IO) : Nil
+    io << "OAuth2::AccessToken::Mac(access_token=" << @access_token << ")"
+  end
+
+  private def host_and_port(request : HTTP::Request, tls : Bool) : Tuple(String, Int32)
+    host_hdr = request.headers["Host"]?
+    if host_hdr && !host_hdr.empty?
+      if colon_idx = host_hdr.index(':')
+        h = host_hdr[0, colon_idx]
+        p = host_hdr[colon_idx + 1, host_hdr.bytesize - colon_idx - 1].to_i? || (tls ? 443 : 80)
+        {h, p}
+      else
+        {host_hdr, tls ? 443 : 80}
+      end
+    else
+      {"localhost", tls ? 443 : 80}
+    end
+  end
+end
+
+# -----------------------------------------------------------------------------
+# OAuth2::Client (RFC 6749 Section 2 / 4)
+# -----------------------------------------------------------------------------
+
+pub class Client
+  DEFAULT_HEADERS = Headers.new
+
+  property host : String
+  property client_id : String
+  property client_secret : String
+  property port : Int32?
+  property scheme : String
+  property authorize_uri : String
+  property token_uri : String
+  getter redirect_uri : String?
+  property auth_scheme : AuthScheme
+
+  def http_client=(client : HTTP::Client?) : HTTP::Client?
+    @http_client = client
+  end
+
+  def initialize(@host : String,
+                 @client_id : String,
+                 @client_secret : String,
+                 @port : Int32? = nil,
+                 @scheme : String = "https",
+                 @authorize_uri : String = "/oauth2/authorize",
+                 @token_uri : String = "/oauth2/token",
+                 @redirect_uri : String? = nil,
+                 @auth_scheme : AuthScheme = AuthScheme::HTTPBasic)
+    @http_client = nil
+  end
+
+  def http_client : HTTP::Client
+    @http_client ||= HTTP::Client.new(parsed_token_uri)
+  end
+
+  def get_authorize_uri(scope : String? = nil, state : String? = nil) : String
+    get_authorize_uri(scope, state) { |_p| }
+  end
+
+  def get_authorize_uri(scope : String? = nil, state : String? = nil, &block : Params -> Nil) : String
+    uri = URI.parse(@authorize_uri)
+    unless uri.host
+      uri = URI.new(scheme: @scheme, host: @host, port: @port, path: @authorize_uri)
+    end
+
+    params = uri.query_params
+    params.add("client_id", @client_id)
+    if redir = @redirect_uri
+      params.add("redirect_uri", redir)
+    end
+    params.add("response_type", "code")
+    if scp = scope
+      params.add("scope", scp)
+    end
+    if st = state
+      params.add("state", st)
+    end
+    yield params
+
+    uri.query_params = params
+    uri.to_s
+  end
+
+  def get_access_token_using_authorization_code(authorization_code : String) : AccessToken
+    get_access_token do |form|
+      if redir = @redirect_uri
+        form.add("redirect_uri", redir)
+      end
+      form.add("grant_type", "authorization_code")
+      form.add("code", authorization_code)
+    end
+  end
+
+  def get_access_token_using_resource_owner_credentials(username : String, password : String, scope : String? = nil) : AccessToken
+    get_access_token do |form|
+      form.add("grant_type", "password")
+      form.add("username", username)
+      form.add("password", password)
+      if scp = scope
+        form.add("scope", scp)
+      end
+    end
+  end
+
+  def get_access_token_using_client_credentials(scope : String? = nil) : AccessToken
+    get_access_token do |form|
+      form.add("grant_type", "client_credentials")
+      if scp = scope
+        form.add("scope", scp)
+      end
+    end
+  end
+
+  def get_access_token_using_refresh_token(refresh_token : String?, scope : String? = nil) : AccessToken
+    get_access_token do |form|
+      form.add("grant_type", "refresh_token")
+      form.add("refresh_token", refresh_token || "")
+      if scp = scope
+        form.add("scope", scp)
+      end
+    end
+  end
+
+  def make_token_request(&block : (Params, Headers) -> Nil) : Response
+    headers = Headers.new
+    headers["Accept"] = "application/json"
+    headers["Content-Type"] = "application/x-www-form-urlencoded"
+
+    form = Params.new
+
+    if @auth_scheme.request_body?
+      form.add("client_id", @client_id)
+      form.add("client_secret", @client_secret)
+    elsif @auth_scheme.http_basic?
+      basic_creds = Base64.strict_encode(@client_id + ":" + @client_secret)
+      headers["Authorization"] = "Basic " + basic_creds
+    end
+
+    yield form, headers
+
+    uri = parsed_token_uri
+    path = uri.path.empty? ? "/" : uri.path
+    http_client.post(path, form: form, headers: headers)
+  end
+
+  private def get_access_token(&block : Params -> Nil) : AccessToken
+    response = make_token_request do |form, _headers|
+      yield form
+    end
+
+    unless response.status_code >= 200 && response.status_code < 300
+      err_msg = begin
+        err_resp = ErrorResponse.from_json(response.body)
+        desc = err_resp.error_description
+        if desc && !desc.empty?
+          "OAuth2 Error: " + err_resp.error + " - " + desc
+        else
+          "OAuth2 Error: " + err_resp.error
+        end
+      rescue
+        "Unexpected response status: " + response.status_code.to_s + " " + response.body
+      end
+      raise Error.new(err_msg)
+    end
+
+    AccessToken.from_json(response.body)
+  end
+
+  private def parsed_token_uri : URI
+    uri = URI.parse(@token_uri)
+    if uri.host
+      uri
+    else
+      URI.new(scheme: @scheme, host: @host, port: @port, path: @token_uri)
+    end
+  end
+end
+
+# -----------------------------------------------------------------------------
+# OAuth2::Session (Bearer Session with Auto-Refresh)
+# -----------------------------------------------------------------------------
+
+pub class Session
+  getter oauth2_client : Client
+  getter access_token : AccessToken
+  getter expires_at : Time?
+
+  def initialize(@oauth2_client : Client,
+                 @access_token : AccessToken,
+                 @expires_at : Time? = Time.utc,
+                 &callback : Session -> Nil)
+    @callback = callback
+  end
+
+  def authenticate(http_client : HTTP::Client) : Nil
+    check_refresh_token
+    @access_token.authenticate(http_client)
+  end
+
+  private def check_refresh_token : Nil
+    if access_token_expired?
+      refresh_access_token
+      @callback.call(self)
+    end
+  end
+
+  private def access_token_expired? : Bool
+    if exp = @expires_at
+      Time.utc >= exp
+    else
+      false
+    end
+  end
+
+  private def refresh_access_token : Nil
+    old_tok = @access_token
+    new_tok = @oauth2_client.get_access_token_using_refresh_token(old_tok.refresh_token)
+
+    if exp_in = new_tok.expires_in
+      @expires_at = Time.utc + Span.new(seconds: exp_in, nanoseconds: 0)
+    else
+      @expires_at = nil
+    end
+
+    if new_tok.refresh_token.nil?
+      new_tok.refresh_token = old_tok.refresh_token
+    end
+
+    @access_token = new_tok
+  end
+end
+
+# -----------------------------------------------------------------------------
+# Top-Level Aliases
+# -----------------------------------------------------------------------------
+
+pub struct OAuth2
+end
+
+alias ::OAuth2 = Std::Oauth2::OAuth2
+alias ::OAuth2::Client = Std::Oauth2::Client
+alias ::OAuth2::AccessToken = Std::Oauth2::AccessToken
+alias ::OAuth2::AuthScheme = Std::Oauth2::AuthScheme
+alias ::OAuth2::Error = Std::Oauth2::Error
+alias ::OAuth2::ErrorResponse = Std::Oauth2::ErrorResponse
+alias ::OAuth2::Session = Std::Oauth2::Session
+alias ::OAuth2::AccessToken::Bearer = Std::Oauth2::Bearer
+alias ::OAuth2::AccessToken::Mac = Std::Oauth2::Mac

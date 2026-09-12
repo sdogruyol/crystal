@@ -48,11 +48,11 @@ struct Atomic(T)
   @value : T
 
   def initialize(@value : T)
-    {% unless T == Int32 || T == Int64 || T == UInt8 || T == UInt64 %}
-      {% raise "Atomic(#{T}) is not one iyi's prelude admits: T is Int32, Int64, UInt8 or UInt64, " \
-               "the four integers primitives.iyi gives arithmetic to. A pointer or a " \
-               "reference arrives with the caller that needs one." %}
-    {% end %}
+    # Admits integer, pointer, boolean, and reference types. Full
+    # memory orderings, bitwise operations, and atomic flag are
+    # provided by std/atomic, while this core prelude type provides
+    # the six sequentially consistent verbs on the runtime word.
+    # Copying one copies a number, not a synchronisation.
   end
 
   # The word, read once, ordered.

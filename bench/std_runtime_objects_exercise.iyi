@@ -1,0 +1,441 @@
+# Comprehensive exercise for iyi runtime object and error surface:
+# Box, Class, Exception, GC, Kernel, Object, Raise, Reference, ReferenceStorage,
+# Struct, Union, Value, WeakRef, SystemError, Errno, WasiError, and WinError.
+
+import std/runtime_objects
+using std/box::{Box}
+using std/weak_ref::{WeakRef}
+using std/reference_storage::{ReferenceStorage}
+using std/errno::{Errno}
+using std/wasi_error::{WasiError}
+using std/winerror::{WinError}
+using std/kernel::{p, pp, puts_all, print_all, loop, sleep}
+
+class Person
+  getter name : String
+  getter age : Int32
+
+  def initialize(@name : String, @age : Int32)
+  end
+end
+
+struct Point
+  getter x : Int32
+  getter y : Int32
+
+  def initialize(@x : Int32, @y : Int32)
+  end
+end
+
+class CustomAppError < Exception
+  include SystemError
+  extend SystemError::ClassMethods
+
+  def initialize(@message : String? = nil, @cause : Exception? = nil)
+    super(@message, @cause)
+  end
+end
+
+def log_section(name : String) : Nil
+  print "== "
+  print name
+  print "\n"
+end
+
+def log_check(name : String) : Nil
+  print "    "
+  print name
+  print " verified\n"
+end
+
+def fail(message : String) : Nil
+  print "FAIL: "
+  print message
+  print "\n"
+  __iyi_exit(1)
+end
+
+def test_box : Nil
+  log_section("std/box: boxing, unboxing, and type preservation")
+
+  # Value type boxing
+  boxed_int = Box(Int32).box(4242)
+  val = Box(Int32).unbox(boxed_int)
+  fail("box: value int mismatch") unless val == 4242
+  log_check("box: value round-trip")
+
+  # Reference type boxing
+  person = Person.new("Ada", 36)
+  boxed_person = Box(Person).box(person)
+  unboxed_person = Box(Person).unbox(boxed_person)
+  fail("box: reference identity mismatch") unless unboxed_person.same?(person)
+  fail("box: field mismatch") unless unboxed_person.name == "Ada" && unboxed_person.age == 36
+  log_check("box: reference round-trip")
+
+  # Direct container object access
+  container = Box(String).new("hello")
+  fail("box: container object mismatch") unless container.object == "hello"
+  log_check("box: container object access")
+end
+
+def test_weak_ref : Nil
+  log_section("std/weak_ref: weak reference wrapping and dereferencing")
+
+  person = Person.new("Babbage", 79)
+  ref = WeakRef.new(person)
+
+  if deref = ref.value
+    fail("weak_ref: deref name mismatch") unless deref.name == "Babbage"
+    fail("weak_ref: deref age mismatch") unless deref.age == 79
+  else
+    fail("weak_ref: unexpectedly nil")
+  end
+  log_check("weak_ref: live dereference")
+
+  # Allocation method
+  allocated = WeakRef(Person).allocate
+  fail("weak_ref: allocate null") if allocated.value
+  log_check("weak_ref: custom allocate")
+end
+
+def test_reference_storage : Nil
+  log_section("std/reference_storage: decoupled allocation and stack reference storage")
+
+  storage = uninitialized ReferenceStorage(Person)
+  p = Person.unsafe_construct(pointerof(storage).as(Pointer(Void)), "Grace", 85)
+
+  fail("ref_storage: name mismatch") unless p.name == "Grace"
+  fail("ref_storage: age mismatch") unless p.age == 85
+  fail("ref_storage: to_reference mismatch") unless storage.to_reference.name == "Grace"
+  log_check("ref_storage: in-place construction and to_reference")
+
+  storage2 = storage
+  fail("ref_storage: equality mismatch") unless storage == storage2
+  log_check("ref_storage: bytewise equality")
+
+  fail("ref_storage: to_s format") unless storage.to_s.includes?("ReferenceStorage")
+  fail("ref_storage: inspect format") unless storage.inspect.includes?("ReferenceStorage")
+  log_check("ref_storage: string representation")
+end
+
+def test_errno : Nil
+  log_section("std/errno: POSIX errno values, messages, and thread-local state")
+
+  fail("errno: NONE mismatch") unless Errno::NONE.value == 0
+  fail("errno: ENOENT mismatch") unless Errno::ENOENT.value == 2
+  fail("errno: EACCES mismatch") unless Errno::EACCES.value == 13
+  fail("errno: EINVAL mismatch") unless Errno::EINVAL.value == 22
+  log_check("errno: constants")
+
+  fail("errno: ENOENT message") unless Errno::ENOENT.message == "No such file or directory"
+  fail("errno: EACCES message") unless Errno::EACCES.message == "Permission denied"
+  fail("errno: EINVAL message") unless Errno::EINVAL.message == "Invalid argument"
+  log_check("errno: message lookup")
+
+  # Equality and case equality
+  fail("errno: self equality") unless Errno::ENOENT == Errno::ENOENT
+  fail("errno: distinct inequality") if Errno::ENOENT == Errno::EACCES
+  fail("errno: inequality op") unless Errno::ENOENT != Errno::EACCES
+
+  matched = false
+  case Errno::ENOENT
+  when Errno::NONE
+    fail("errno: case matched NONE")
+  when Errno::ENOENT
+    matched = true
+  else
+    fail("errno: case hit else")
+  end
+  fail("errno: case equality failed") unless matched
+  log_check("errno: comparison and case-equality")
+
+  # Setting and getting errno value
+  Errno.value = Errno::EINVAL
+  fail("errno: value get/set") unless Errno.value == Errno::EINVAL
+  Errno.value = Errno::NONE
+  log_check("errno: value get and set")
+end
+
+def test_wasi_error : Nil
+  log_section("std/wasi_error: WASI preview 1 error codes and errno mapping")
+
+  fail("wasi: SUCCESS mismatch") unless WasiError::SUCCESS.value.to_i32 == 0
+  fail("wasi: ENOENT mismatch") unless WasiError::ENOENT.value.to_i32 == 44
+  fail("wasi: EPERM mismatch") unless WasiError::EPERM.value.to_i32 == 63
+  log_check("wasi: constants")
+
+  fail("wasi: ENOENT message") unless WasiError::ENOENT.message.includes?("No such file")
+  log_check("wasi: message lookup")
+
+  fail("wasi: to_errno ENOENT") unless WasiError::ENOENT.to_errno == Errno::ENOENT
+  fail("wasi: to_errno SUCCESS") unless WasiError::SUCCESS.to_errno == Errno::NONE
+  fail("wasi: to_errno EACCES") unless WasiError::EACCES.to_errno == Errno::EACCES
+  log_check("wasi: to_errno translation")
+end
+
+def test_winerror : Nil
+  log_section("std/winerror: Windows System Error Codes and message retrieval")
+
+  fail("winerror: ERROR_SUCCESS") unless WinError::ERROR_SUCCESS.value.to_i32 == 0
+  fail("winerror: ERROR_FILE_NOT_FOUND") unless WinError::ERROR_FILE_NOT_FOUND.value.to_i32 == 2
+  fail("winerror: ERROR_ACCESS_DENIED") unless WinError::ERROR_ACCESS_DENIED.value.to_i32 == 5
+  log_check("winerror: constants")
+
+  fail("winerror: file not found message") unless WinError::ERROR_FILE_NOT_FOUND.message.includes?("cannot find the file")
+  log_check("winerror: message lookup")
+
+  fail("winerror: value access") unless WinError.value == WinError::ERROR_SUCCESS
+  fail("winerror: wsa_value access") unless WinError.wsa_value == WinError::ERROR_SUCCESS
+
+  nt_mapped = WinError.from_ntstatus(0_u32)
+  fail("winerror: from_ntstatus") unless nt_mapped == WinError::ERROR_SUCCESS
+  log_check("winerror: values and ntstatus mapping")
+end
+
+def test_system_error : Nil
+  log_section("std/system_error: system error wrapping and message formatting")
+
+  err = CustomAppError.from_errno("open file", Errno::ENOENT)
+  fail("system_error: message formatting") unless err.message == "open file: No such file or directory"
+  fail("system_error: os_error tracking") unless err.os_error == Errno::ENOENT
+  log_check("system_error: from_errno")
+
+  win_err = CustomAppError.from_winerror("registry read", WinError::ERROR_FILE_NOT_FOUND)
+  fail("system_error: winerror message") unless win_err.message == "registry read: The system cannot find the file specified."
+  fail("system_error: winerror tracking") unless win_err.os_error == WinError::ERROR_FILE_NOT_FOUND
+  log_check("system_error: from_winerror")
+
+  wsa_err = CustomAppError.from_wsa_error("socket connect", WinError::WSAECONNREFUSED)
+  fail("system_error: wsa message") unless (wsa_err.message || "").includes?("actively refused")
+  log_check("system_error: from_wsa_error")
+
+  # Standalone os_error_message
+  custom_msg = CustomAppError.os_error_message(Errno::EACCES)
+  fail("system_error: os_error_message") unless custom_msg == "Permission denied"
+  log_check("system_error: helper message derivation")
+end
+
+def test_gc : Nil
+  log_section("std/gc: garbage collector interface, allocation, and stats")
+
+  ptr = GC.malloc(128)
+  fail("gc: malloc null") if ptr.address == 0
+  log_check("gc: malloc")
+
+  ptr_atomic = GC.malloc_atomic(64)
+  fail("gc: malloc_atomic null") if ptr_atomic.address == 0
+  log_check("gc: malloc_atomic")
+
+  realloc_ptr = GC.realloc(ptr, 256)
+  fail("gc: realloc null") if realloc_ptr.address == 0
+  log_check("gc: realloc")
+
+  GC.free(realloc_ptr)
+  GC.collect
+  GC.enable
+  GC.disable
+  log_check("gc: collection control hooks")
+
+  stats = GC.stats
+  fail("gc: stats type") unless stats.heap_size >= 0_u64
+  clone_stats = stats.clone
+  fail("gc: stats clone") unless clone_stats.heap_size == stats.heap_size
+  copied_stats = stats.copy_with(heap_size: 1024_u64)
+  fail("gc: stats copy_with") unless copied_stats.heap_size == 1024_u64
+  log_check("gc: stats and copy_with")
+
+  prof = GC.prof_stats
+  fail("gc: prof_stats") unless prof.heap_size >= 0_u64
+  log_check("gc: prof_stats")
+
+  # Syscall yielding
+  called = false
+  GC.syscall do
+    called = true
+  end
+  fail("gc: syscall block not executed") unless called
+  log_check("gc: syscall block wrapping")
+end
+
+def test_kernel : Nil
+  log_section("std/kernel: top-level printing, inspection, looping, and timing")
+
+  # p and pp return their argument
+  ret_p = p(100)
+  fail("kernel: p return") unless ret_p == 100
+
+  ret_pp = pp("test_kernel")
+  fail("kernel: pp return") unless ret_pp == "test_kernel"
+  log_check("kernel: p and pp single argument")
+
+  # Splat p and pp
+  ret_p_splat = p(10, "a", true)
+  fail("kernel: p splat") unless ret_p_splat == {10, "a", true}
+
+  ret_pp_splat = pp("x", 42)
+  fail("kernel: pp splat") unless ret_pp_splat == {"x", 42}
+  log_check("kernel: p and pp splat")
+
+  # puts_all and print_all
+  puts_all("val1", "val2")
+  print_all("inline1", "inline2", "\n")
+  log_check("kernel: puts_all and print_all")
+
+  # loop with break
+  count = 0
+  loop do
+    count = count + 1
+    break if count == 5
+  end
+  fail("kernel: loop count mismatch") unless count == 5
+  log_check("kernel: loop construct")
+
+  # sleep duration
+  t0 = __iyi_monotonic_ns
+  sleep(0.01) # 10ms
+  elapsed = (__iyi_monotonic_ns - t0) // 1_000_000_i64
+  fail("kernel: sleep too short") unless elapsed >= 5
+  sleep(0)  # Boundary: zero sleep
+  sleep(-1) # Boundary: negative sleep
+  log_check("kernel: sleep durations and boundaries")
+end
+
+def test_exception_hierarchy : Nil
+  log_section("std/exception: exception hierarchy, backtraces, and cause chaining")
+
+  # Inner and outer cause chaining
+  inner = Exception.new("inner reason")
+  outer = Exception.new("outer reason", inner)
+  fail("exception: message") unless outer.message == "outer reason"
+  fail("exception: cause message") unless (if c = outer.cause
+                                            c.message
+                                          end) == "inner reason"
+  log_check("exception: cause chaining")
+
+  # CallStack inspection
+  outer.callstack = Exception::CallStack.new(["file1.iyi:10 in run", "file2.iyi:20 in main"])
+  fail("exception: backtrace count") unless outer.backtrace.size == 2
+  fail("exception: backtrace entry") unless outer.backtrace[0] == "file1.iyi:10 in run"
+  log_check("exception: callstack and backtrace")
+
+  # String representations
+  fail("exception: to_s") unless outer.to_s == "outer reason"
+  fail("exception: inspect") unless outer.inspect.includes?("outer reason")
+  full_trace = outer.inspect_with_backtrace
+  fail("exception: inspect_with_backtrace missing outer") unless full_trace.includes?("outer reason")
+  fail("exception: inspect_with_backtrace missing inner") unless full_trace.includes?("inner reason")
+  fail("exception: inspect_with_backtrace missing frame") unless full_trace.includes?("file1.iyi:10")
+  log_check("exception: inspect_with_backtrace formatting")
+
+  # Standard exception subclasses
+  idx = IndexError.new
+  fail("exception: IndexError default") unless idx.message == "Index out of bounds"
+  arg = ArgumentError.new("bad param")
+  fail("exception: ArgumentError custom") unless arg.message == "bad param"
+  byte_err = InvalidByteSequenceError.new
+  fail("exception: InvalidByteSequenceError") unless (byte_err.message || "").includes?("Invalid byte sequence")
+  key_err = KeyError.new
+  fail("exception: KeyError") unless key_err.message == "Missing key"
+  div_err = DivisionByZeroError.new
+  fail("exception: DivisionByZeroError") unless div_err.message == "Division by 0"
+  ovf_err = OverflowError.new
+  fail("exception: OverflowError") unless ovf_err.message == "Arithmetic overflow"
+  ni_err = NotImplementedError.new("feature_x")
+  fail("exception: NotImplementedError") unless ni_err.message == "Not Implemented: feature_x"
+  nil_err = NilAssertionError.new
+  fail("exception: NilAssertionError") unless nil_err.message == "Nil assertion failed"
+  rt_err = RuntimeError.new("runtime fail")
+  fail("exception: RuntimeError") unless rt_err.message == "runtime fail"
+  log_check("exception: standard error subclasses")
+end
+
+def test_object_and_class : Nil
+  log_section("std/runtime_objects: Object, Class, Reference, Struct, and Value APIs")
+
+  # Object methods: tap, try, itself
+  tapped = 0
+  num = 15.tap { |n| tapped = n }.itself
+  fail("object: tap") unless tapped == 15
+  fail("object: itself") unless num == 15
+  computed = num.try { |n| n + 10 }
+  fail("object: try") unless computed == 25
+  log_check("object: tap, try, and itself")
+
+  # Object pattern match and negation
+  fail("object: !~") unless 123 !~ "foo"
+  fail("object: =~") unless (123 =~ "foo") == nil
+  log_check("object: pattern match and negation")
+
+  # Object in? membership
+  fail("object: in? hit") unless 10.in?(5, 10, 15)
+  fail("object: in? miss") if 20.in?(5, 10, 15)
+  log_check("object: in? alternation")
+
+  # Object unsafe_as
+  val_u32 = 0x12345678_u32
+  as_i32 = val_u32.unsafe_as(Int32)
+  fail("object: unsafe_as") unless as_i32 == 0x12345678_i32
+  log_check("object: unsafe_as reinterpret cast")
+
+  # Class comparisons and subtyping
+  fail("class: equality") unless Int32 == Int32
+  fail("class: inequality") if Int32 == String
+  fail("class: subtyping <") unless Int32 < Number
+  fail("class: subtyping < false") if Number < Int32
+  fail("class: subtyping <=") unless Int32 <= Int32
+  fail("class: subtyping >") unless Number > Int32
+  fail("class: subtyping >=") unless Number >= Int32
+  fail("class: case equality true") unless Int32 === 42
+  fail("class: case equality false") if Int32 === "text"
+  fail("class: name") unless Int32.name == "Int32"
+  fail("class: nilable? false") if Int32.nilable?
+  fail("class: nilable? true") unless Nil.nilable?
+  fail("class: dup") unless Int32.dup == Int32
+  fail("class: clone") unless Int32.clone == Int32
+  log_check("class: subtyping, operators, and reflection")
+
+  # Reference identity, same?, dup
+  p1 = Person.new("Carol", 40)
+  p2 = Person.new("Carol", 40)
+  p3 = p1
+  p4 = p1.dup
+
+  fail("reference: same? true") unless p1.same?(p3)
+  fail("reference: same? false") if p1.same?(p2)
+  fail("reference: same? nil") if p1.same?(nil)
+  fail("reference: == true") unless p1 == p3
+  fail("reference: == false") if p1 == p2
+  fail("reference: dup field") unless p4.name == "Carol" && p4.age == 40
+  fail("reference: dup distinct identity") if p4.same?(p1)
+  log_check("reference: identity, equality, and dup")
+
+  # Struct equality, hash, dup
+  pt1 = Point.new(3, 4)
+  pt2 = Point.new(3, 4)
+  pt3 = Point.new(5, 6)
+  pt4 = pt1.dup
+
+  fail("struct: equality true") unless pt1 == pt2
+  fail("struct: equality false") if pt1 == pt3
+  fail("struct: dup") unless pt4 == pt1
+  fail("struct: hash match") unless pt1.hash == pt2.hash
+  log_check("struct: equality, dup, and hash")
+
+  # Value equality
+  fail("value: equality mismatch") if pt1 == "string"
+  log_check("value: cross-type inequality")
+end
+
+test_box
+test_weak_ref
+test_reference_storage
+test_errno
+test_wasi_error
+test_winerror
+test_system_error
+test_gc
+test_kernel
+test_exception_hierarchy
+test_object_and_class
+
+puts "all std/runtime_objects checks passed"

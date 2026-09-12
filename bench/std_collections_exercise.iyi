@@ -1,0 +1,406 @@
+# Standard library collections exercise: Deque, Set, and Tuple.
+#
+# Verifies:
+#   1. Deque: double-ended queue over a ring buffer (push, unshift, pop, shift, [], []=).
+#   2. Deque: ring-buffer index arithmetic across wraparound (both branches of wraparound).
+#   3. Deque: growth-while-wrapped preserving contiguous logical order.
+#   4. Deque: rotate, insert, and delete_at with element shifting.
+#   5. Deque: Indexable surface (fetch, each, reverse_each, bsearch, values_at, etc.).
+#   6. Set: full mathematical algebra (| union, & intersection, - difference, ^ symmetric difference).
+#   7. Set: algebraic identities (inclusion-exclusion, De Morgan on bounded universe, a - a, a ^ a).
+#   8. Set: relations (subset_of?, proper_subset_of?, superset_of?, proper_superset_of?, disjoint?, intersects?, ==).
+#   9. Set: Enumerable integration (all?, any?, map, select, reject, reduce, count).
+#  10. Tuple & NamedTuple: fixed-size heterogeneous sequences, compile-time indexing,
+#      size, empty?, first/last, ==, map, to_a, keys, values, has_key?.
+
+module bench/std_collections_exercise
+
+import std/deque
+using std/deque::{Deque}
+import std/set
+using std/set::{Set}
+import std/tuple
+
+def assert_true(cond : Bool, msg : String) : Nil
+  if !cond
+    raise "ASSERTION FAILED: #{msg}"
+  end
+end
+
+def assert_equal(expected : Int32, actual : Int32, msg : String) : Nil
+  if expected != actual
+    raise "ASSERTION FAILED: #{msg} (expected #{expected}, got #{actual})"
+  end
+end
+
+def assert_str_equal(expected : String, actual : String, msg : String) : Nil
+  if expected != actual
+    raise "ASSERTION FAILED: #{msg} (expected '#{expected}', got '#{actual}')"
+  end
+end
+
+# ===========================================================================
+# Section 1: Deque basic operations and ring buffer mechanics
+# ===========================================================================
+puts "== deque surface: basic operations"
+
+d = Deque(Int32).new
+assert_true(d.empty?, "new deque is empty")
+assert_equal(0, d.size, "new deque size is 0")
+assert_true(d.first?.nil?, "first? on empty deque is nil")
+assert_true(d.last?.nil?, "last? on empty deque is nil")
+assert_true(d[0]?.nil?, "[]? on empty deque is nil")
+
+# FIFO queue: push 10, 20, 30; shift -> 10, 20, 30
+d.push(10)
+d.push(20)
+d.push(30)
+assert_equal(3, d.size, "size after 3 pushes")
+assert_equal(10, d.first, "first is 10")
+assert_equal(30, d.last, "last is 30")
+assert_equal(10, d[0], "d[0] is 10")
+assert_equal(20, d[1], "d[1] is 20")
+assert_equal(30, d[2], "d[2] is 30")
+assert_equal(30, d[-1], "d[-1] is 30")
+assert_equal(20, d[-2], "d[-2] is 20")
+assert_equal(10, d[-3], "d[-3] is 10")
+
+assert_equal(10, d.shift, "shift returns 10")
+assert_equal(20, d.shift, "shift returns 20")
+assert_equal(30, d.shift, "shift returns 30")
+assert_true(d.empty?, "deque is empty after shifting all")
+
+# LIFO stack: unshift 100, 200, 300; pop -> 100, 200, 300
+d.unshift(100)
+d.unshift(200)
+d.unshift(300)
+assert_equal(3, d.size, "size after 3 unshifts")
+assert_equal(300, d[0], "d[0] is 300")
+assert_equal(200, d[1], "d[1] is 200")
+assert_equal(100, d[2], "d[2] is 100")
+
+assert_equal(100, d.pop, "pop returns 100")
+assert_equal(200, d.pop, "pop returns 200")
+assert_equal(300, d.pop, "pop returns 300")
+assert_true(d.empty?, "deque is empty after popping all")
+
+# Bulk shift and pop
+d2 = Deque(Int32).new([1, 2, 3, 4, 5, 6])
+d2.shift(2)
+assert_equal(4, d2.size, "size after shift(2)")
+assert_equal(3, d2.first, "first after shift(2) is 3")
+d2.pop(2)
+assert_equal(2, d2.size, "size after pop(2)")
+assert_equal(4, d2.last, "last after pop(2) is 4")
+
+puts "deque surface: all passed"
+
+# ===========================================================================
+# Section 2: Deque wraparound and growth while wrapped
+# ===========================================================================
+puts "\n== deque wraparound: fill, wrap, and grow while wrapped"
+
+# Test Branch 1: old_capacity - @start >= @start
+# Start with capacity 4.
+w1 = Deque(Int32).new(4)
+assert_equal(4, w1.capacity, "initial capacity 4")
+
+# Push 2 items, shift 2 items -> @start advances to 2
+w1.push(11)
+w1.push(22)
+w1.shift # removes 11, @start = 1
+w1.shift # removes 22, @start = 2
+assert_equal(0, w1.size, "size 0 after shifting")
+
+# Now push 4 items -> buffer[2], buffer[3], buffer[0], buffer[1] (wrapped!)
+w1.push(33) # at buffer[2]
+w1.push(44) # at buffer[3]
+w1.push(55) # at buffer[0] (wrapped)
+w1.push(66) # at buffer[1] (wrapped)
+assert_equal(4, w1.size, "full wrapped size 4")
+assert_equal(4, w1.capacity, "full wrapped capacity 4")
+
+# Verify indexed read across wrap boundary
+assert_equal(33, w1[0], "wrapped w1[0] is 33")
+assert_equal(44, w1[1], "wrapped w1[1] is 44")
+assert_equal(55, w1[2], "wrapped w1[2] is 55")
+assert_equal(66, w1[3], "wrapped w1[3] is 66")
+
+# Verify negative index across wrap boundary
+assert_equal(66, w1[-1], "wrapped w1[-1] is 66")
+assert_equal(55, w1[-2], "wrapped w1[-2] is 55")
+assert_equal(44, w1[-3], "wrapped w1[-3] is 44")
+assert_equal(33, w1[-4], "wrapped w1[-4] is 33")
+
+# GROW WHILE WRAPPED: triggers resize from 4 to 8
+# old_capacity = 4, @start = 2. 4 - 2 >= 2 -> moves wrapped elements [0..1] to [4..5]
+w1.push(77)
+assert_equal(5, w1.size, "grown size is 5")
+assert_equal(8, w1.capacity, "grown capacity is 8")
+
+# Check all 5 elements in exact logical order
+assert_equal(33, w1[0], "post-growth w1[0]")
+assert_equal(44, w1[1], "post-growth w1[1]")
+assert_equal(55, w1[2], "post-growth w1[2]")
+assert_equal(66, w1[3], "post-growth w1[3]")
+assert_equal(77, w1[4], "post-growth w1[4]")
+
+# Test Branch 2: old_capacity - @start < @start
+# Start with capacity 4, advance @start to 3.
+w2 = Deque(Int32).new(4)
+w2.push(1)
+w2.push(2)
+w2.push(3)
+w2.shift
+w2.shift
+w2.shift # @start = 3
+
+# Push 4 items -> buffer[3], buffer[0], buffer[1], buffer[2]
+w2.push(10) # at buffer[3]
+w2.push(20) # at buffer[0]
+w2.push(30) # at buffer[1]
+w2.push(40) # at buffer[2]
+assert_equal(4, w2.size, "w2 wrapped size 4")
+assert_equal(10, w2[0], "w2[0]")
+assert_equal(40, w2[3], "w2[3]")
+
+# Grow while wrapped: old_capacity = 4, @start = 3. 4 - 3 = 1 < 3 -> moves head items to end
+w2.push(50)
+assert_equal(5, w2.size, "w2 grown size 5")
+assert_equal(8, w2.capacity, "w2 grown capacity 8")
+
+assert_equal(10, w2[0], "w2 post-growth [0]")
+assert_equal(20, w2[1], "w2 post-growth [1]")
+assert_equal(30, w2[2], "w2 post-growth [2]")
+assert_equal(40, w2[3], "w2 post-growth [3]")
+assert_equal(50, w2[4], "w2 post-growth [4]")
+
+puts "deque wraparound: all passed"
+
+# ===========================================================================
+# Section 3: Deque rotate, insert, delete_at
+# ===========================================================================
+puts "\n== deque manipulation: rotate, insert, delete_at"
+
+# Rotate
+r = Deque(Int32).new([1, 2, 3, 4, 5])
+r.rotate(1)
+assert_str_equal("Deque{2, 3, 4, 5, 1}", r.to_s, "rotate 1")
+r.rotate(2)
+assert_str_equal("Deque{4, 5, 1, 2, 3}", r.to_s, "rotate 2")
+r.rotate(-1)
+assert_str_equal("Deque{3, 4, 5, 1, 2}", r.to_s, "rotate -1")
+r.rotate(-2)
+assert_str_equal("Deque{1, 2, 3, 4, 5}", r.to_s, "rotate -2 (restored)")
+
+# Insert
+ins = Deque(Int32).new([10, 20, 30, 40])
+ins.insert(0, 5) # unshift path
+assert_str_equal("Deque{5, 10, 20, 30, 40}", ins.to_s, "insert at 0")
+ins.insert(5, 50) # push path
+assert_str_equal("Deque{5, 10, 20, 30, 40, 50}", ins.to_s, "insert at end")
+ins.insert(2, 99) # interior insert
+assert_str_equal("Deque{5, 10, 99, 20, 30, 40, 50}", ins.to_s, "insert interior")
+
+# Delete at
+del_first = ins.delete_at(0) # shift path
+assert_equal(5, del_first, "delete_at 0 returns 5")
+del_last = ins.delete_at(ins.size - 1) # pop path
+assert_equal(50, del_last, "delete_at last returns 50")
+del_mid = ins.delete_at(1) # interior delete (the 99)
+assert_equal(99, del_mid, "delete_at mid returns 99")
+assert_str_equal("Deque{10, 20, 30, 40}", ins.to_s, "delete_at restored sequence")
+
+# Concat and +
+c1 = Deque(Int32).new([1, 2])
+c2 = Deque(Int32).new([3, 4])
+c3 = c1 + c2
+assert_str_equal("Deque{1, 2, 3, 4}", c3.to_s, "deque concatenation +")
+assert_str_equal("Deque{1, 2}", c1.to_s, "c1 unaffected by +")
+
+# Indexable methods
+idx_d = Deque(Int32).new([10, 20, 30, 40, 50])
+assert_equal(30, idx_d.fetch(2, 0), "fetch in bounds")
+assert_equal(999, idx_d.fetch(10, 999), "fetch out of bounds default")
+assert_equal(2, idx_d.index(30) || -1, "index of 30")
+assert_true(idx_d.index(999).nil?, "index of missing element")
+assert_str_equal("10-20-30-40-50", idx_d.join("-"), "join with separator")
+assert_equal(30, idx_d.bsearch { |x| x >= 25 } || -1, "bsearch found 30")
+assert_true(idx_d.equals?(Deque(Int32).new([10, 20, 30, 40, 50])), "equals? identical deque")
+
+puts "deque manipulation: all passed"
+
+# ===========================================================================
+# Section 4: Set algebra and mathematical identities
+# ===========================================================================
+puts "\n== set algebra: operations and identities"
+
+s1 = Set(Int32).new([1, 2, 3, 4, 5])
+s2 = Set(Int32).new([4, 5, 6, 7, 8])
+
+assert_equal(5, s1.size, "s1 size is 5")
+assert_equal(5, s2.size, "s2 size is 5")
+assert_true(s1.includes?(3), "s1 includes 3")
+assert_true(!s1.includes?(8), "s1 does not include 8")
+
+# 1. Union (|) and Addition (+)
+u = s1 | s2
+assert_equal(8, u.size, "union size is 8")
+assert_true(u == (s1 + s2), "union | equals +")
+assert_true(u.includes?(1) && u.includes?(8), "union contains elements from both")
+
+# 2. Intersection (&)
+inter = s1 & s2
+assert_equal(2, inter.size, "intersection size is 2")
+assert_true(inter.includes?(4) && inter.includes?(5), "intersection contains common elements 4 and 5")
+
+# 3. Inclusion-Exclusion Principle: |A ∪ B| = |A| + |B| - |A ∩ B|
+assert_equal(u.size, s1.size + s2.size - inter.size, "inclusion-exclusion identity holds")
+
+# 4. Difference (-)
+diff1 = s1 - s2
+assert_equal(3, diff1.size, "s1 - s2 size is 3")
+assert_true(diff1.includes?(1) && diff1.includes?(2) && diff1.includes?(3), "s1 - s2 elements")
+
+diff2 = s2 - s1
+assert_equal(3, diff2.size, "s2 - s1 size is 3")
+assert_true(diff2.includes?(6) && diff2.includes?(7) && diff2.includes?(8), "s2 - s1 elements")
+
+# Self difference identity: A - A is empty
+empty_diff = s1 - s1
+assert_true(empty_diff.empty?, "a - a is empty")
+assert_equal(0, empty_diff.size, "a - a size is 0")
+
+# 5. Symmetric Difference (^): A ^ B = (A - B) ∪ (B - A) = (A ∪ B) - (A ∩ B)
+symm = s1 ^ s2
+assert_equal(6, symm.size, "symmetric difference size is 6")
+assert_true(symm == (diff1 | diff2), "A ^ B == (A - B) | (B - A)")
+assert_true(symm == (u - inter), "A ^ B == (A | B) - (A & B)")
+
+# Self symmetric difference identity: A ^ A is empty
+empty_symm = s1 ^ s2 ^ (s1 ^ s2)
+assert_true((s1 ^ s1).empty?, "a ^ a is empty")
+assert_equal(0, (s1 ^ s1).size, "a ^ a size is 0")
+
+# 6. De Morgan's Laws on a bounded universe U = {1..20}
+univ = Set(Int32).new([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20])
+sub_a = Set(Int32).new([2, 4, 6, 8, 10, 12])
+sub_b = Set(Int32).new([6, 8, 10, 12, 14, 16])
+
+# Law 1: (A ∪ B)' = A' ∩ B'
+comp_union = univ - (sub_a | sub_b)
+inter_comps = (univ - sub_a) & (univ - sub_b)
+assert_true(comp_union == inter_comps, "De Morgan Law 1: (A | B)' == A' & B'")
+
+# Law 2: (A ∩ B)' = A' ∪ B'
+comp_inter = univ - (sub_a & sub_b)
+union_comps = (univ - sub_a) | (univ - sub_b)
+assert_true(comp_inter == union_comps, "De Morgan Law 2: (A & B)' == A' | B'")
+
+# 7. Subset / Superset relations
+assert_true(s1.subset_of?(u), "s1 is subset of union")
+assert_true(inter.subset_of?(s1), "intersection is subset of s1")
+assert_true(u.superset_of?(s1), "union is superset of s1")
+assert_true(s1.subset_of?(s1), "s1 is subset of self")
+assert_true(!s1.proper_subset_of?(s1), "s1 is NOT proper subset of self")
+assert_true(inter.proper_subset_of?(s1), "intersection is proper subset of s1")
+assert_true(u.proper_superset_of?(s1), "union is proper superset of s1")
+
+# Disjointness and Intersection
+assert_true(diff1.disjoint?(diff2), "s1 - s2 is disjoint from s2 - s1")
+assert_true(!s1.disjoint?(s2), "s1 and s2 are not disjoint")
+assert_true(s1.intersects?(s2), "s1 intersects s2")
+assert_true(!diff1.intersects?(diff2), "s1 - s2 does not intersect s2 - s1")
+
+# Enumerable surface on Set
+assert_true(s1.any? { |x| x == 3 }, "Enumerable#any? on Set")
+assert_true(s1.all? { |x| x > 0 }, "Enumerable#all? on Set")
+assert_true(s1.none? { |x| x > 10 }, "Enumerable#none? on Set")
+assert_equal(15, s1.reduce(0) { |acc, x| acc + x }, "Enumerable#reduce on Set")
+assert_str_equal("10,20,30,40,50", s1.map { |x| x * 10 }.join(","), "Enumerable#map on Set")
+
+# Conversions
+arr_from_set = s1.to_a
+assert_equal(5, arr_from_set.size, "to_a size")
+set_from_arr = [100, 200, 300].to_set
+assert_equal(3, set_from_arr.size, "Array#to_set size")
+assert_true(set_from_arr.includes?(200), "Array#to_set elements")
+
+# Bridge from prelude Set
+prelude_set = ::Set(Int32).new
+prelude_set.add(777)
+std_set = prelude_set.to_std
+assert_equal(1, std_set.size, "to_std bridge size")
+assert_true(std_set.includes?(777), "to_std bridge elements")
+
+puts "set algebra: all passed"
+
+# ===========================================================================
+# Section 5: Tuple and NamedTuple
+# ===========================================================================
+puts "\n== tuple and named_tuple surface"
+
+# Tuple
+t = {1, "hello", true}
+assert_equal(3, t.size, "tuple size is 3")
+assert_true(!t.empty?, "tuple is not empty")
+assert_equal(1, t.first, "tuple first is 1")
+assert_true(t.last, "tuple last is true")
+assert_true(t == {1, "hello", true}, "tuple equality")
+assert_true(!(t == {1, "world", true}), "tuple inequality")
+
+# Map over tuple
+mapped_t = {10, 20, 30}.map { |x| x * 2 }
+assert_true(mapped_t == {20, 40, 60}, "tuple map {20, 40, 60}")
+
+# Tuple to_a (union type)
+t_arr = t.to_a
+assert_equal(3, t_arr.size, "tuple to_a size")
+assert_str_equal("{1, \"hello\", true}", t.to_s, "tuple to_s")
+
+# Tuple.new constructor
+t_constructed = Tuple.new(42, "answer")
+assert_equal(2, t_constructed.size, "Tuple.new size")
+assert_equal(42, t_constructed[0], "Tuple.new elements")
+
+# NamedTuple
+nt = {name: "Alice", age: 30, verified: true}
+assert_equal(3, nt.size, "named_tuple size is 3")
+assert_true(!nt.empty?, "named_tuple is not empty")
+assert_true(nt.has_key?(:name), "has_key? :name")
+assert_true(!nt.has_key?(:missing), "has_key? :missing is false")
+assert_true(nt == {name: "Alice", age: 30, verified: true}, "named_tuple equality")
+assert_true(!(nt == {name: "Bob", age: 30, verified: true}), "named_tuple inequality")
+
+# Keys and Values
+nt_keys = nt.keys
+assert_true(nt_keys == {:name, :age, :verified}, "named_tuple keys")
+nt_vals = nt.values
+assert_equal(3, nt_vals.size, "named_tuple values size")
+assert_str_equal("{name: \"Alice\", age: 30, verified: true}", nt.to_s, "named_tuple to_s")
+
+puts "tuple and named_tuple: all passed"
+
+# ---------------------------------------------------------------------------
+# Probe triggers for failure proofs
+# ---------------------------------------------------------------------------
+if Program.args.size > 0
+  mode = Program.args[0]
+  case mode
+  when "probe_deque_out_of_range"
+    d_probe = Deque(Int32).new
+    d_probe.push(1)
+    d_probe[5]
+  when "probe_deque_empty_pop"
+    d_probe = Deque(Int32).new
+    d_probe.pop
+  when "probe_deque_empty_shift"
+    d_probe = Deque(Int32).new
+    d_probe.shift
+  when "probe_deque_negative_capacity"
+    Deque(Int32).new(-5)
+  else
+    raise "unknown probe mode: #{mode}"
+  end
+end
+puts "\nall collections checks passed"

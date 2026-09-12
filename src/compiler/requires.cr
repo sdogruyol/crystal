@@ -1,3 +1,4 @@
+require "ecr/processor"
 require "./iyi/annotatable"
 require "./iyi/program"
 require "./iyi/*"

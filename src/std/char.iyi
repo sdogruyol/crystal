@@ -1,0 +1,393 @@
+module std/char
+
+import std/traits
+using std/traits::{Cmp}
+import std/comparable
+using std/comparable::{Comparable}
+
+struct ::Char
+  def -(other : ::Char) : Int32
+    ord - other.ord
+  end
+
+  def +(other : Int) : ::Char
+    (ord + other.to_i32).unsafe_chr
+  end
+
+  def -(other : Int) : ::Char
+    (ord - other.to_i32).unsafe_chr
+  end
+
+  def <=>(other : ::Char) : Int32
+    ord < other.ord ? -1 : (ord > other.ord ? 1 : 0)
+  end
+
+  def <(other : ::Char) : ::Bool
+    ord < other.ord
+  end
+
+  def <=(other : ::Char) : ::Bool
+    ord <= other.ord
+  end
+
+  def >(other : ::Char) : ::Bool
+    ord > other.ord
+  end
+
+  def >=(other : ::Char) : ::Bool
+    ord >= other.ord
+  end
+
+  def step(*, to limit = nil, exclusive : ::Bool = false, & : ::Char -> ::Nil) : ::Nil
+    current = self
+    if !limit.nil?
+      dir = limit <=> current
+      return if dir == 0 && exclusive
+      while true
+        if dir >= 0
+          break if current > limit || (current == limit && exclusive)
+        else
+          break if current < limit || (current == limit && exclusive)
+        end
+        yield current
+        current = dir >= 0 ? current.succ : current.pred
+      end
+    else
+      while true
+        yield current
+        current = current.succ
+      end
+    end
+  end
+
+  def ascii? : ::Bool
+    ord < 128
+  end
+
+  def ascii_number?(base : Int = 10) : ::Bool
+    !to_i?(base).nil?
+  end
+
+  def number? : ::Bool
+    ascii_number?
+  end
+
+  def ascii_lowercase? : ::Bool
+    self >= 'a' && self <= 'z'
+  end
+
+  def lowercase? : ::Bool
+    ascii_lowercase?
+  end
+
+  def ascii_uppercase? : ::Bool
+    self >= 'A' && self <= 'Z'
+  end
+
+  def uppercase? : ::Bool
+    ascii_uppercase?
+  end
+
+  def titlecase? : ::Bool
+    false
+  end
+
+  def ascii_letter? : ::Bool
+    ascii_lowercase? || ascii_uppercase?
+  end
+
+  def letter? : ::Bool
+    ascii_letter?
+  end
+
+  def ascii_alphanumeric? : ::Bool
+    ascii_letter? || ascii_number?
+  end
+
+  def alphanumeric? : ::Bool
+    ascii_alphanumeric?
+  end
+
+  def ascii_whitespace? : ::Bool
+    self == ' ' || (ord >= 9 && ord <= 13)
+  end
+
+  def whitespace? : ::Bool
+    ascii_whitespace?
+  end
+
+  def hex? : ::Bool
+    ascii_number?(16)
+  end
+
+  def ascii_control? : ::Bool
+    ord < 32 || ord == 127
+  end
+
+  def control? : ::Bool
+    ascii_control?
+  end
+
+  def printable? : ::Bool
+    !control? && (!whitespace? || self == ' ')
+  end
+
+  def in_set?(set : String) : ::Bool
+    i = 0
+    if set.bytesize > 0 && set.to_unsafe[0] == 94_u8
+      negated = true
+      i = 1
+    end
+
+    matched = false
+    while i < set.bytesize
+      if i + 2 < set.bytesize && set.to_unsafe[i + 1] == 45_u8
+        start_c = set.to_unsafe[i].to_i32
+        end_c = set.to_unsafe[i + 2].to_i32
+        if ord >= start_c && ord <= end_c
+          matched = true
+          break
+        end
+        i = i + 3
+      else
+        if ord == set.to_unsafe[i].to_i32
+          matched = true
+          break
+        end
+        i = i + 1
+      end
+    end
+
+    negated ? !matched : matched
+  end
+
+  def downcase : ::Char
+    ascii_uppercase? ? (ord + 32).unsafe_chr : self
+  end
+
+  def upcase : ::Char
+    ascii_lowercase? ? (ord - 32).unsafe_chr : self
+  end
+
+  def succ : ::Char
+    (ord + 1).unsafe_chr
+  end
+
+  def pred : ::Char
+    (ord - 1).unsafe_chr
+  end
+
+  def to_i?(base : Int = 10) : Int32?
+    b = base.to_i32
+    return nil if b < 2 || b > 36
+    val = if self >= '0' && self <= '9'
+            ord - 48
+          elsif self >= 'a' && self <= 'z'
+            ord - 97 + 10
+          elsif self >= 'A' && self <= 'Z'
+            ord - 65 + 10
+          else
+            -1
+          end
+    (val >= 0 && val < b) ? val : nil
+  end
+
+  def to_i(base : Int = 10) : Int32
+    to_i?(base) || raise "Invalid integer: #{self}"
+  end
+
+  def to_i8(base : Int = 10) : Int8
+    to_i(base).to_i8
+  end
+
+  def to_i16(base : Int = 10) : Int16
+    to_i(base).to_i16
+  end
+
+  def to_i32(base : Int = 10) : Int32
+    to_i(base)
+  end
+
+  def to_i64(base : Int = 10) : Int64
+    to_i(base).to_i64
+  end
+
+  def to_u8(base : Int = 10) : UInt8
+    to_i(base).to_u8
+  end
+
+  def to_u16(base : Int = 10) : UInt16
+    to_i(base).to_u16
+  end
+
+  def to_u32(base : Int = 10) : UInt32
+    to_i(base).to_u32
+  end
+
+  def to_u64(base : Int = 10) : UInt64
+    to_i(base).to_u64
+  end
+
+  def to_f : Float64
+    to_i.to_f64
+  end
+
+  def to_f32 : Float32
+    to_i.to_f32
+  end
+
+  def to_f64 : Float64
+    to_i.to_f64
+  end
+
+  def inspect : String
+    "'" + to_s + "'"
+  end
+
+  def inspect(io : IyiIO) : ::Nil
+    io.print(inspect)
+  end
+
+  def dump : String
+    inspect
+  end
+
+  def dump(io : IyiIO) : ::Nil
+    io.print(dump)
+  end
+
+  def unicode_escape : String
+    "\\u" + ord.to_s(16)
+  end
+
+  def unicode_escape(io : IyiIO) : ::Nil
+    io.print(unicode_escape)
+  end
+
+  def bytesize : Int32
+    c = ord
+    if c <= 0x7f
+      1
+    elsif c <= 0x7ff
+      2
+    elsif c <= 0xffff
+      3
+    else
+      4
+    end
+  end
+
+  def each_byte(& : UInt8 -> ::Nil) : ::Nil
+    c = ord
+    if c <= 0x7f
+      yield c.to_u8
+    elsif c <= 0x7ff
+      yield (0xc0 | (c >> 6)).to_u8
+      yield (0x80 | (c & 0x3f)).to_u8
+    elsif c <= 0xffff
+      yield (0xe0 | (c >> 12)).to_u8
+      yield (0x80 | ((c >> 6) & 0x3f)).to_u8
+      yield (0x80 | (c & 0x3f)).to_u8
+    else
+      yield (0xf0 | (c >> 18)).to_u8
+      yield (0x80 | ((c >> 12) & 0x3f)).to_u8
+      yield (0x80 | ((c >> 6) & 0x3f)).to_u8
+      yield (0x80 | (c & 0x3f)).to_u8
+    end
+  end
+
+  def bytes : Array(UInt8)
+    res = [] of UInt8
+    each_byte { |b| res << b }
+    res
+  end
+
+  def ===(byte : Int) : ::Bool
+    ord == byte
+  end
+
+  def clone : ::Char
+    self
+  end
+
+  def hash : Int32
+    ord
+  end
+end
+
+# Char reader for iterating strings by codepoints.
+pub struct Reader
+  getter string : String
+  getter pos : Int32
+  getter current_char : ::Char
+
+  def initialize(@string : String)
+    @pos = 0
+    @current_char = '\0'
+    decode_current_char
+  end
+
+  def has_next? : ::Bool
+    @pos < @string.bytesize
+  end
+
+  def next_char : ::Char
+    return '\0' unless has_next?
+    @pos = @pos + @current_char.bytesize
+    decode_current_char
+    @current_char
+  end
+
+  def previous_char : ::Char
+    return '\0' if @pos <= 0
+    @pos = @pos - 1
+    while @pos > 0 && (@string.to_unsafe[@pos] & 0xc0_u8) == 0x80_u8
+      @pos = @pos - 1
+    end
+    decode_current_char
+    @current_char
+  end
+
+  def peek_next_char : ::Char
+    return '\0' unless has_next?
+    next_pos = @pos + @current_char.bytesize
+    return '\0' if next_pos >= @string.bytesize
+    decode_at(next_pos)
+  end
+
+  def each(& : ::Char -> ::Nil) : ::Nil
+    while has_next?
+      yield current_char
+      next_char
+    end
+  end
+
+  private def decode_current_char : ::Nil
+    if @pos >= @string.bytesize
+      @current_char = '\0'
+    else
+      @current_char = decode_at(@pos)
+    end
+  end
+
+  private def decode_at(p : Int32) : ::Char
+    first = @string.to_unsafe[p].to_i32
+    if first < 0x80
+      first.unsafe_chr
+    elsif (first & 0xe0) == 0xc0 && p + 1 < @string.bytesize
+      b2 = @string.to_unsafe[p + 1].to_i32 & 0x3f
+      ((first & 0x1f) << 6 | b2).unsafe_chr
+    elsif (first & 0xf0) == 0xe0 && p + 2 < @string.bytesize
+      b2 = @string.to_unsafe[p + 1].to_i32 & 0x3f
+      b3 = @string.to_unsafe[p + 2].to_i32 & 0x3f
+      ((first & 0x0f) << 12 | (b2 << 6) | b3).unsafe_chr
+    elsif (first & 0xf8) == 0xf0 && p + 3 < @string.bytesize
+      b2 = @string.to_unsafe[p + 1].to_i32 & 0x3f
+      b3 = @string.to_unsafe[p + 2].to_i32 & 0x3f
+      b4 = @string.to_unsafe[p + 3].to_i32 & 0x3f
+      ((first & 0x07) << 18 | (b2 << 12) | (b3 << 6) | b4).unsafe_chr
+    else
+      first.unsafe_chr
+    end
+  end
+end

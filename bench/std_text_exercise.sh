@@ -74,6 +74,14 @@ prove_fails() {
   local label="$1" dir="$2" phrase="$3" sed_script="$4"
   mkdir -p "$WORK/$dir/std"
   sed -e "$sed_script" "$REPO/src/std/text.iyi" > "$WORK/$dir/std/text.iyi"
+  # A patch that matches nothing leaves the library intact, and an intact
+  # library passes, which reads as "this check cannot fail" when the truth is
+  # that nothing was broken to test it. Line-anchored patches drift.
+  if cmp -s "$REPO/src/std/text.iyi" "$WORK/$dir/std/text.iyi"; then
+    echo "  $label: the patch changed nothing, so this proves nothing"
+    status=1
+    return
+  fi
   if ! IYI_PATH="$WORK/$dir:$REPO/src" "$IYI" build \
        -o "$WORK/$dir/program" "$REPO/bench/std_text_exercise.iyi" \
        >"$WORK/$dir/build.log" 2>&1; then
@@ -101,7 +109,7 @@ prove_fails() {
 
 # 1. ASCII letter predicate broken
 prove_fails "ascii letter predicate broken" no_letter "char: ascii_letter lowercase" \
-  's/def ascii_letter? : Bool/def ascii_letter? : Bool; return false/'
+  's/def ascii_letter[?] : Bool/def ascii_letter? : Bool; return false/'
 
 # 2. String capitalize broken
 prove_fails "string capitalize broken" no_capitalize "string: capitalize standard" \

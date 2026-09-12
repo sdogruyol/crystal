@@ -164,9 +164,9 @@ struct Proc
 end
 
 {% begin %}
-  {% ints = %w(Int32 Int64 UInt8 UInt64) %}
+  {% ints = %w(Int8 Int16 Int32 Int64 UInt8 UInt16 UInt32 UInt64) %}
   {% floats = %w(Float64) %}
-  {% nums = %w(Int32 Int64 UInt8 UInt64 Float64) %}
+  {% nums = %w(Int8 Int16 Int32 Int64 UInt8 UInt16 UInt32 UInt64 Float64) %}
   {% binaries = %w(+ - *) %}
 
   {% for num in nums %}

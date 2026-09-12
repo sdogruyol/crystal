@@ -1,0 +1,250 @@
+# XML processing standard library exercise.
+#
+#   ./bin/iyi run bench/std_xml_exercise.iyi
+#
+# Exercises the entire XML 1.0 document tree, parsing, and serialization surface:
+# XML declaration, element hierarchy, attributes, namespaces, CDATA sections,
+# predefined and numeric character entities, comments, processing instructions,
+# tree navigation (find, find_all, path, root, parent), tree mutation,
+# and serialization round-tripping.
+#
+# Every section prints a progress line and raises on mismatch.
+
+import std/xml
+using std/xml::{Document, Node, Attribute, Namespace, NodeType, parse, escape, escape_attribute, unescape}
+
+def assert_true(cond : Bool, msg : String) : Nil
+  if !cond
+    raise "ASSERTION FAILED: #{msg}"
+  end
+end
+
+def assert_equal(expected : String, actual : String?, msg : String) : Nil
+  if actual.nil? || expected != actual
+    raise "ASSERTION FAILED: #{msg} (expected #{expected.inspect}, got #{actual.inspect})"
+  end
+end
+
+def assert_equal_int(expected : Int32, actual : Int32, msg : String) : Nil
+  if expected != actual
+    raise "ASSERTION FAILED: #{msg} (expected #{expected}, got #{actual})"
+  end
+end
+
+# 1. XML Declaration and Document metadata
+xml_decl = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><catalog/>"
+doc1 = parse(xml_decl)
+assert_equal("1.0", doc1.version, "xml: doc version")
+assert_equal("UTF-8", doc1.encoding, "xml: doc encoding")
+assert_true(doc1.standalone == true, "xml: doc standalone true")
+assert_equal("catalog", doc1.root.name, "xml: doc root name")
+
+xml_decl_no_standalone = "<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><data/>"
+doc1_ns = parse(xml_decl_no_standalone)
+assert_equal("ISO-8859-1", doc1_ns.encoding, "xml: doc encoding non-utf8")
+assert_true(doc1_ns.standalone.nil?, "xml: doc standalone nil")
+puts "    xml declaration: version, encoding, and standalone options verified"
+
+# 2. Element hierarchy and attributes
+xml_tree = "<store name=\"City Books\" open=\"true\"><dept code=\"fiction\"><shelf id=\"1\"/><shelf id=\"2\"/></dept></store>"
+doc2 = parse(xml_tree)
+store = doc2.root
+assert_equal("store", store.name, "xml: store name")
+assert_equal("City Books", store["name"], "xml: store attribute name")
+assert_equal("true", store["open"], "xml: store attribute open")
+assert_true(store.has_attribute?("name"), "xml: has_attribute? name")
+assert_true(!store.has_attribute?("closed"), "xml: has_attribute? absent")
+assert_equal("City Books", store["name"]?, "xml: []? present")
+assert_true(store["missing"]?.nil?, "xml: []? missing")
+
+dept = store.first_element_child
+assert_true(!dept.nil?, "xml: first_element_child")
+if d = dept
+  assert_equal("dept", d.name, "xml: dept name")
+  assert_equal("fiction", d["code"], "xml: dept code")
+  assert_true(d.parent == store, "xml: dept parent is store")
+  shelves = d.element_children
+  assert_equal_int(2, shelves.size, "xml: shelves count")
+  assert_equal("1", shelves[0]["id"], "xml: shelf 1 id")
+  assert_equal("2", shelves[1]["id"], "xml: shelf 2 id")
+end
+puts "    element hierarchy: parent-child links, attributes, and indexing verified"
+
+# 3. Content and text extraction
+xml_content = "<article><title>First Post</title><p>Hello <b>World</b>!</p></article>"
+doc3 = parse(xml_content)
+art = doc3.root
+title = art.find("title")
+assert_true(!title.nil?, "xml: find title")
+if t = title
+  assert_equal("First Post", t.content, "xml: title content")
+  assert_equal("First Post", t.text, "xml: title text alias")
+end
+
+p_elem = art.find("p")
+assert_true(!p_elem.nil?, "xml: find p")
+if p = p_elem
+  assert_equal("Hello World!", p.content, "xml: p recursive content")
+end
+assert_equal("First PostHello World!", art.content, "xml: article recursive content")
+puts "    content extraction: direct and recursive descendant text verified"
+
+# 4. Namespaces
+xml_namespaces = "<root xmlns=\"http://example.com/ns\" xmlns:h=\"http://www.w3.org/TR/html4/\" xmlns:b=\"http://books.org\"><h:table b:class=\"grid\"><h:tr><h:td>Cell</h:td></h:tr></h:table></root>"
+doc4 = parse(xml_namespaces)
+ns_root = doc4.root
+assert_true(!ns_root.namespace.nil?, "xml: root default namespace present")
+if r_ns = ns_root.namespace
+  assert_equal("http://example.com/ns", r_ns.uri, "xml: root default namespace")
+  assert_true(r_ns.default?, "xml: root namespace default?")
+end
+
+table_node = ns_root.find("table")
+assert_true(!table_node.nil?, "xml: find table by local name")
+if tbl = table_node
+  assert_equal("h:table", tbl.name, "xml: table qualified name")
+  assert_equal("h", tbl.prefix, "xml: table prefix")
+  assert_equal("table", tbl.local_name, "xml: table local name")
+  assert_true(!tbl.namespace.nil?, "xml: table resolved namespace")
+  if tbl_ns = tbl.namespace
+    assert_equal("http://www.w3.org/TR/html4/", tbl_ns.uri, "xml: table resolved namespace uri")
+    assert_equal("h", tbl_ns.prefix, "xml: table namespace prefix")
+  end
+
+  # Check attribute with prefix
+  attr = tbl.attributes[0]
+  assert_equal("b:class", attr.name, "xml: attr qualified name")
+  assert_equal("b", attr.prefix, "xml: attr prefix")
+  assert_equal("class", attr.local_name, "xml: attr local name")
+  assert_equal("grid", attr.value, "xml: attr value")
+end
+puts "    namespaces: default xmlns, prefix scoping, and attribute prefixes verified"
+
+# 5. CDATA sections
+xml_cdata = "<entry><title>Sample</title><snippet><![CDATA[if (x < 10 && y > 20) { alert(\"test\"); }]]></snippet></entry>"
+doc5 = parse(xml_cdata)
+snippet = doc5.root.find("snippet")
+assert_true(!snippet.nil?, "xml: find snippet")
+if sn = snippet
+  cdata = sn.first_child
+  assert_true(!cdata.nil?, "xml: snippet has child")
+  if cd = cdata
+    assert_true(cd.node_type.cdata?, "xml: node_type.cdata?")
+    assert_equal("if (x < 10 && y > 20) { alert(\"test\"); }", cd.content, "xml: raw cdata content")
+  end
+  assert_equal("if (x < 10 && y > 20) { alert(\"test\"); }", sn.content, "xml: element containing cdata")
+end
+puts "    cdata sections: unescaped markup preservation verified"
+
+# 6. Entity references and numeric character references
+xml_entities = "<data><predefined>&lt;&gt;&amp;&apos;&quot;</predefined><numeric>&#65;&#66;&#67; &#x41;&#x42;&#x43; &#x20AC; &#9731;</numeric></data>"
+doc6 = parse(xml_entities)
+pre = doc6.root.find("predefined")
+assert_true(!pre.nil?, "xml: find predefined")
+if pr = pre
+  assert_equal("<>&'\"", pr.content, "xml: predefined entities decoded")
+end
+
+num = doc6.root.find("numeric")
+assert_true(!num.nil?, "xml: find numeric")
+if nm = num
+  assert_equal("ABC ABC € ☃", nm.content, "xml: numeric and hex entities decoded")
+end
+
+# Also check standalone escape and unescape
+assert_equal("&lt;tag attr=&quot;val&amp;&apos;&quot;&gt;", escape_attribute("<tag attr=\"val&'\">"), "xml: escape_attribute")
+assert_equal("&lt;div&gt;&amp;nbsp;&lt;/div&gt;", escape("<div>&nbsp;</div>"), "xml: escape text")
+assert_equal("<div>&nbsp;</div>", unescape("&lt;div&gt;&amp;nbsp;&lt;/div&gt;"), "xml: unescape text")
+assert_equal("€", unescape("&#x20AC;"), "xml: unescape hex entity")
+assert_equal("A", unescape("&#65;"), "xml: unescape decimal entity")
+puts "    entity references: predefined entities and numeric character references verified"
+
+# 7. Comments and Processing Instructions
+xml_pi_comment = "<?xml version=\"1.0\"?><?xml-stylesheet type=\"text/xsl\" href=\"style.xsl\"?><!-- external comment --><root><!-- internal comment --><item/></root>"
+doc7 = parse(xml_pi_comment)
+assert_equal_int(3, doc7.children.size, "xml: doc7 children count (PI, comment, root)")
+pi_child = doc7.children[0]
+assert_true(pi_child.node_type.pi?, "xml: is processing instruction")
+assert_equal("xml-stylesheet", pi_child.name, "xml: pi target name")
+assert_equal("type=\"text/xsl\" href=\"style.xsl\"", pi_child.content, "xml: pi content")
+
+comment_child = doc7.children[1]
+assert_true(comment_child.node_type.comment?, "xml: is comment")
+assert_equal(" external comment ", comment_child.content, "xml: comment content")
+
+item_elem = doc7.root.find("item")
+assert_true(!item_elem.nil?, "xml: item inside commented root")
+puts "    comments and processing instructions: parsed and attached to tree verified"
+
+# 8. Tree navigation: find, find_all, and path
+xml_nav = "<site><section id=\"s1\"><page num=\"1\"><title>Home</title></page><page num=\"2\"><title>About</title></page></section><section id=\"s2\"><page num=\"3\"><title>Contact</title></page></section></site>"
+doc8 = parse(xml_nav)
+all_pages = doc8.root.find_all("page")
+assert_equal_int(3, all_pages.size, "xml: find_all pages count")
+assert_equal("1", all_pages[0]["num"], "xml: page 1 num")
+assert_equal("2", all_pages[1]["num"], "xml: page 2 num")
+assert_equal("3", all_pages[2]["num"], "xml: page 3 num")
+
+all_titles = doc8.root.find_all("title")
+assert_equal_int(3, all_titles.size, "xml: find_all titles count")
+assert_equal("Home", all_titles[0].content, "xml: title 1")
+assert_equal("About", all_titles[1].content, "xml: title 2")
+assert_equal("Contact", all_titles[2].content, "xml: title 3")
+
+# Path calculation
+page2 = all_pages[1]
+assert_equal("/site/section[1]/page[2]", page2.path, "xml: page 2 canonical path")
+page3 = all_pages[2]
+assert_equal("/site/section[2]/page[1]", page3.path, "xml: page 3 canonical path")
+puts "    tree navigation: find, find_all, and canonical path verified"
+
+# 9. Tree mutation and construction
+doc9 = Document.new("1.0", "UTF-8")
+root9 = Node.new_element("library")
+doc9.add_child(root9)
+b1 = Node.new_element("book")
+b1.set_attribute("isbn", "123-456")
+title9 = Node.new_element("title")
+title9.add_child(Node.new_text("Iyi Programming"))
+b1.add_child(title9)
+root9.add_child(b1)
+
+assert_equal("library", doc9.root.name, "xml: mutated root name")
+book9 = doc9.root.find("book")
+assert_true(!book9.nil?, "xml: mutated book found")
+if bk = book9
+  assert_equal("123-456", bk["isbn"], "xml: mutated book isbn")
+end
+title9_node = doc9.root.find("title")
+assert_true(!title9_node.nil?, "xml: mutated title found")
+if tt = title9_node
+  assert_equal("Iyi Programming", tt.text, "xml: mutated title text")
+end
+puts "    tree mutation: programmatic construction and attribute mutation verified"
+
+# 10. Serialization and round-trip
+serialized9 = doc9.to_xml
+assert_true(serialized9.starts_with?("<?xml version=\"1.0\" encoding=\"UTF-8\"?>"), "xml: serialized declaration")
+assert_true(serialized9.includes?("<book isbn=\"123-456\">"), "xml: serialized book tag")
+assert_true(serialized9.includes?("<title>Iyi Programming</title>"), "xml: serialized title tag")
+
+# Parse the serialized XML back and verify identity
+doc9_reloaded = parse(serialized9)
+assert_equal("library", doc9_reloaded.root.name, "xml: round-trip root")
+re_book = doc9_reloaded.root.find("book")
+assert_true(!re_book.nil?, "xml: reloaded book found")
+if rb = re_book
+  assert_equal("123-456", rb["isbn"], "xml: round-trip book isbn")
+end
+re_title = doc9_reloaded.root.find("title")
+assert_true(!re_title.nil?, "xml: reloaded title found")
+if rt = re_title
+  assert_equal("Iyi Programming", rt.text, "xml: round-trip title text")
+end
+# Self-closing serialization check
+empty_elem = Node.new_element("empty")
+empty_elem.set_attribute("flag", "yes")
+assert_equal("<empty flag=\"yes\"/>", empty_elem.to_xml, "xml: self-closing element serialization")
+puts "    serialization: XML generation and round-trip parsing verified"
+
+puts "all std/xml checks passed"

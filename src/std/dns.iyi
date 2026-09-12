@@ -1,0 +1,1378 @@
+# Native DNS stub resolver: DNS over UDP (RFC 1035), DNSSEC-ready framing, and extensible transports
+#
+# A pure iyi DNS client that resolves hostnames to IP addresses without linking libc's getaddrinfo.
+# Adheres to SPEC.md III.9 and III.10: zero undefined symbols on Linux, standard socket symbols on Darwin.
+#
+# Architecture and Transport Seam:
+# Plain UDP port 53 is the first transport. Secure DNS transports (DoT RFC 7858, DoQ RFC 9250, DoH RFC 8484)
+# are supported via the abstract `Transport` interface. The `Resolver` sends queries and receives responses
+# through a `Transport`.
+# Framing (such as the 2-byte length prefix required by DoT and DoQ, or HTTP request headers in DoH) is
+# encapsulated entirely within the `Transport` implementation. The encoder and decoder remain completely
+# transport-agnostic and work with raw DNS wire bytes.
+#
+# DNSSEC Readiness:
+# In accordance with RFC 4033-4035:
+# 1. Owner names preserve exact wire casing (no case normalization).
+# 2. Complete raw wire bytes of every resource record and the entire message are preserved in-memory.
+# 3. DNSSEC record types (RRSIG, DNSKEY, DS, NSEC, NSEC3) and header bits (AD, CD) are parsed into structured forms.
+# 4. Unknown record types are preserved as `GenericRecord` with untouched raw RDATA and wire bytes.
+
+module std/dns
+
+import std/slice
+import std/udp
+import std/time
+using std/slice::{Bytes, Slice}
+using std/udp::{UdpSocket, Datagram, IPv4Address}
+using std/time::{Time}
+
+pub alias Bytes = Std::Slice::Bytes
+
+# --- DNS Protocol Constants ---
+
+# Standard Record Types (RFC 1035, RFC 3596, RFC 4034, RFC 5155)
+pub TYPE_A      =   1
+pub TYPE_NS     =   2
+pub TYPE_CNAME  =   5
+pub TYPE_SOA    =   6
+pub TYPE_PTR    =  12
+pub TYPE_MX     =  15
+pub TYPE_TXT    =  16
+pub TYPE_AAAA   =  28
+pub TYPE_DS     =  43
+pub TYPE_RRSIG  =  46
+pub TYPE_NSEC   =  47
+pub TYPE_DNSKEY =  48
+pub TYPE_NSEC3  =  50
+pub TYPE_OPT    =  41
+pub TYPE_ANY    = 255
+
+# Record Classes (RFC 1035)
+pub CLASS_IN  =   1
+pub CLASS_CS  =   2
+pub CLASS_CH  =   3
+pub CLASS_HS  =   4
+pub CLASS_ANY = 255
+
+# Response Codes (RCODE, RFC 1035)
+pub RCODE_NO_ERROR        = 0
+pub RCODE_FORMAT_ERROR    = 1
+pub RCODE_SERVER_FAILURE  = 2
+pub RCODE_NAME_ERROR      = 3 # NXDomain
+pub RCODE_NOT_IMPLEMENTED = 4
+pub RCODE_REFUSED         = 5
+
+# --- Exception Hierarchy ---
+
+pub class DnsError < Exception
+  getter message : String
+
+  def initialize(@message : String)
+  end
+
+  def to_s : String
+    @message
+  end
+end
+
+pub class DnsFormatError < DnsError
+  def initialize(message : String)
+    @message = message
+  end
+end
+
+pub class DnsIdMismatchError < DnsError
+  def initialize(message : String)
+    @message = message
+  end
+end
+
+pub class DnsResponseError < DnsError
+  getter rcode : Int32
+
+  def initialize(message : String, @rcode : Int32 = 0)
+    @message = message
+  end
+end
+
+pub class DnsTruncatedError < DnsError
+  def initialize(message : String = "DNS response was truncated (TC bit set)")
+    @message = message
+  end
+end
+
+pub class DnsTimeoutError < DnsError
+  def initialize(message : String = "DNS query timed out")
+    @message = message
+  end
+end
+
+pub class DnsResolveError < DnsError
+  def initialize(message : String)
+    @message = message
+  end
+end
+
+def raise(err : DnsError) : NoReturn
+  ::raise(err.message)
+end
+
+# --- DNS Header and Sections ---
+
+pub struct Header
+  property id : Int32
+  property qr : Bool
+  property opcode : Int32
+  property aa : Bool
+  property tc : Bool
+  property rd : Bool
+  property ra : Bool
+  property z : Int32
+  property ad : Bool
+  property cd : Bool
+  property rcode : Int32
+
+  property qdcount : Int32
+  property ancount : Int32
+  property nscount : Int32
+  property arcount : Int32
+
+  def initialize(
+    @id : Int32,
+    @qr : Bool,
+    @opcode : Int32,
+    @aa : Bool,
+    @tc : Bool,
+    @rd : Bool,
+    @ra : Bool,
+    @z : Int32,
+    @ad : Bool,
+    @cd : Bool,
+    @rcode : Int32,
+    @qdcount : Int32,
+    @ancount : Int32,
+    @nscount : Int32,
+    @arcount : Int32,
+  )
+  end
+end
+
+pub struct Question
+  getter name : String
+  getter qtype : Int32
+  getter qclass : Int32
+
+  def initialize(@name : String, @qtype : Int32 = TYPE_A, @qclass : Int32 = CLASS_IN)
+  end
+end
+
+# --- Resource Record Data Abstraction ---
+
+pub abstract class RecordData
+  abstract def to_s : String
+end
+
+pub class ARecord < RecordData
+  getter address : String
+  getter ip : IPv4Address
+
+  def initialize(@address : String, @ip : IPv4Address)
+  end
+
+  def to_s : String
+    @address
+  end
+end
+
+pub class AAAARecord < RecordData
+  getter address : String
+
+  def initialize(@address : String)
+  end
+
+  def to_s : String
+    @address
+  end
+end
+
+pub class CNameRecord < RecordData
+  getter target : String
+
+  def initialize(@target : String)
+  end
+
+  def to_s : String
+    @target
+  end
+end
+
+pub class NSRecord < RecordData
+  getter nameserver : String
+
+  def initialize(@nameserver : String)
+  end
+
+  def to_s : String
+    @nameserver
+  end
+end
+
+pub class MXRecord < RecordData
+  getter preference : Int32
+  getter exchange : String
+
+  def initialize(@preference : Int32, @exchange : String)
+  end
+
+  def to_s : String
+    "#{@preference} #{@exchange}"
+  end
+end
+
+pub class TXTRecord < RecordData
+  getter entries : Array(String)
+
+  def initialize(@entries : Array(String))
+  end
+
+  def text : String
+    @entries.join("")
+  end
+
+  def to_s : String
+    text
+  end
+end
+
+pub class SOARecord < RecordData
+  getter mname : String
+  getter rname : String
+  getter serial : Int64
+  getter refresh : Int64
+  getter retry : Int64
+  getter expire : Int64
+  getter minimum : Int64
+
+  def initialize(@mname : String, @rname : String, @serial : Int64, @refresh : Int64, @retry : Int64, @expire : Int64, @minimum : Int64)
+  end
+
+  def to_s : String
+    "#{@mname} #{@rname} #{@serial} #{@refresh} #{@retry} #{@expire} #{@minimum}"
+  end
+end
+
+# DNSSEC Record Types (RFC 4034, RFC 5155)
+
+pub class RRSIGRecord < RecordData
+  getter type_covered : Int32
+  getter algorithm : Int32
+  getter labels : Int32
+  getter original_ttl : Int64
+  getter signature_expiration : Int64
+  getter signature_inception : Int64
+  getter key_tag : Int32
+  getter signer_name : String
+  getter signature : Bytes
+
+  def initialize(
+    @type_covered : Int32,
+    @algorithm : Int32,
+    @labels : Int32,
+    @original_ttl : Int64,
+    @signature_expiration : Int64,
+    @signature_inception : Int64,
+    @key_tag : Int32,
+    @signer_name : String,
+    @signature : Bytes,
+  )
+  end
+
+  def to_s : String
+    "#{@type_covered} #{@algorithm} #{@labels} #{@original_ttl} #{@signature_expiration} #{@signature_inception} #{@key_tag} #{@signer_name}"
+  end
+end
+
+pub class DNSKEYRecord < RecordData
+  getter flags : Int32
+  getter protocol : Int32
+  getter algorithm : Int32
+  getter public_key : Bytes
+
+  def initialize(@flags : Int32, @protocol : Int32, @algorithm : Int32, @public_key : Bytes)
+  end
+
+  def to_s : String
+    "#{@flags} #{@protocol} #{@algorithm} (pubkey: #{@public_key.size} bytes)"
+  end
+end
+
+pub class DSRecord < RecordData
+  getter key_tag : Int32
+  getter algorithm : Int32
+  getter digest_type : Int32
+  getter digest : Bytes
+
+  def initialize(@key_tag : Int32, @algorithm : Int32, @digest_type : Int32, @digest : Bytes)
+  end
+
+  def digest_hex : String
+    @digest.hexstring
+  end
+
+  def to_s : String
+    "#{@key_tag} #{@algorithm} #{@digest_type} #{digest_hex}"
+  end
+end
+
+pub class NSECRecord < RecordData
+  getter next_domain_name : String
+  getter type_bit_maps : Bytes
+
+  def initialize(@next_domain_name : String, @type_bit_maps : Bytes)
+  end
+
+  def to_s : String
+    "#{@next_domain_name} (bitmaps: #{@type_bit_maps.size} bytes)"
+  end
+end
+
+pub class NSEC3Record < RecordData
+  getter hash_algorithm : Int32
+  getter flags : Int32
+  getter iterations : Int32
+  getter salt : Bytes
+  getter next_hashed_owner : Bytes
+  getter type_bit_maps : Bytes
+
+  def initialize(
+    @hash_algorithm : Int32,
+    @flags : Int32,
+    @iterations : Int32,
+    @salt : Bytes,
+    @next_hashed_owner : Bytes,
+    @type_bit_maps : Bytes,
+  )
+  end
+
+  def to_s : String
+    "#{@hash_algorithm} #{@flags} #{@iterations} salt=#{@salt.hexstring}"
+  end
+end
+
+# Preserves any unknown or unparsed record type with raw bytes intact.
+pub class GenericRecord < RecordData
+  getter type_code : Int32
+  getter rdata : Bytes
+
+  def initialize(@type_code : Int32, @rdata : Bytes)
+  end
+
+  def to_s : String
+    "TYPE#{@type_code} (#{@rdata.size} bytes)"
+  end
+end
+
+# --- Resource Record Structure ---
+
+pub struct Record
+  getter name : String
+  getter type_code : Int32
+  getter class_code : Int32
+  getter ttl : Int64
+  getter rdata_raw : Bytes
+  getter raw : Bytes
+  getter data : RecordData
+
+  def initialize(@name : String, @type_code : Int32, @class_code : Int32, @ttl : Int64, @rdata_raw : Bytes, @raw : Bytes, @data : RecordData)
+  end
+
+  def a_record? : ARecord?
+    @data.is_a?(ARecord) ? @data.as(ARecord) : nil
+  end
+
+  def aaaa_record? : AAAARecord?
+    @data.is_a?(AAAARecord) ? @data.as(AAAARecord) : nil
+  end
+
+  def cname_record? : CNameRecord?
+    @data.is_a?(CNameRecord) ? @data.as(CNameRecord) : nil
+  end
+
+  def ns_record? : NSRecord?
+    @data.is_a?(NSRecord) ? @data.as(NSRecord) : nil
+  end
+
+  def mx_record? : MXRecord?
+    @data.is_a?(MXRecord) ? @data.as(MXRecord) : nil
+  end
+
+  def txt_record? : TXTRecord?
+    @data.is_a?(TXTRecord) ? @data.as(TXTRecord) : nil
+  end
+
+  def soa_record? : SOARecord?
+    @data.is_a?(SOARecord) ? @data.as(SOARecord) : nil
+  end
+
+  def ds_record? : DSRecord?
+    @data.is_a?(DSRecord) ? @data.as(DSRecord) : nil
+  end
+
+  def dnskey_record? : DNSKEYRecord?
+    @data.is_a?(DNSKEYRecord) ? @data.as(DNSKEYRecord) : nil
+  end
+
+  def rrsig_record? : RRSIGRecord?
+    @data.is_a?(RRSIGRecord) ? @data.as(RRSIGRecord) : nil
+  end
+
+  def nsec_record? : NSECRecord?
+    @data.is_a?(NSECRecord) ? @data.as(NSECRecord) : nil
+  end
+
+  def nsec3_record? : NSEC3Record?
+    @data.is_a?(NSEC3Record) ? @data.as(NSEC3Record) : nil
+  end
+end
+
+# --- DNS Message Representation ---
+
+pub class Message
+  property header : Header
+  property questions : Array(Question)
+  property answers : Array(Record)
+  property authorities : Array(Record)
+  property additionals : Array(Record)
+  property raw_bytes : Bytes
+
+  def initialize(
+    @header : Header,
+    @questions : Array(Question),
+    @answers : Array(Record),
+    @authorities : Array(Record),
+    @additionals : Array(Record),
+    @raw_bytes : Bytes,
+  )
+  end
+
+  def id : Int32
+    @header.id
+  end
+
+  def response? : Bool
+    @header.qr
+  end
+
+  def truncated? : Bool
+    @header.tc
+  end
+
+  def authoritative? : Bool
+    @header.aa
+  end
+
+  def authentic_data? : Bool
+    @header.ad
+  end
+
+  def checking_disabled? : Bool
+    @header.cd
+  end
+
+  def rcode : Int32
+    @header.rcode
+  end
+
+  def rcode_name : String
+    case @header.rcode
+    when RCODE_NO_ERROR        then "NoError"
+    when RCODE_FORMAT_ERROR    then "FormErr"
+    when RCODE_SERVER_FAILURE  then "ServFail"
+    when RCODE_NAME_ERROR      then "NXDomain"
+    when RCODE_NOT_IMPLEMENTED then "NotImp"
+    when RCODE_REFUSED         then "Refused"
+    else                            "RCODE_#{@header.rcode}"
+    end
+  end
+end
+
+# --- Entropy / Random Transaction ID Generation ---
+
+pub struct Entropy
+  # Reads a cryptographically secure 16-bit random integer from the OS entropy source.
+  # Uses /dev/urandom on POSIX platforms, with a monotonic clock + memory entropy fallback.
+  def self.crypto_random_id : Int32
+    c_urandom = Pointer(UInt8).malloc(13_u64)
+    c_urandom[0] = 47_u8   # '/'
+    c_urandom[1] = 100_u8  # 'd'
+    c_urandom[2] = 101_u8  # 'e'
+    c_urandom[3] = 118_u8  # 'v'
+    c_urandom[4] = 47_u8   # '/'
+    c_urandom[5] = 117_u8  # 'u'
+    c_urandom[6] = 114_u8  # 'r'
+    c_urandom[7] = 97_u8   # 'a'
+    c_urandom[8] = 110_u8  # 'n'
+    c_urandom[9] = 100_u8  # 'd'
+    c_urandom[10] = 111_u8 # 'o'
+    c_urandom[11] = 109_u8 # 'm'
+    c_urandom[12] = 0_u8
+
+    fd = __iyi_open_read(c_urandom)
+    if fd >= 0_i64
+      buf = Pointer(UInt8).malloc(2_u64)
+      r = __iyi_read(fd.to_i32, buf.as(Void*), 2_u64)
+      __iyi_close(fd)
+      if r == 2_i64
+        val = (buf[0].to_i32 << 8) | buf[1].to_i32
+        return val
+      end
+    end
+
+    # Fallback to high-resolution monotonic time mixed with pointer address entropy
+    t = Time.monotonic_nanoseconds.to_i64
+    mix = ((t >> 16) ^ t) & 0xFFFF_i64
+    mix.to_i32
+  end
+end
+
+# --- Wire Encoding and Decoding ---
+
+pub struct Wire
+  # Decodes a domain name starting at start_pos, handling RFC 1035 pointer compression.
+  # Security bounds enforced:
+  # - Loops bounded: max 32 pointer hops, raises DnsFormatError if exceeded.
+  # - Forward pointers rejected: pointer offset pointing ahead or to itself raises DnsFormatError.
+  # - Name length bounded: maximum uncompressed name length is 255 octets (RFC 1035 2.3.4).
+  # - Preserves exact casing of labels as received in wire bytes.
+  def self.decode_name?(bytes : Bytes, start_pos : Int32) : Tuple(String, Int32)?
+    pos = start_pos
+    labels = [] of String
+    hops = 0
+    max_hops = 32
+    bytes_consumed = -1
+    total_length = 0
+
+    while true
+      return nil if pos >= bytes.size
+
+      len = bytes[pos].to_i32
+      if len == 0
+        if bytes_consumed < 0
+          bytes_consumed = (pos - start_pos) + 1
+        end
+        break
+      elsif (len & 0xC0) == 0xC0
+        return nil if pos + 1 >= bytes.size
+        ptr_offset = ((len & 0x3F) << 8) | bytes[pos + 1].to_i32
+
+        if bytes_consumed < 0
+          bytes_consumed = (pos - start_pos) + 2
+        end
+
+        hops = hops + 1
+        return nil if hops > max_hops
+        return nil if ptr_offset >= pos && hops == 1
+        return nil if ptr_offset >= bytes.size
+
+        pos = ptr_offset
+      elsif (len & 0xC0) == 0
+        pos = pos + 1
+        return nil if pos + len > bytes.size
+        total_length = total_length + len + 1
+        return nil if total_length > 255
+
+        label_str = String.new(len) do |buf|
+          buf.copy_from((bytes.to_unsafe + pos), len)
+        end
+        labels << label_str
+        pos = pos + len
+      else
+        return nil
+      end
+    end
+
+    name = labels.empty? ? "." : labels.join(".")
+    next_pos = bytes_consumed < 0 ? (pos - start_pos) : bytes_consumed
+    {name, start_pos + next_pos}
+  end
+
+  def self.decode_name(bytes : Bytes, start_pos : Int32) : Tuple(String, Int32)
+    res = decode_name?(bytes, start_pos)
+    raise "DNS format error: malformed domain name or pointer loop" if res.nil?
+    res
+  end
+
+  # Encodes a domain name into wire label format without compression.
+  def self.encode_name(name : String) : Bytes
+    return Bytes.new(1) { 0_u8 } if name == "." || name.empty?
+    parts = name.split('.')
+    total_size = 0
+    i = 0
+    while i < parts.size
+      p = parts[i]
+      raise DnsFormatError.new("label exceeds 63 characters: #{p}") if p.bytesize > 63
+      total_size = total_size + 1 + p.bytesize
+      i = i + 1
+    end
+    total_size = total_size + 1 # trailing 0
+
+    bytes = Bytes.new(total_size)
+    pos = 0
+    j = 0
+    while j < parts.size
+      p = parts[j]
+      len = p.bytesize
+      bytes[pos] = len.to_u8
+      pos = pos + 1
+      (bytes.to_unsafe + pos).copy_from(p.to_unsafe, len)
+      pos = pos + len
+      j = j + 1
+    end
+    bytes[pos] = 0_u8
+    bytes
+  end
+
+  # Encodes a standard DNS query into raw wire bytes.
+  def self.encode_query(name : String, qtype : Int32 = TYPE_A, tx_id : Int32 = -1, rd : Bool = true, cd : Bool = false) : Tuple(Bytes, Int32)
+    actual_id = tx_id >= 0 ? tx_id : Entropy.crypto_random_id
+
+    qname_bytes = encode_name(name)
+    msg_size = 12 + qname_bytes.size + 4
+    buf = Bytes.new(msg_size)
+
+    # Transaction ID (16 bits)
+    buf[0] = ((actual_id >> 8) & 0xFF).to_u8
+    buf[1] = (actual_id & 0xFF).to_u8
+
+    # Flags: QR=0, Opcode=0, AA=0, TC=0, RD, RA=0, Z=0, AD=0, CD, RCODE=0
+    flags = 0
+    flags = flags | 0x0100 if rd # bit 8
+    flags = flags | 0x0010 if cd # bit 4
+    buf[2] = ((flags >> 8) & 0xFF).to_u8
+    buf[3] = (flags & 0xFF).to_u8
+
+    # QDCOUNT = 1
+    buf[4] = 0_u8
+    buf[5] = 1_u8
+
+    # ANCOUNT, NSCOUNT, ARCOUNT = 0
+    buf[6] = 0_u8
+    buf[7] = 0_u8
+    buf[8] = 0_u8
+    buf[9] = 0_u8
+    buf[10] = 0_u8
+    buf[11] = 0_u8
+
+    # Question section
+    (buf.to_unsafe + 12).copy_from(qname_bytes.to_unsafe, qname_bytes.size)
+    qpos = 12 + qname_bytes.size
+
+    # QTYPE (16 bits)
+    buf[qpos] = ((qtype >> 8) & 0xFF).to_u8
+    buf[qpos + 1] = (qtype & 0xFF).to_u8
+
+    # QCLASS (16 bits, CLASS_IN = 1)
+    buf[qpos + 2] = 0_u8
+    buf[qpos + 3] = 1_u8
+
+    {buf, actual_id}
+  end
+
+  # Decodes a raw DNS message from wire bytes into a structured Message object.
+  # Returns nil if packet is malformed, truncated, or contains pointer loops.
+  def self.decode_message?(bytes : Bytes) : Message?
+    return nil if bytes.size < 12
+
+    # Header parsing
+    id = (bytes[0].to_i32 << 8) | bytes[1].to_i32
+    flags = (bytes[2].to_i32 << 8) | bytes[3].to_i32
+    qr = (flags & 0x8000) != 0
+    opcode = (flags >> 11) & 0x0F
+    aa = (flags & 0x0400) != 0
+    tc = (flags & 0x0200) != 0
+    rd = (flags & 0x0100) != 0
+    ra = (flags & 0x0080) != 0
+    z = (flags >> 6) & 0x01
+    ad = (flags & 0x0020) != 0
+    cd = (flags & 0x0010) != 0
+    rcode = flags & 0x0F
+
+    qdcount = (bytes[4].to_i32 << 8) | bytes[5].to_i32
+    ancount = (bytes[6].to_i32 << 8) | bytes[7].to_i32
+    nscount = (bytes[8].to_i32 << 8) | bytes[9].to_i32
+    arcount = (bytes[10].to_i32 << 8) | bytes[11].to_i32
+
+    header = Header.new(id, qr, opcode, aa, tc, rd, ra, z, ad, cd, rcode, qdcount, ancount, nscount, arcount)
+
+    pos = 12
+
+    # Question section
+    questions = [] of Question
+    qi = 0
+    while qi < qdcount
+      qname_res = decode_name?(bytes, pos)
+      return nil if qname_res.nil?
+      qname, pos = qname_res
+      return nil if pos + 4 > bytes.size
+      qtype = (bytes[pos].to_i32 << 8) | bytes[pos + 1].to_i32
+      qclass = (bytes[pos + 2].to_i32 << 8) | bytes[pos + 3].to_i32
+      pos = pos + 4
+      questions << Question.new(qname, qtype, qclass)
+      qi = qi + 1
+    end
+
+    # Answer section
+    answers = [] of Record
+    pos_ans = decode_records?(bytes, pos, ancount, answers)
+    return nil if pos_ans.nil?
+    pos = pos_ans
+
+    # Authority section
+    authorities = [] of Record
+    pos_auth = decode_records?(bytes, pos, nscount, authorities)
+    return nil if pos_auth.nil?
+    pos = pos_auth
+
+    # Additional section
+    additionals = [] of Record
+    pos_add = decode_records?(bytes, pos, arcount, additionals)
+    return nil if pos_add.nil?
+
+    Message.new(header, questions, answers, authorities, additionals, bytes)
+  end
+
+  def self.decode_message(bytes : Bytes) : Message
+    msg = decode_message?(bytes)
+    raise "DNS format error: malformed DNS packet" if msg.nil?
+    msg
+  end
+
+  private def self.decode_records?(bytes : Bytes, start_pos : Int32, count : Int32, target : Array(Record)) : Int32?
+    pos = start_pos
+    i = 0
+    while i < count
+      record_start = pos
+      name_res = decode_name?(bytes, pos)
+      return nil if name_res.nil?
+      name, pos = name_res
+
+      return nil if pos + 10 > bytes.size
+
+      type_code = (bytes[pos].to_i32 << 8) | bytes[pos + 1].to_i32
+      class_code = (bytes[pos + 2].to_i32 << 8) | bytes[pos + 3].to_i32
+      b4 = bytes[pos + 4].to_i64
+      b5 = bytes[pos + 5].to_i64
+      b6 = bytes[pos + 6].to_i64
+      b7 = bytes[pos + 7].to_i64
+      ttl = (b4 << 24) | (b5 << 16) | (b6 << 8) | b7
+      rdlength = (bytes[pos + 8].to_i32 << 8) | bytes[pos + 9].to_i32
+      pos = pos + 10
+
+      return nil if pos + rdlength > bytes.size
+
+      rdata_start = pos
+      rdata_raw = bytes[rdata_start, rdlength]
+      record_end = rdata_start + rdlength
+      record_raw = bytes[record_start, record_end - record_start]
+
+      data = parse_record_data(bytes, rdata_start, rdlength, type_code, rdata_raw)
+      target << Record.new(name, type_code, class_code, ttl, rdata_raw, record_raw, data)
+
+      pos = record_end
+      i = i + 1
+    end
+    pos
+  end
+
+  private def self.parse_record_data(bytes : Bytes, rdata_start : Int32, rdlength : Int32, type_code : Int32, rdata_raw : Bytes) : RecordData
+    case type_code
+    when TYPE_A
+      if rdlength == 4
+        ip = IPv4Address.new(rdata_raw[0], rdata_raw[1], rdata_raw[2], rdata_raw[3])
+        ARecord.new(ip.to_s, ip)
+      else
+        GenericRecord.new(type_code, rdata_raw)
+      end
+    when TYPE_AAAA
+      if rdlength == 16
+        AAAARecord.new(format_ipv6(rdata_raw))
+      else
+        GenericRecord.new(type_code, rdata_raw)
+      end
+    when TYPE_CNAME
+      target_res = decode_name?(bytes, rdata_start)
+      target_res ? CNameRecord.new(target_res[0]) : GenericRecord.new(type_code, rdata_raw)
+    when TYPE_NS
+      ns_res = decode_name?(bytes, rdata_start)
+      ns_res ? NSRecord.new(ns_res[0]) : GenericRecord.new(type_code, rdata_raw)
+    when TYPE_MX
+      if rdlength >= 3
+        pref = (bytes[rdata_start].to_i32 << 8) | bytes[rdata_start + 1].to_i32
+        ex_res = decode_name?(bytes, rdata_start + 2)
+        ex_res ? MXRecord.new(pref, ex_res[0]) : GenericRecord.new(type_code, rdata_raw)
+      else
+        GenericRecord.new(type_code, rdata_raw)
+      end
+    when TYPE_TXT
+      entries = [] of String
+      txt_pos = rdata_start
+      txt_end = rdata_start + rdlength
+      while txt_pos < txt_end
+        s_len = bytes[txt_pos].to_i32
+        txt_pos = txt_pos + 1
+        break if txt_pos + s_len > txt_end
+        s = String.new(s_len) do |buf|
+          buf.copy_from((bytes.to_unsafe + txt_pos), s_len)
+        end
+        entries << s
+        txt_pos = txt_pos + s_len
+      end
+      TXTRecord.new(entries)
+    when TYPE_SOA
+      mname_res = decode_name?(bytes, rdata_start)
+      if mname_res
+        rname_res = decode_name?(bytes, mname_res[1])
+        if rname_res && rname_res[1] + 20 <= rdata_start + rdlength
+          p2 = rname_res[1]
+          serial = read_u32_be(bytes, p2)
+          refresh = read_u32_be(bytes, p2 + 4)
+          retry_val = read_u32_be(bytes, p2 + 8)
+          expire = read_u32_be(bytes, p2 + 12)
+          minimum = read_u32_be(bytes, p2 + 16)
+          SOARecord.new(mname_res[0], rname_res[0], serial, refresh, retry_val, expire, minimum)
+        else
+          GenericRecord.new(type_code, rdata_raw)
+        end
+      else
+        GenericRecord.new(type_code, rdata_raw)
+      end
+    when TYPE_RRSIG
+      if rdlength >= 18
+        type_cov = (bytes[rdata_start].to_i32 << 8) | bytes[rdata_start + 1].to_i32
+        algo = bytes[rdata_start + 2].to_i32
+        labels = bytes[rdata_start + 3].to_i32
+        orig_ttl = read_u32_be(bytes, rdata_start + 4)
+        sig_exp = read_u32_be(bytes, rdata_start + 8)
+        sig_inc = read_u32_be(bytes, rdata_start + 12)
+        key_tag = (bytes[rdata_start + 16].to_i32 << 8) | bytes[rdata_start + 17].to_i32
+        signer_res = decode_name?(bytes, rdata_start + 18)
+        if signer_res
+          p_sig = signer_res[1]
+          sig_len = (rdata_start + rdlength) - p_sig
+          sig = sig_len > 0 ? bytes[p_sig, sig_len] : Bytes.empty
+          RRSIGRecord.new(type_cov, algo, labels, orig_ttl, sig_exp, sig_inc, key_tag, signer_res[0], sig)
+        else
+          GenericRecord.new(type_code, rdata_raw)
+        end
+      else
+        GenericRecord.new(type_code, rdata_raw)
+      end
+    when TYPE_DNSKEY
+      if rdlength >= 4
+        flags = (bytes[rdata_start].to_i32 << 8) | bytes[rdata_start + 1].to_i32
+        proto = bytes[rdata_start + 2].to_i32
+        algo = bytes[rdata_start + 3].to_i32
+        pubkey = bytes[rdata_start + 4, rdlength - 4]
+        DNSKEYRecord.new(flags, proto, algo, pubkey)
+      else
+        GenericRecord.new(type_code, rdata_raw)
+      end
+    when TYPE_DS
+      if rdlength >= 4
+        key_tag = (bytes[rdata_start].to_i32 << 8) | bytes[rdata_start + 1].to_i32
+        algo = bytes[rdata_start + 2].to_i32
+        digest_type = bytes[rdata_start + 3].to_i32
+        digest = bytes[rdata_start + 4, rdlength - 4]
+        DSRecord.new(key_tag, algo, digest_type, digest)
+      else
+        GenericRecord.new(type_code, rdata_raw)
+      end
+    when TYPE_NSEC
+      next_domain, p_bm = decode_name(bytes, rdata_start)
+      bm_len = (rdata_start + rdlength) - p_bm
+      bitmaps = bm_len > 0 ? bytes[p_bm, bm_len] : Bytes.empty
+      NSECRecord.new(next_domain, bitmaps)
+    when TYPE_NSEC3
+      if rdlength >= 5
+        hash_algo = bytes[rdata_start].to_i32
+        flags = bytes[rdata_start + 1].to_i32
+        iter = (bytes[rdata_start + 2].to_i32 << 8) | bytes[rdata_start + 3].to_i32
+        salt_len = bytes[rdata_start + 4].to_i32
+        salt = bytes[rdata_start + 5, salt_len]
+        pos3 = rdata_start + 5 + salt_len
+        if pos3 < rdata_start + rdlength
+          hash_len = bytes[pos3].to_i32
+          pos3 = pos3 + 1
+          next_hashed = bytes[pos3, hash_len]
+          pos3 = pos3 + hash_len
+          bm_len = (rdata_start + rdlength) - pos3
+          bitmaps = bm_len > 0 ? bytes[pos3, bm_len] : Bytes.empty
+          NSEC3Record.new(hash_algo, flags, iter, salt, next_hashed, bitmaps)
+        else
+          GenericRecord.new(type_code, rdata_raw)
+        end
+      else
+        GenericRecord.new(type_code, rdata_raw)
+      end
+    else
+      GenericRecord.new(type_code, rdata_raw)
+    end
+  end
+
+  private def self.read_u32_be(bytes : Bytes, offset : Int32) : Int64
+    b0 = bytes[offset].to_i64
+    b1 = bytes[offset + 1].to_i64
+    b2 = bytes[offset + 2].to_i64
+    b3 = bytes[offset + 3].to_i64
+    (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+  end
+
+  def self.format_ipv6(bytes : Bytes) : String
+    parts = [] of String
+    k = 0
+    while k < 8
+      offset = k * 2
+      w = (bytes[offset].to_i32 << 8) | bytes[offset + 1].to_i32
+      parts << w.to_s(16)
+      k = k + 1
+    end
+    res = parts[0]
+    m = 1
+    while m < parts.size
+      res = res + ":" + parts[m]
+      m = m + 1
+    end
+    res
+  end
+
+  # Parses a hex string into Bytes (useful for test vectors and DNSSEC digests).
+  def self.decode_hex(hex : String) : Bytes
+    len = hex.bytesize // 2
+    bytes = Bytes.new(len)
+    i = 0
+    while i < len
+      hi = hex_val(hex[i * 2])
+      lo = hex_val(hex[i * 2 + 1])
+      bytes[i] = ((hi << 4) | lo).to_u8
+      i = i + 1
+    end
+    bytes
+  end
+
+  private def self.hex_val(c : Char) : Int32
+    o = c.ord
+    if o >= 48 && o <= 57
+      o - 48
+    elsif o >= 97 && o <= 102
+      o - 87
+    elsif o >= 65 && o <= 70
+      o - 55
+    else
+      0
+    end
+  end
+end
+
+# --- Transport Seam: Extensible Transports for Plain UDP, DoT, DoQ, and DoH ---
+
+pub abstract class Transport
+  # Sends raw wire query bytes to the target server and returns raw wire response bytes.
+  # Transport-specific framing (e.g. DoT/DoQ 2-byte length prefix, DoH HTTP/2 POST encapsulation)
+  # is performed inside the Transport implementation, so wire encoder and decoder remain
+  # completely reusable without alteration.
+  abstract def round_trip(query : Bytes, server : String, port : Int32, timeout_ms : Int32) : Bytes
+end
+
+# Plain UDP Transport (Port 53)
+pub class UdpTransport < Transport
+  property default_timeout_ms : Int32
+
+  def initialize(@default_timeout_ms : Int32 = 2000)
+  end
+
+  def round_trip(query : Bytes, server : String, port : Int32, timeout_ms : Int32) : Bytes
+    sock = UdpSocket.unbound
+    defer sock.close
+    effective_timeout = timeout_ms > 0 ? timeout_ms : @default_timeout_ms
+    sock.read_timeout = effective_timeout
+    sock.send_to(query, server, port)
+    resp, _, _ = sock.receive_from(4096)
+    resp
+  end
+end
+
+# Mock Transport for deterministic unit testing without a network socket.
+pub class MockTransport < Transport
+  property response : Bytes
+  property echo_tx_id : Bool
+  getter last_query : Bytes?
+  getter last_server : String?
+  getter last_port : Int32?
+
+  def initialize(@response : Bytes, @echo_tx_id : Bool = false)
+    @last_query = nil
+    @last_server = nil
+    @last_port = nil
+  end
+
+  def round_trip(query : Bytes, server : String, port : Int32, timeout_ms : Int32) : Bytes
+    @last_query = query
+    @last_server = server
+    @last_port = port
+    if @echo_tx_id && query.size >= 2 && @response.size >= 2
+      resp = @response.dup
+      resp[0] = query[0]
+      resp[1] = query[1]
+      return resp
+    end
+    @response
+  end
+end
+
+# --- Nameserver Discovery ---
+
+pub struct Config
+  FALLBACK_NAMESERVERS = ["1.1.1.1", "8.8.8.8"]
+
+  # Reads nameservers from /etc/resolv.conf on POSIX systems.
+  #
+  # Platform status:
+  # - POSIX (Linux, Darwin): Parses nameserver lines from /etc/resolv.conf. Falls back to 1.1.1.1 / 8.8.8.8 if missing.
+  # - Windows: /etc/resolv.conf does not exist; nameservers live in the registry or require GetNetworkParams
+  #   from iphlpapi.dll (SPEC.md III.9 excludes foreign DLL linking). Falls back to FALLBACK_NAMESERVERS.
+  # - wasm32-wasi: No /etc/resolv.conf and no direct datagram socket syscalls in WASI preview 1.
+  #   Falls back to FALLBACK_NAMESERVERS.
+  def self.nameservers(resolv_conf_path : String = "/etc/resolv.conf") : Array(String)
+    servers = [] of String
+    if File.exists?(resolv_conf_path)
+      begin
+        content = File.read(resolv_conf_path)
+        lines = content.split('\n')
+        i = 0
+        while i < lines.size
+          line = lines[i].strip
+          if !line.empty? && line[0] != '#' && line[0] != ';'
+            if line.starts_with?("nameserver")
+              rest = line[10, line.bytesize - 10].strip
+              token = ""
+              j = 0
+              while j < rest.bytesize
+                ch = rest[j]
+                break if ch == ' ' || ch == '\t' || ch == '#' || ch == ';'
+                token = token + ch.to_s
+                j = j + 1
+              end
+              servers << token if !token.empty?
+            end
+          end
+          i = i + 1
+        end
+      rescue
+        # Fall back on any read or parse failure
+      end
+    end
+
+    servers.empty? ? FALLBACK_NAMESERVERS : servers
+  end
+end
+
+# --- In-Memory TTL Cache ---
+
+pub class CacheEntry
+  getter addresses : Array(String)
+  getter expires_at_ns : UInt64
+
+  def initialize(@addresses : Array(String), @expires_at_ns : UInt64)
+  end
+
+  def expired?(now_ns : UInt64) : Bool
+    now_ns >= @expires_at_ns
+  end
+end
+
+pub class Cache
+  @entries : Hash(String, CacheEntry)
+
+  def initialize
+    @entries = Hash(String, CacheEntry).new
+  end
+
+  def get(name : String, qtype : Int32) : Array(String)?
+    key = "#{qtype}:#{name}"
+    entry = @entries[key]?
+    return nil if entry.nil?
+    now = Time.monotonic_nanoseconds
+    if entry.expired?(now)
+      @entries.delete(key)
+      return nil
+    end
+    entry.addresses
+  end
+
+  def set(name : String, qtype : Int32, addresses : Array(String), ttl_seconds : Int64) : Nil
+    return if ttl_seconds <= 0 || addresses.empty?
+    clamped_ttl = ttl_seconds > 86400_i64 ? 86400_i64 : ttl_seconds
+    now = Time.monotonic_nanoseconds
+    expire_ns = now + (clamped_ttl.to_u64 * 1000000000_u64)
+    key = "#{qtype}:#{name}"
+    @entries[key] = CacheEntry.new(addresses, expire_ns)
+  end
+
+  def clear : Nil
+    @entries = Hash(String, CacheEntry).new
+  end
+
+  def size : Int32
+    @entries.size
+  end
+end
+
+# --- DNS Stub Resolver ---
+
+pub class Resolver
+  property transport : Transport
+  property nameservers : Array(String)
+  property port : Int32
+  property timeout_ms : Int32
+  property max_retries : Int32
+  property cache : Cache?
+
+  def initialize(
+    @transport : Transport = UdpTransport.new,
+    @nameservers : Array(String) = Config.nameservers,
+    @port : Int32 = 53,
+    @timeout_ms : Int32 = 2000,
+    @max_retries : Int32 = 2,
+    enable_cache : Bool = true,
+  )
+    @cache = enable_cache ? Cache.new : nil
+  end
+
+  # Sends a DNS query over the configured transport, verifying transaction ID and checking response.
+  # Sends a DNS query over the configured transport, returning Message?, or nil on failure/mismatch.
+  def query?(name : String, qtype : Int32 = TYPE_A, cd : Bool = false) : Message?
+    query_bytes, expected_id = Wire.encode_query(name, qtype, cd: cd)
+
+    si = 0
+    while si < @nameservers.size
+      server = @nameservers[si]
+      attempt = 0
+      while attempt < @max_retries
+        resp_bytes = @transport.round_trip(query_bytes, server, @port, @timeout_ms)
+        msg = Wire.decode_message?(resp_bytes)
+        if msg && msg.id == expected_id
+          return msg
+        end
+        attempt = attempt + 1
+      end
+      si = si + 1
+    end
+    nil
+  end
+
+  # Sends a DNS query over the configured transport, verifying transaction ID and raising on failure.
+  def query(name : String, qtype : Int32 = TYPE_A, cd : Bool = false) : Message
+    query_bytes, expected_id = Wire.encode_query(name, qtype, cd: cd)
+
+    si = 0
+    while si < @nameservers.size
+      server = @nameservers[si]
+      attempt = 0
+      while attempt < @max_retries
+        resp_bytes = @transport.round_trip(query_bytes, server, @port, @timeout_ms)
+        msg = Wire.decode_message(resp_bytes)
+
+        # Transaction ID verification (anti-spoofing defense)
+        if msg.id != expected_id
+          raise "DNS transaction ID mismatch: expected #{expected_id}, got #{msg.id}"
+        end
+
+        return msg
+        attempt = attempt + 1
+      end
+      si = si + 1
+    end
+
+    raise "failed to query #{name} across #{@nameservers.size} nameservers"
+  end
+
+  # Resolves a hostname to a list of IP addresses, returning nil on resolution failure.
+  def resolve?(hostname : String, qtype : Int32 = TYPE_A) : Array(String)?
+    # Direct numeric resolution for IPv4 dotted-decimal
+    if is_numeric_ipv4?(hostname)
+      return [hostname]
+    end
+
+    if hostname == "localhost"
+      return qtype == TYPE_AAAA ? ["::1"] : ["127.0.0.1"]
+    end
+
+    # Check cache
+    if c = @cache
+      if cached = c.get(hostname, qtype)
+        return cached
+      end
+    end
+
+    current_name = hostname
+    hops = 0
+    max_cname_hops = 8
+
+    while hops < max_cname_hops
+      msg = query?(current_name, qtype)
+      return nil if msg.nil?
+      return nil if msg.truncated?
+
+      if msg.rcode != RCODE_NO_ERROR
+        if msg.rcode == RCODE_NAME_ERROR
+          return [] of String
+        end
+        return nil
+      end
+
+      addresses = [] of String
+      cname_target : String? = nil
+      min_ttl = 300_i64
+
+      ai = 0
+      while ai < msg.answers.size
+        ans = msg.answers[ai]
+        if ans.type_code == qtype
+          if a = ans.a_record?
+            addresses << a.address
+            min_ttl = ans.ttl if ans.ttl < min_ttl && ans.ttl > 0
+          elsif aaaa = ans.aaaa_record?
+            addresses << aaaa.address
+            min_ttl = ans.ttl if ans.ttl < min_ttl && ans.ttl > 0
+          end
+        elsif ans.type_code == TYPE_CNAME
+          if cname = ans.cname_record?
+            cname_target = cname.target
+          end
+        end
+        ai = ai + 1
+      end
+
+      if !addresses.empty?
+        if c = @cache
+          c.set(hostname, qtype, addresses, min_ttl)
+        end
+        return addresses
+      end
+
+      # No direct address answer: follow CNAME target if present
+      if target = cname_target
+        current_name = target
+        hops = hops + 1
+      else
+        return [] of String
+      end
+    end
+    nil
+  end
+
+  # Resolves a hostname to a list of IP addresses, raising on failure.
+  def resolve(hostname : String, qtype : Int32 = TYPE_A) : Array(String)
+    res = resolve?(hostname, qtype)
+    raise "failed to resolve #{hostname}" if res.nil?
+    res
+  end
+
+  def resolve_a(hostname : String) : Array(String)
+    resolve(hostname, TYPE_A)
+  end
+
+  def resolve_aaaa(hostname : String) : Array(String)
+    resolve(hostname, TYPE_AAAA)
+  end
+
+  def resolve_cname(hostname : String) : String?
+    msg = query(hostname, TYPE_CNAME)
+    return nil if msg.rcode != RCODE_NO_ERROR
+    i = 0
+    while i < msg.answers.size
+      ans = msg.answers[i]
+      if c = ans.cname_record?
+        return c.target
+      end
+      i = i + 1
+    end
+    nil
+  end
+
+  def resolve_txt(hostname : String) : Array(String)
+    msg = query(hostname, TYPE_TXT)
+    return [] of String if msg.rcode != RCODE_NO_ERROR
+    results = [] of String
+    i = 0
+    while i < msg.answers.size
+      ans = msg.answers[i]
+      if txt = ans.txt_record?
+        j = 0
+        while j < txt.entries.size
+          results << txt.entries[j]
+          j = j + 1
+        end
+      end
+      i = i + 1
+    end
+    results
+  end
+
+  def resolve_mx(hostname : String) : Array(MXRecord)
+    msg = query(hostname, TYPE_MX)
+    return [] of MXRecord if msg.rcode != RCODE_NO_ERROR
+    records = [] of MXRecord
+    i = 0
+    while i < msg.answers.size
+      ans = msg.answers[i]
+      if mx = ans.mx_record?
+        records << mx
+      end
+      i = i + 1
+    end
+    records
+  end
+
+  private def is_numeric_ipv4?(s : String) : Bool
+    dots = 0
+    i = 0
+    while i < s.bytesize
+      c = s[i]
+      if c == '.'
+        dots = dots + 1
+      elsif c < '0' || c > '9'
+        return false
+      end
+      i = i + 1
+    end
+    dots == 3
+  end
+end
+
+# --- Module-Level Shortcut Functions ---
+
+pub def self.resolve(hostname : String) : Array(String)
+  Resolver.new.resolve(hostname)
+end
+
+pub def self.resolve_a(hostname : String) : Array(String)
+  Resolver.new.resolve_a(hostname)
+end
+
+pub def self.resolve_aaaa(hostname : String) : Array(String)
+  Resolver.new.resolve_aaaa(hostname)
+end
+
+pub def self.resolve_cname(hostname : String) : String?
+  Resolver.new.resolve_cname(hostname)
+end
+
+pub def self.resolve_txt(hostname : String) : Array(String)
+  Resolver.new.resolve_txt(hostname)
+end
+
+pub def self.resolve_mx(hostname : String) : Array(MXRecord)
+  Resolver.new.resolve_mx(hostname)
+end

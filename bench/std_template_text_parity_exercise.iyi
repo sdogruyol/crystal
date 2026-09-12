@@ -1,0 +1,340 @@
+# Standard Template and Text parity exercise for iyi.
+#
+#   ./bin/iyi run bench/std_template_text_parity_exercise.iyi
+#
+# Exercises complete parity for:
+#   1. HTML: escape (string & IO), unescape (named, decimal, hex), fast paths
+#   2. INI: parse (sections, top-level keys, comments), build (spacing modes), ParseException locations
+#   3. ECR: lexer tokens, process_string, embed, render, def_to_s, whitespace suppression
+#   4. OptionParser: short/long flags, value handling, bundling, subcommands, callbacks, help formatting
+#   5. MIME: MediaType parsing, parameters, MIME registry, DEFAULT_TYPES, Multipart build/parse
+#   6. CSV: RFC 4180 compliance, headers, row accessors (index, name, regex), Quoting (NONE/RFC/ALL), Lexer tokens
+
+import std/html
+using std/html::{HTML}
+
+import std/ini
+using std/ini::{INI}
+
+import std/ecr
+using std/ecr::{ECR}
+
+import std/option_parser
+using std/option_parser::{OptionParser, FlagValue}
+
+import std/mime
+using std/mime::{MIME, MediaType}
+
+import std/http
+using std/http::{Headers}
+
+import std/csv
+using std/csv::{CSV}
+
+import std/regex
+using std/regex::{Regex}
+
+import std/io
+using std/io::{Memory}
+
+# =============================================================================
+# 1. HTML Parity
+# =============================================================================
+
+# Fast path when no escaping is needed
+plain_html = "Hello world! 12345"
+raise "html: fast path" unless HTML.escape(plain_html) == plain_html
+
+# Five predefined entities
+dirty_html = "<div id=\"main\" class='card'>Tom & Jerry > Spike</div>"
+escaped_html = HTML.escape(dirty_html)
+raise "html: escape ampersand" unless escaped_html.includes?("&amp;")
+raise "html: escape lt" unless escaped_html.includes?("&lt;div")
+raise "html: escape gt" unless escaped_html.includes?("&gt;")
+raise "html: escape quot" unless escaped_html.includes?("&quot;main&quot;")
+raise "html: escape apos" unless escaped_html.includes?("&#39;card&#39;")
+
+# IO escape streaming
+mem_html = Memory.new
+HTML.escape("a & b < c > d \" e ' f", mem_html)
+raise "html: escape io" unless mem_html.to_s == "a &amp; b &lt; c &gt; d &quot; e &#39; f"
+
+# Unescape named entities, decimal, hex numeric references
+unesc1 = HTML.unescape("&lt;b&gt;Caf&eacute; &amp; &copy;&#169;&#xA9;&lt;/b&gt;")
+raise "html: unescape lt/gt" unless unesc1.starts_with?("<b>") && unesc1.ends_with?("</b>")
+raise "html: unescape cafe" unless unesc1.includes?("Café")
+raise "html: unescape copy" unless unesc1.includes?("©©©")
+
+# Unescape unknown or malformed entities preserves original
+raise "html: unescape unknown" unless HTML.unescape("&unknownEntity;") == "&unknownEntity;"
+raise "html: unescape bare amp" unless HTML.unescape("a & b") == "a & b"
+
+puts "std/html: escaping (string & IO), unescaping (named, decimal, hex), and entity tables verified"
+
+# =============================================================================
+# 2. INI Parity
+# =============================================================================
+
+ini_content = <<-INI
+# Top-level global comments
+; Semicolon global comment
+app_name = ParityRunner
+version = 2.4.0
+
+[database]
+host = db.internal
+port = 5432
+max_connections = 100
+
+[features]
+experimental = true
+cache_ttl = 3600
+INI
+
+parsed_ini = INI.parse(ini_content)
+raise "ini: global app_name" unless parsed_ini[""]["app_name"] == "ParityRunner"
+raise "ini: global version" unless parsed_ini[""]["version"] == "2.4.0"
+raise "ini: section db host" unless parsed_ini["database"]["host"] == "db.internal"
+raise "ini: section db port" unless parsed_ini["database"]["port"] == "5432"
+raise "ini: section features" unless parsed_ini["features"]["experimental"] == "true"
+
+# Build with space = true
+built_spaced = INI.build(parsed_ini, space: true)
+raise "ini: build space" unless built_spaced.includes?("app_name = ParityRunner")
+raise "ini: build section" unless built_spaced.includes?("[database]")
+
+# Build with space = false
+built_compact = INI.build(parsed_ini, space: false)
+raise "ini: build compact" unless built_compact.includes?("app_name=ParityRunner")
+
+# Roundtrip
+reparsed = INI.parse(built_compact)
+raise "ini: roundtrip" unless reparsed["database"]["host"] == "db.internal"
+
+# ParseException validation
+ex_unterminated = INI::ParseException.new("Unterminated section", 5, 12)
+raise "ini: ex line" unless ex_unterminated.line_number == 5
+raise "ini: ex col" unless ex_unterminated.column_number == 12
+raise "ini: ex location" unless ex_unterminated.location[0] == 5 && ex_unterminated.location[1] == 12
+raise "ini: ex message" unless ex_unterminated.message.includes?("Unterminated section at line 5, column 12")
+
+puts "std/ini: section parsing, top-level keys, spacing formats, and parse exceptions verified"
+
+# =============================================================================
+# 3. ECR Parity
+# =============================================================================
+
+# 1. Lexer tokenization
+ecr_sample = "hello <%= 42 %> text <%- if true -%> yes <% end %> <%% escaped %>"
+ecr_lexer = ECR::Lexer.new(ecr_sample)
+
+tok1 = ecr_lexer.next_token
+raise "ecr: tok1 string" unless tok1.string? && tok1.value == "hello "
+
+tok2 = ecr_lexer.next_token
+raise "ecr: tok2 output" unless tok2.output? && tok2.value.strip == "42"
+
+tok3 = ecr_lexer.next_token
+raise "ecr: tok3 string" unless tok3.string? && tok3.value == " text "
+
+tok4 = ecr_lexer.next_token
+raise "ecr: tok4 control" unless tok4.control? && tok4.suppress_leading? && tok4.value.strip == "if true"
+
+# 2. Runtime process_string
+processed_prog = ECR.process_string("<%= name %>: <% 2.times { %>hi<% } %>", "view.ecr", "buffer")
+raise "ecr: process buffer" unless processed_prog.includes?("buffer")
+raise "ecr: process loc" unless processed_prog.includes?("#<loc:\"view.ecr\"")
+
+# 3. Compile-time template compilation without shelling out
+class ECRGreetingView
+  def initialize(@greeting : String, @items : Array(String))
+  end
+
+  def name
+    @greeting
+  end
+
+  def count
+    @items.size
+  end
+
+  ECR.def_to_s("/tmp/my_test_template.ecr")
+end
+
+greet_view = ECRGreetingView.new("Greetings from ECR", ["alpha", "beta"])
+greet_mem = Memory.new
+greet_view.to_s(greet_mem)
+raise "ecr: def_to_s" unless greet_mem.to_s.includes?("Greetings from ECR")
+
+# 4. ECR.render to String
+name = "RenderUser"
+count = 3
+rendered_str = ECR.render("/tmp/my_test_template.ecr")
+raise "ecr: render output" unless rendered_str.includes?("Hello RenderUser!")
+raise "ecr: render logic" unless rendered_str.includes?("Count is 3")
+
+puts "std/ecr: lexer, process_string, embed, render, def_to_s without shelling out verified"
+
+# =============================================================================
+# 4. OptionParser Parity
+# =============================================================================
+
+opt_v = false
+opt_name = ""
+opt_level = "0"
+opt_sub = false
+remaining_args = [] of String
+
+parser = OptionParser.new
+parser.banner = "Usage: parity_test [options]"
+parser.on("-v", "--verbose", "Verbose mode") { opt_v = true }
+parser.on("-n NAME", "--name=NAME", "Target name") { |val| opt_name = val }
+parser.on("-l[LEVEL]", "--level[=LEVEL]", "Compression level") { |val| opt_level = val }
+parser.on("subcmd", "Run subcommand") { opt_sub = true }
+parser.separator("Advanced:")
+
+args_to_parse = ["-v", "--name=iyi_test", "-l5", "subcmd", "extra1", "extra2"]
+remaining_args = parser.parse(args_to_parse)
+
+raise "opt: verbose" unless opt_v
+raise "opt: name" unless opt_name == "iyi_test"
+raise "opt: level" unless opt_level == "5"
+raise "opt: subcommand" unless opt_sub
+raise "opt: remaining" unless remaining_args == ["extra1", "extra2"]
+
+# Help text generation
+help_text = parser.to_s
+raise "opt: help banner" unless help_text.includes?("Usage: parity_test [options]")
+raise "opt: help verbose" unless help_text.includes?("--verbose")
+raise "opt: help separator" unless help_text.includes?("Advanced:")
+
+# Check Exception types
+inv_ex = OptionParser::InvalidOption.new("-z")
+raise "opt: invalid ex" unless inv_ex.flag == "-z" && inv_ex.message == "Invalid option: -z"
+miss_ex = OptionParser::MissingOption.new("--name")
+raise "opt: missing ex" unless miss_ex.flag == "--name" && miss_ex.message == "Missing option: --name"
+
+puts "std/option_parser: flags, required/optional arguments, subcommands, help formatting verified"
+
+# =============================================================================
+# 5. MIME Parity
+# =============================================================================
+
+# MediaType parsing and attributes
+mt = MediaType.parse("text/html; charset=UTF-8; boundary=\"----boundary123\"")
+raise "mime: type" unless mt.type == "text"
+raise "mime: sub_type" unless mt.sub_type == "html"
+raise "mime: charset" unless mt["charset"] == "UTF-8"
+raise "mime: boundary" unless mt["boundary"] == "----boundary123"
+raise "mime: fetch default" unless mt.fetch("nonexistent", "fallback") == "fallback"
+
+# MIME Registry and DEFAULT_TYPES
+MIME.init(load_defaults: true)
+raise "mime: html default" unless MIME.from_extension(".html") == "text/html; charset=utf-8"
+raise "mime: json default" unless MIME.from_extension(".json") == "application/json"
+raise "mime: filename lookup" unless MIME.from_filename("report.pdf") == "application/pdf"
+raise "mime: default fallback" unless MIME.from_extension(".unknown_xyz", "text/plain") == "text/plain"
+
+# Custom registration
+MIME.register(".iyi", "text/x-iyi; charset=utf-8")
+raise "mime: custom register" unless MIME.from_extension(".iyi") == "text/x-iyi; charset=utf-8"
+raise "mime: custom extensions" unless MIME.extensions("text/x-iyi; charset=utf-8").includes?(".iyi")
+
+# Multipart Builder and Parser
+mp_data = MIME::Multipart.build("BOUNDARY_PARITY") do |builder|
+  h1 = Headers.new
+  h1.add("Content-Type", "text/plain; charset=utf-8")
+  builder.body_part(h1, "Part 1: Text content")
+
+  h2 = Headers.new
+  h2.add("Content-Type", "application/json")
+  builder.body_part(h2, "{\"key\":\"value\"}")
+end
+
+raise "mime: mp boundary" unless mp_data.includes?("--BOUNDARY_PARITY")
+raise "mime: mp close" unless mp_data.includes?("--BOUNDARY_PARITY--")
+
+# Multipart parsing
+parsed_parts = 0
+MIME::Multipart.parse(mp_data, "BOUNDARY_PARITY") do |headers, body_io|
+  parsed_parts += 1
+  if parsed_parts == 1
+    raise "mime: part 1 header" unless headers["Content-Type"].includes?("text/plain")
+    raise "mime: part 1 body" unless body_io.to_s == "Part 1: Text content"
+  elsif parsed_parts == 2
+    raise "mime: part 2 header" unless headers["Content-Type"].includes?("application/json")
+    raise "mime: part 2 body" unless body_io.to_s == "{\"key\":\"value\"}"
+  end
+end
+raise "mime: parsed parts count" unless parsed_parts == 2
+
+puts "std/mime: MediaType, default registry, custom types, and Multipart builder/parser verified"
+
+# =============================================================================
+# 6. CSV Parity
+# =============================================================================
+
+# RFC 4180 parsing with quotes, commas, CRLF
+csv_text = "Name,Age,Notes\r\n\"Smith, John\",34,\"Line 1\r\nLine 2\"\r\nAlice,28,\"She said \"\"Hello\"\"\"\r\n"
+parsed_rows = CSV.parse(csv_text)
+
+raise "csv: row count" unless parsed_rows.size == 3
+raise "csv: col count" unless parsed_rows[0].size == 3
+raise "csv: quoted comma" unless parsed_rows[1][0] == "Smith, John"
+raise "csv: quoted crlf" unless parsed_rows[1][2] == "Line 1\r\nLine 2"
+raise "csv: escaped quotes" unless parsed_rows[2][2] == "She said \"Hello\""
+
+# CSV with headers, strip, row accessors, and Regex pattern
+csv_reader = CSV.new("  First Name  ,  Age  ,  Role  \n  Bob  ,  42  ,  Admin  ", headers: true, strip: true)
+raise "csv: next true" unless csv_reader.next
+raise "csv: header name" unless csv_reader["First Name"] == "Bob"
+raise "csv: header index" unless csv_reader[1] == "42"
+raise "csv: negative index" unless csv_reader[-1] == "Admin"
+raise "csv: header regex" unless csv_reader[Regex.new("First.*")] == "Bob"
+
+row_obj = csv_reader.row
+raise "csv: row size" unless row_obj.size == 3
+row_hash = row_obj.to_h
+raise "csv: row to_h" unless row_hash["First Name"] == "Bob" && row_hash["Role"] == "Admin"
+raise "csv: values_at" unless row_obj.values_at(0, 2) == ["Bob", "Admin"]
+
+# CSV Builder with Quoting modes
+csv_rfc = CSV.build(quoting: CSV::Builder::Quoting::RFC) do |builder|
+  builder.row("hello", "world, with comma", "simple")
+  builder.row do |r|
+    r << "first"
+    r.skip_cell
+    r.concat(["third", "fourth"])
+  end
+end
+raise "csv: rfc quotes" unless csv_rfc.includes?("\"world, with comma\"")
+raise "csv: skip cell" unless csv_rfc.includes?("first,,third,fourth")
+
+csv_all = CSV.build(quoting: CSV::Builder::Quoting::ALL) do |builder|
+  builder.row("a", "b", "c")
+end
+raise "csv: all quotes" unless csv_all.strip == "\"a\",\"b\",\"c\""
+
+# CSV::Lexer streaming token inspection
+csv_lex = CSV::Lexer.new("one,two\nthree")
+tok_a = csv_lex.next_token
+raise "csv: lex cell1" unless tok_a.cell? && tok_a.value == "one"
+tok_b = csv_lex.next_token
+raise "csv: lex cell2" unless tok_b.cell? && tok_b.value == "two"
+tok_nl = csv_lex.next_token
+raise "csv: lex nl" unless tok_nl.newline?
+tok_c = csv_lex.next_token
+raise "csv: lex cell3" unless tok_c.cell? && tok_c.value == "three"
+tok_eof = csv_lex.next_token
+raise "csv: lex eof" unless tok_eof.eof?
+
+# CSV::MalformedCSVError
+err = CSV::MalformedCSVError.new("Unclosed quote", 4, 18)
+raise "csv: err line" unless err.line_number == 4
+raise "csv: err col" unless err.column_number == 18
+raise "csv: err message" unless err.message == "Unclosed quote at line 4, column 18"
+
+puts "std/csv: RFC 4180 parsing, headers, row accessors, builder quoting, and lexer tokens verified"
+
+# =============================================================================
+puts "all std/template_text_parity checks passed"

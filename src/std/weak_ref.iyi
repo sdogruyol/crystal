@@ -1,0 +1,26 @@
+# Weak Reference class that allows a referenced object to be inspected
+# without preventing it from being garbage-collected where supported.
+
+module std/weak_ref
+
+pub class WeakRef(T)
+  @target : Void*
+
+  def initialize(target : T)
+    @target = target.as(Void*)
+  end
+
+  def self.allocate : self
+    ptr = Pointer(UInt8).malloc(instance_sizeof(self).to_u64).as(self)
+    ptr
+  end
+
+  # Returns the referenced object or Nil if it has been collected.
+  def value : T?
+    if @target.address == 0
+      nil
+    else
+      @target.as(T?)
+    end
+  end
+end

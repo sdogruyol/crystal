@@ -1,0 +1,229 @@
+# Exercises standard IO and filesystem modules:
+#   * std/path (Path)
+#   * std/env (ENV)
+#   * std/dir (Dir)
+#   * std/file_utils (FileUtils)
+#   * std/file (File extensions, Info, Permissions, Type)
+#   * std/io (IO extensions, Memory, Sized, Delimited, MultiWriter, Hexdump, ByteFormat)
+
+module bench/std_io_filesystem_exercise
+
+import std/path
+using std/path::{Path}
+
+import std/env
+using std/env::{ENV}
+
+import std/dir
+using std/dir::{Dir}
+
+import std/file_utils
+using std/file_utils::{FileUtils}
+
+import std/file
+using std/file::{File}
+
+import std/io
+using std/io::{IO, Memory, Sized, Delimited, MultiWriter, Hexdump, ByteFormat, Seek}
+
+def assert_true(cond : Bool, msg : String) : Nil
+  if !cond
+    raise "ASSERTION FAILED: #{msg}"
+  end
+end
+
+def assert_equal(expected : String, actual : String, msg : String) : Nil
+  if expected != actual
+    raise "ASSERTION FAILED: #{msg} (expected '#{expected}', got '#{actual}')"
+  end
+end
+
+def assert_equal(expected : Int64, actual : Int64, msg : String) : Nil
+  if expected != actual
+    raise "ASSERTION FAILED: #{msg} (expected #{expected}, got #{actual})"
+  end
+end
+
+puts "== std/path"
+# 1. Path creation and normalization
+p1 = Path.new("/a/b/c/file.txt")
+assert_equal("/a/b/c/file.txt", p1.to_s, "path to_s")
+assert_equal("file.txt", p1.basename, "path basename")
+assert_equal("file", p1.basename(".txt"), "path basename suffix")
+assert_equal("/a/b/c", p1.dirname, "path dirname")
+assert_equal("/a/b/c", p1.parent.to_s, "path parent")
+assert_equal(".txt", p1.extension, "path extension")
+assert_equal("file", p1.stem, "path stem")
+assert_true(p1.absolute?, "path absolute?")
+assert_true(!p1.relative?, "path not relative?")
+
+p_norm = Path.new("a/b/../c/./d").normalize
+assert_equal("a/c/d", p_norm.to_s, "path normalize")
+
+# 2. Path relative_to and join
+p_rel = Path.new("/a/b/c/d").relative_to("/a/b")
+assert_equal("c/d", p_rel.to_s, "path relative_to")
+
+p_joined = Path.new("/root").join("sub", "leaf.txt")
+assert_equal("/root/sub/leaf.txt", p_joined.to_s, "path join")
+p_slash = Path.new("/root") / "branch"
+assert_equal("/root/branch", p_slash.to_s, "path /")
+
+# 3. Path parts and match?
+parts = p1.parts
+assert_true(parts.size == 5, "path parts size")
+assert_true(p1.match?("*.txt"), "path match wildcard")
+assert_true(p1.match?("*/file.txt"), "path match prefix wildcard")
+assert_true(!p1.match?("*.md"), "path match negative")
+
+puts "== std/env"
+# 1. ENV write and read
+ENV["IYI_TEST_ENV_VAR"] = "test_value_42"
+assert_true(ENV.has_key?("IYI_TEST_ENV_VAR"), "env has_key?")
+assert_equal("test_value_42", ENV["IYI_TEST_ENV_VAR"], "env []")
+assert_equal("test_value_42", ENV.fetch("IYI_TEST_ENV_VAR"), "env fetch")
+assert_equal("default", ENV.fetch("NON_EXISTENT_VAR_xyz", "default"), "env fetch default")
+
+# 2. ENV iteration and deletion
+env_keys = ENV.keys
+assert_true(env_keys.includes?("IYI_TEST_ENV_VAR"), "env keys includes var")
+deleted = ENV.delete("IYI_TEST_ENV_VAR")
+assert_equal("test_value_42", deleted ? deleted : "", "env delete return")
+assert_true(!ENV.has_key?("IYI_TEST_ENV_VAR"), "env has_key? after delete")
+
+puts "== std/dir"
+# 1. Dir current and tempdir
+cwd = Dir.current
+assert_true(!cwd.empty?, "dir current not empty")
+tmp = Dir.tempdir
+assert_true(!tmp.empty?, "dir tempdir not empty")
+
+# 2. Dir mkdir, entries, children, delete
+test_dir = tmp + "/iyi_std_dir_test_" + p1.basename
+FileUtils.rm_rf(test_dir)
+Dir.mkdir_p(test_dir)
+assert_true(Dir.exists?(test_dir), "dir exists? after mkdir_p")
+assert_true(Dir.empty?(test_dir), "dir empty? true")
+
+test_file = test_dir + "/sample.txt"
+File.write(test_file, "hello inside dir")
+assert_true(!Dir.empty?(test_dir), "dir empty? false after file write")
+
+children = Dir.children(test_dir)
+assert_equal(1_i64, children.size.to_i64, "dir children size")
+assert_equal("sample.txt", children[0], "dir child filename")
+
+entries = Dir.entries(test_dir)
+assert_true(entries.includes?(".") && entries.includes?(".."), "dir entries includes . and ..")
+
+File.delete(test_file)
+Dir.delete(test_dir)
+assert_true(!Dir.exists?(test_dir), "dir exists? false after delete")
+
+# 3. Dir glob
+glob_sh = Dir.glob("bench/*.sh")
+assert_true(glob_sh.size > 0, "dir glob bench/*.sh found entries")
+
+puts "== std/file_utils"
+# 1. FileUtils mkdir_p, touch, cp, mv, cmp, rm_rf
+fu_base = tmp + "/iyi_std_fu_test"
+FileUtils.rm_rf(fu_base)
+FileUtils.mkdir_p(fu_base + "/nested/deep")
+assert_true(Dir.exists?(fu_base + "/nested/deep"), "fu mkdir_p nested")
+
+fu_f1 = fu_base + "/f1.txt"
+FileUtils.touch(fu_f1)
+assert_true(File.exists?(fu_f1), "fu touch created file")
+File.write(fu_f1, "contents 12345")
+
+fu_f2 = fu_base + "/f2.txt"
+FileUtils.cp(fu_f1, fu_f2)
+assert_true(FileUtils.cmp(fu_f1, fu_f2), "fu cmp identical")
+
+fu_f3 = fu_base + "/f3.txt"
+FileUtils.mv(fu_f2, fu_f3)
+assert_true(File.exists?(fu_f3), "fu mv dest exists")
+assert_true(!File.exists?(fu_f2), "fu mv src gone")
+
+FileUtils.rm_rf(fu_base)
+assert_true(!Dir.exists?(fu_base), "fu rm_rf removed directory")
+
+puts "== std/file"
+# 1. File size, info, read_lines, truncate
+test_f = tmp + "/iyi_std_file_test.txt"
+File.delete(test_f) if File.exists?(test_f)
+File.write(test_f, "line 1\nline 2\nline 3\n")
+assert_equal(21_i64, File.size(test_f), "file size")
+assert_true(File.file?(test_f), "file file?")
+assert_true(!File.directory?(test_f), "file directory? false")
+assert_true(File.readable?(test_f), "file readable?")
+assert_true(File.writable?(test_f), "file writable?")
+
+info = File.info(test_f)
+assert_equal(21_i64, info.size, "file info size")
+assert_true(info.file?, "file info file?")
+assert_true(info.permissions.owner_read?, "file info perms owner_read")
+assert_true(info.modification_time > 0_i64, "file info mtime")
+
+lines = File.read_lines(test_f)
+assert_equal(3_i64, lines.size.to_i64, "file read_lines count")
+assert_equal("line 1", lines[0], "file read_lines 0")
+assert_equal("line 2", lines[1], "file read_lines 1")
+assert_equal("line 3", lines[2], "file read_lines 2")
+
+File.truncate(test_f, 6_i64)
+assert_equal(6_i64, File.size(test_f), "file size after truncate")
+
+File.delete(test_f)
+assert_true(!File.exists?(test_f), "file exists? false after delete")
+
+# 2. File tempfile
+temp_path = File.tempfile("sample", ".tmp")
+assert_true(File.exists?(temp_path), "tempfile created")
+File.delete(temp_path)
+
+puts "== std/io"
+# 1. IO::Memory
+mem = Memory.new
+mem.write("hello ")
+mem.puts("world")
+assert_equal(12_i64, mem.bytesize.to_i64, "mem bytesize")
+assert_equal("hello world\n", mem.to_s, "mem to_s")
+
+mem.rewind
+l = mem.read_line(chomp: true)
+assert_equal("hello world", l ? l : "", "mem read_line chomp")
+
+mem.seek(0_i64, Seek::Set)
+b_val = mem.read_byte
+assert_equal(104_i64, b_val ? b_val.to_i64 : 0_i64, "mem read_byte 'h'")
+
+# 2. IO::Sized and IO::Delimited
+mem2 = Memory.new("prefix-DATA-suffix")
+delim = Delimited.new(mem2, "-suffix")
+assert_equal("prefix-DATA", delim.read_all, "delimited read_all")
+
+# 3. IO::MultiWriter
+m1 = Memory.new
+m2 = Memory.new
+multi = MultiWriter.new([m1, m2])
+multi.print("broadcast")
+assert_equal("broadcast", m1.to_s, "multiwriter m1")
+assert_equal("broadcast", m2.to_s, "multiwriter m2")
+
+# 4. IO::ByteFormat
+buf4 = Pointer(UInt8).malloc(4_u64)
+ByteFormat::LittleEndian.encode_int32(12345678, buf4)
+decoded_le = ByteFormat::LittleEndian.decode_int32(buf4)
+assert_equal(12345678_i64, decoded_le.to_i64, "byteformat le int32")
+
+ByteFormat::BigEndian.encode_int32(12345678, buf4)
+decoded_be = ByteFormat::BigEndian.decode_int32(buf4)
+assert_equal(12345678_i64, decoded_be.to_i64, "byteformat be int32")
+
+buf8 = Pointer(UInt8).malloc(8_u64)
+ByteFormat::LittleEndian.encode_int64(9876543210_i64, buf8)
+decoded_i64 = ByteFormat::LittleEndian.decode_int64(buf8)
+assert_equal(9876543210_i64, decoded_i64, "byteformat le int64")
+
+puts "all std/io and filesystem checks passed"

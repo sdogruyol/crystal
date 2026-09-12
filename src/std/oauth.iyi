@@ -1,0 +1,690 @@
+# Standard OAuth 1.0 (RFC 5849) protocol implementation for iyi.
+#
+# Fully native: zero external C library dependencies.
+# Uses std/crypto for HMAC-SHA1 and CSPRNG, std/http for requests/responses,
+# std/uri for parameter encoding, and std/json for token serialization.
+
+module std/oauth
+
+pub import std/http
+pub import std/http1
+pub import std/uri
+pub import std/crypto
+pub import std/digest
+pub import std/base64
+pub import std/time
+pub import std/json
+pub import std/random
+
+using std/http::{Request, Response, Headers, Status}
+using std/uri::{URI, Params}
+using std/crypto::{HMAC}
+using std/base64::{Base64}
+using std/time::{Time, Span}
+using std/json::{JSON, Builder, PullParser}
+
+# -----------------------------------------------------------------------------
+# HTTP::Client support
+# -----------------------------------------------------------------------------
+
+module ::HTTP
+  alias Request = Std::Http::Request
+  alias Response = Std::Http::Response
+  alias Headers = Std::Http::Headers
+
+  class Client
+    property host : String
+    property port : Int32?
+    property tls : Bool
+    property default_headers : Headers
+    property timeout_ms : Int32
+    @before_request : Array(Proc(Request, Nil))
+    @http1_client : Std::Http1::Client?
+
+    def initialize(@host : String, @port : Int32? = nil, @tls : Bool = false)
+      @before_request = [] of Proc(Request, Nil)
+      @default_headers = Headers.new
+      @default_headers["User-Agent"] = "iyi-oauth/1.0"
+      @timeout_ms = 10000
+      @http1_client = nil
+    end
+
+    def initialize(uri : Std::Uri::URI)
+      @host = uri.host || "127.0.0.1"
+      @port = uri.port
+      @tls = uri.scheme == "https"
+      @before_request = [] of Proc(Request, Nil)
+      @default_headers = Headers.new
+      @default_headers["User-Agent"] = "iyi-oauth/1.0"
+      @timeout_ms = 10000
+      @http1_client = nil
+    end
+
+    def tls? : Bool
+      @tls
+    end
+
+    def before_request(&block : Request -> Nil) : Nil
+      @before_request << block
+    end
+
+    def run_before_request(request : Request) : Nil
+      i = 0
+      while i < @before_request.size
+        @before_request[i].call(request)
+        i = i + 1
+      end
+    end
+
+    def get(path : String, headers : Headers? = nil) : Response
+      req = Request.new("GET", path, headers)
+      exec(req)
+    end
+
+    def post(path : String, headers : Headers? = nil, body : String = "", form : String | Std::Uri::Params | Nil = nil) : Response
+      hdrs = headers ? headers.dup : Headers.new
+      actual_body = if form
+                      unless hdrs.has_key?("Content-Type")
+                        hdrs["Content-Type"] = "application/x-www-form-urlencoded"
+                      end
+                      form.is_a?(Std::Uri::Params) ? form.to_s : form.as(String)
+                    else
+                      body
+                    end
+      req = Request.new("POST", path, hdrs, actual_body)
+      exec(req)
+    end
+
+    def exec(req : Request) : Response
+      run_before_request(req)
+      url = build_url(req.target)
+      c = @http1_client ||= Std::Http1::Client.new
+      c.execute(req, url)
+    end
+
+    def close : Nil
+      if c = @http1_client
+        c.close
+      end
+      @http1_client = nil
+    end
+
+    private def build_url(path : String) : String
+      if path.starts_with?("http://") || path.starts_with?("https://")
+        path
+      else
+        scheme = @tls ? "https" : "http"
+        p = @port ? ":" + @port.to_s : ""
+        slash = path.starts_with?("/") ? "" : "/"
+        scheme + "://" + @host + p + slash + path
+      end
+    end
+  end
+end
+
+# -----------------------------------------------------------------------------
+# OAuth::Error
+# -----------------------------------------------------------------------------
+
+pub class Error < Exception
+  getter message : String
+  getter response : HTTP::Response?
+
+  def initialize(@message : String)
+    @response = nil
+  end
+
+  def initialize(response : HTTP::Response)
+    @message = "OAuth:Error: " + response.body
+    @response = response
+  end
+
+  def message : String
+    @message
+  end
+end
+
+def raise(err : Error, file : String = __FILE__, line : Int32 = __LINE__) : NoReturn
+  m = err.message
+  ::raise(m ? m : "OAuth::Error", file, line)
+end
+
+# -----------------------------------------------------------------------------
+# OAuth::RequestToken
+# -----------------------------------------------------------------------------
+
+pub class RequestToken
+  getter token : String
+  getter secret : String
+
+  def initialize(@token : String, @secret : String)
+  end
+
+  def self.from_response(response : String) : self
+    params = Params.parse(response)
+    tok = params["oauth_token"]?
+    sec = params["oauth_token_secret"]?
+
+    if tok && sec
+      new(tok, sec)
+    else
+      missing = [] of String
+      missing << "token" unless tok
+      missing << "secret" unless sec
+      raise Error.new("Missing " + missing.join(" and "))
+    end
+  end
+
+  def ==(other : RequestToken) : Bool
+    @token == other.token && @secret == other.secret
+  end
+
+  def hash(hasher)
+    hasher = @token.hash(hasher)
+    @secret.hash(hasher)
+  end
+
+  def to_s(io : IO) : Nil
+    io << "OAuth::RequestToken(token=" << @token << ", secret=" << @secret << ")"
+  end
+end
+
+# -----------------------------------------------------------------------------
+# OAuth::AccessToken
+# -----------------------------------------------------------------------------
+
+pub class AccessToken
+  getter token : String
+  getter secret : String
+
+  def initialize(@token : String, @secret : String, @extra : Hash(String, String)? = nil)
+  end
+
+  def extra : Hash(String, String)
+    @extra ||= {} of String => String
+  end
+
+  def authenticate(client : HTTP::Client, consumer_key : String, consumer_secret : String, extra_params : Hash(String, String)? = nil) : Nil
+    OAuth.authenticate(client, @token, @secret, consumer_key, consumer_secret, extra_params)
+  end
+
+  def self.from_response(response : String) : self
+    params = Params.parse(response)
+    tok = params["oauth_token"]?
+    sec = params["oauth_token_secret"]?
+
+    if tok && sec
+      extra_map = {} of String => String
+      params.each do |k, v|
+        unless k == "oauth_token" || k == "oauth_token_secret"
+          extra_map[k] = v
+        end
+      end
+      extra_res = extra_map.empty? ? nil : extra_map
+      new(tok, sec, extra_res)
+    else
+      missing = [] of String
+      missing << "token" unless tok
+      missing << "secret" unless sec
+      raise Error.new("Missing " + missing.join(" and "))
+    end
+  end
+
+  def self.from_json(json_str : String) : self
+    new(PullParser.new(json_str))
+  end
+
+  def self.new(pull : PullParser) : self
+    tok : String? = nil
+    sec : String? = nil
+    extra : Hash(String, String)? = nil
+
+    pull.read_object do |key|
+      case key
+      when "oauth_token"
+        tok = pull.read_string
+      when "oauth_token_secret"
+        sec = pull.read_string
+      else
+        if pull.kind == PullParser::Kind::String
+          extra_map = extra ||= {} of String => String
+          extra_map[key] = pull.read_string
+        else
+          pull.skip
+        end
+      end
+    end
+
+    if tok && sec
+      new(tok, sec, extra)
+    else
+      missing = [] of String
+      missing << "token" unless tok
+      missing << "secret" unless sec
+      raise Error.new("Missing " + missing.join(" and "))
+    end
+  end
+
+  def to_json(json : Builder) : Nil
+    json.object do
+      json.field "oauth_token", @token
+      json.field "oauth_token_secret", @secret
+      if ex = @extra
+        ex.each do |k, v|
+          json.field k, v
+        end
+      end
+    end
+  end
+
+  def to_json : String
+    JSON.build do |b|
+      to_json(b)
+    end
+  end
+
+  def ==(other : AccessToken) : Bool
+    return false unless @token == other.token && @secret == other.secret
+    self_extra = @extra || ({} of String => String)
+    other_extra = other.extra
+    self_extra == other_extra
+  end
+
+  def hash(hasher)
+    hasher = @token.hash(hasher)
+    @secret.hash(hasher)
+  end
+
+  def to_s(io : IO) : Nil
+    io << "OAuth::AccessToken(token=" << @token << ", secret=" << @secret << ")"
+  end
+end
+
+# -----------------------------------------------------------------------------
+# OAuth::AuthorizationHeader
+# -----------------------------------------------------------------------------
+
+pub struct AuthorizationHeader
+  @entries : Array(String)
+
+  def initialize
+    @entries = [] of String
+  end
+
+  def add(key : String, value : String?) : Nil
+    return unless value
+    k_enc = URI.encode_www_form(key, space_to_plus: false)
+    v_enc = URI.encode_www_form(value, space_to_plus: false)
+    @entries << k_enc + "=\"" + v_enc + "\""
+  end
+
+  def to_s : String
+    "OAuth " + @entries.join(", ")
+  end
+
+  def to_s(io : IO) : Nil
+    io << to_s
+  end
+end
+
+# -----------------------------------------------------------------------------
+# OAuth::Signature (RFC 5849 Section 3.4)
+# -----------------------------------------------------------------------------
+
+pub struct Signature
+  property consumer_key : String
+  property client_shared_secret : String
+  property oauth_token : String?
+  property token_shared_secret : String?
+  property extra_params : Hash(String, String)?
+  property oauth_version : String?
+
+  def initialize(@consumer_key : String,
+                 @client_shared_secret : String,
+                 @oauth_token : String? = nil,
+                 @token_shared_secret : String? = nil,
+                 @extra_params : Hash(String, String)? = nil,
+                 @oauth_version : String? = nil)
+  end
+
+  def effective_version : String?
+    if v = @oauth_version
+      v.empty? ? nil : v
+    elsif extra = @extra_params
+      if extra.has_key?("oauth_version")
+        v2 = extra["oauth_version"]
+        v2.empty? ? nil : v2
+      else
+        nil
+      end
+    else
+      nil
+    end
+  end
+
+  def key : String
+    enc_client = URI.encode_www_form(@client_shared_secret, space_to_plus: false)
+    enc_token = if tok_sec = @token_shared_secret
+                  URI.encode_www_form(tok_sec, space_to_plus: false)
+                else
+                  ""
+                end
+    enc_client + "&" + enc_token
+  end
+
+  def base_string(request : HTTP::Request, tls : Bool, ts : String, nonce : String) : String
+    norm = gather_and_normalize_params(request, ts, nonce)
+    base_string_with_normalized(request, tls, norm)
+  end
+
+  def compute(request : HTTP::Request, tls : Bool, ts : String, nonce : String) : String
+    bs = base_string(request, tls, ts, nonce)
+    digest = HMAC.digest(:sha1, key, bs)
+    Base64.strict_encode(digest)
+  end
+
+  def authorization_header(request : HTTP::Request, tls : Bool, ts : String, nonce : String) : String
+    sig = compute(request, tls, ts, nonce)
+
+    auth = AuthorizationHeader.new
+    auth.add("oauth_consumer_key", @consumer_key)
+    auth.add("oauth_signature_method", "HMAC-SHA1")
+    auth.add("oauth_timestamp", ts)
+    auth.add("oauth_nonce", nonce)
+    auth.add("oauth_signature", sig)
+    if tok = @oauth_token
+      auth.add("oauth_token", tok)
+    end
+    if ver = effective_version
+      auth.add("oauth_version", ver)
+    end
+
+    if extra = @extra_params
+      extra.each do |k, v|
+        unless k == "oauth_consumer_key" || k == "oauth_signature_method" ||
+               k == "oauth_timestamp" || k == "oauth_nonce" ||
+               k == "oauth_signature" || k == "oauth_token" || k == "oauth_version"
+          auth.add(k, v)
+        end
+      end
+    end
+
+    auth.to_s
+  end
+
+  private def gather_and_normalize_params(request : HTTP::Request, ts : String, nonce : String) : String
+    # Pairs of (encoded_key, encoded_value)
+    pairs = [] of Tuple(String, String)
+
+    pairs << {URI.encode_www_form("oauth_consumer_key", space_to_plus: false), URI.encode_www_form(@consumer_key, space_to_plus: false)}
+    pairs << {URI.encode_www_form("oauth_nonce", space_to_plus: false), URI.encode_www_form(nonce, space_to_plus: false)}
+    pairs << {URI.encode_www_form("oauth_signature_method", space_to_plus: false), URI.encode_www_form("HMAC-SHA1", space_to_plus: false)}
+    pairs << {URI.encode_www_form("oauth_timestamp", space_to_plus: false), URI.encode_www_form(ts, space_to_plus: false)}
+    if tok = @oauth_token
+      pairs << {URI.encode_www_form("oauth_token", space_to_plus: false), URI.encode_www_form(tok, space_to_plus: false)}
+    end
+
+    if ver = effective_version
+      pairs << {URI.encode_www_form("oauth_version", space_to_plus: false), URI.encode_www_form(ver, space_to_plus: false)}
+    end
+
+    if extra = @extra_params
+      extra.each do |k, v|
+        unless k == "oauth_version"
+          pairs << {URI.encode_www_form(k, space_to_plus: false), URI.encode_www_form(v, space_to_plus: false)}
+        end
+      end
+    end
+
+    # Query parameters
+    q_params = request.query_params
+    q_params.each do |k, v|
+      pairs << {URI.encode_www_form(k, space_to_plus: false), URI.encode_www_form(v, space_to_plus: false)}
+    end
+
+    # Form parameters if body is application/x-www-form-urlencoded
+    ct = request.headers["Content-Type"]? || request.headers["Content-type"]?
+    if ct && ct.starts_with?("application/x-www-form-urlencoded") && !request.body.empty?
+      form_p = request.form_params
+      form_p.each do |k, v|
+        pairs << {URI.encode_www_form(k, space_to_plus: false), URI.encode_www_form(v, space_to_plus: false)}
+      end
+    end
+
+    # Sort lexicographically by encoded key, then encoded value (RFC 5849 §3.4.1.3.2)
+    # Using bubble / insertion sort on tuples:
+    i = 0
+    n = pairs.size
+    while i < n - 1
+      j = 0
+      while j < n - i - 1
+        a = pairs[j]
+        b = pairs[j + 1]
+        swap = if a[0] > b[0]
+                 true
+               elsif a[0] == b[0] && a[1] > b[1]
+                 true
+               else
+                 false
+               end
+        if swap
+          pairs[j] = b
+          pairs[j + 1] = a
+        end
+        j = j + 1
+      end
+      i = i + 1
+    end
+
+    # Concatenate: enc_k=enc_v joined by &
+    parts = [] of String
+    i = 0
+    while i < pairs.size
+      parts << pairs[i][0] + "=" + pairs[i][1]
+      i = i + 1
+    end
+    parts.join("&")
+  end
+
+  private def base_string_with_normalized(request : HTTP::Request, tls : Bool, normalized_params : String) : String
+    host, port = host_and_port(request, tls)
+
+    scheme = tls ? "https" : "http"
+    base_uri = scheme + "://" + host.downcase
+    if p = port
+      if (tls && p != 443) || (!tls && p != 80)
+        base_uri = base_uri + ":" + p.to_s
+      end
+    end
+
+    target = request.target
+    uri_path = if q_idx = target.index('?')
+                 target[0, q_idx]
+               else
+                 target
+               end
+
+    # If target is absolute URL, extract path component
+    if uri_path.starts_with?("http://") || uri_path.starts_with?("https://")
+      parsed = URI.parse(uri_path)
+      uri_path = parsed.path
+    end
+
+    uri_path = "/" if uri_path.empty?
+    base_uri = base_uri + uri_path
+
+    enc_method = URI.encode_www_form(request.method.upcase, space_to_plus: false)
+    enc_uri = URI.encode_www_form(base_uri, space_to_plus: false)
+    enc_params = URI.encode_www_form(normalized_params, space_to_plus: false)
+
+    enc_method + "&" + enc_uri + "&" + enc_params
+  end
+
+  private def host_and_port(request : HTTP::Request, tls : Bool) : Tuple(String, Int32?)
+    host_hdr = request.headers["Host"]?
+    if host_hdr && !host_hdr.empty?
+      if colon_idx = host_hdr.index(':')
+        h = host_hdr[0, colon_idx]
+        p = host_hdr[colon_idx + 1, host_hdr.bytesize - colon_idx - 1].to_i?
+        {h, p}
+      else
+        {host_hdr, nil.as(Int32?)}
+      end
+    elsif request.target.starts_with?("http://") || request.target.starts_with?("https://")
+      parsed = URI.parse(request.target)
+      h = parsed.host || "127.0.0.1"
+      {h, parsed.port}
+    else
+      {"127.0.0.1", nil.as(Int32?)}
+    end
+  end
+end
+
+# -----------------------------------------------------------------------------
+# OAuth::Consumer
+# -----------------------------------------------------------------------------
+
+pub class Consumer
+  property host : String
+  property consumer_key : String
+  property consumer_secret : String
+  property port : Int32?
+  property scheme : String
+  property request_token_uri : String
+  property authorize_uri : String
+  property access_token_uri : String
+  property tls : Bool
+
+  def initialize(@host : String,
+                 @consumer_key : String,
+                 @consumer_secret : String,
+                 @port : Int32? = nil,
+                 @scheme : String = "https",
+                 @request_token_uri : String = "/oauth/request_token",
+                 @authorize_uri : String = "/oauth/authorize",
+                 @access_token_uri : String = "/oauth/access_token")
+    @tls = @scheme == "https"
+  end
+
+  def get_request_token(oauth_callback : String = "oob") : RequestToken
+    post(nil, nil, {"oauth_callback" => oauth_callback}, @request_token_uri) do |resp|
+      RequestToken.from_response(resp.body)
+    end
+  end
+
+  def get_authorize_uri(request_token : RequestToken, oauth_callback : String? = nil) : String
+    get_authorize_uri(request_token, oauth_callback) { |_params| }
+  end
+
+  def get_authorize_uri(request_token : RequestToken, oauth_callback : String? = nil, &block : Params -> Nil) : String
+    uri = URI.parse(@authorize_uri)
+    unless uri.host
+      uri = URI.new(scheme: @scheme, host: @host, port: @port, path: @authorize_uri)
+    end
+
+    params = uri.query_params
+    params.add("oauth_token", request_token.token)
+    if cb = oauth_callback
+      params.add("oauth_callback", cb)
+    end
+    yield params
+
+    uri.query_params = params
+    uri.to_s
+  end
+
+  def get_access_token(request_token : RequestToken, oauth_verifier : String, extra_params : Hash(String, String)? = nil) : AccessToken
+    extra = if ex = extra_params
+              ex.dup
+            else
+              {} of String => String
+            end
+    extra["oauth_verifier"] = oauth_verifier
+
+    post(request_token.token, request_token.secret, extra, @access_token_uri) do |resp|
+      AccessToken.from_response(resp.body)
+    end
+  end
+
+  def authenticate(client : HTTP::Client, token : AccessToken) : Nil
+    authenticate(client, token.token, token.secret, nil)
+  end
+
+  def authenticate(client : HTTP::Client, token : String?, token_secret : String?, extra_params : Hash(String, String)? = nil) : Nil
+    OAuth.authenticate(client, token, token_secret, @consumer_key, @consumer_secret, extra_params)
+  end
+
+  private def post(oauth_token : String?, token_shared_secret : String?, extra_params : Hash(String, String)?, target_uri : String, &block : Response -> T) : T forall T
+    uri = URI.parse(target_uri)
+    client = if uri.host
+               HTTP::Client.new(uri)
+             else
+               HTTP::Client.new(@host, @port, @tls)
+             end
+
+    authenticate(client, oauth_token, token_shared_secret, extra_params)
+
+    begin
+      req_target = uri.host ? (uri.path.empty? ? "/" : uri.path) : target_uri
+      response = client.post(req_target)
+      unless response.status_code >= 200 && response.status_code < 300
+        raise Error.new(response)
+      end
+      yield response
+    ensure
+      client.close
+    end
+  end
+end
+
+# -----------------------------------------------------------------------------
+# OAuth Module Methods
+# -----------------------------------------------------------------------------
+
+pub struct OAuth
+  def self.authenticate(client : HTTP::Client,
+                        token : String?,
+                        token_secret : String?,
+                        consumer_key : String,
+                        consumer_secret : String,
+                        extra_params : Hash(String, String)? = nil) : Nil
+    client.before_request do |request|
+      authenticate(client, request, token, token_secret, consumer_key, consumer_secret, extra_params)
+    end
+  end
+
+  def self.authenticate(client : HTTP::Client,
+                        request : HTTP::Request,
+                        token : String?,
+                        token_secret : String?,
+                        consumer_key : String,
+                        consumer_secret : String,
+                        extra_params : Hash(String, String)? = nil) : Nil
+    request.headers["Authorization"] = oauth_header(client, request, token, token_secret, consumer_key, consumer_secret, extra_params)
+  end
+
+  def self.oauth_header(client : HTTP::Client,
+                        request : HTTP::Request,
+                        token : String?,
+                        token_secret : String?,
+                        consumer_key : String,
+                        consumer_secret : String,
+                        extra_params : Hash(String, String)? = nil) : String
+    ts = Time.utc.to_unix.to_s
+    nonce = Std::Crypto.random_bytes(16).hexstring
+    sig = Signature.new(consumer_key, consumer_secret, token, token_secret, extra_params)
+    sig.authorization_header(request, client.tls?, ts, nonce)
+  end
+end
+
+# -----------------------------------------------------------------------------
+# Top-Level Aliases
+# -----------------------------------------------------------------------------
+
+alias ::OAuth = Std::Oauth::OAuth
+alias ::OAuth::Consumer = Std::Oauth::Consumer
+alias ::OAuth::RequestToken = Std::Oauth::RequestToken
+alias ::OAuth::AccessToken = Std::Oauth::AccessToken
+alias ::OAuth::Error = Std::Oauth::Error
+alias ::OAuth::Signature = Std::Oauth::Signature
+alias ::OAuth::AuthorizationHeader = Std::Oauth::AuthorizationHeader

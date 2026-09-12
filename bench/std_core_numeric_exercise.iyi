@@ -1,0 +1,431 @@
+import std/bool
+import std/char
+import std/comparable
+using std/comparable::{Comparable}
+import std/complex
+using std/complex::{Complex}
+import std/empty
+import std/enum
+import std/float
+import std/int
+import std/iterable
+using std/iterable::{Iterable}
+import std/iterator
+import std/nil
+import std/number
+import std/steppable
+using std/steppable::{Steppable}
+import std/symbol
+
+enum Color
+  Red   = 1
+  Green = 2
+  Blue  = 4
+end
+
+struct Score
+  getter val : Int32
+
+  def initialize(@val : Int32)
+  end
+
+  def <=>(other : Score) : Int32?
+    @val < other.val ? -1 : (@val > other.val ? 1 : 0)
+  end
+end
+
+impl Comparable(Score) for Score
+end
+
+class IntList
+  @arr : Array(Int32)
+
+  def initialize(@arr : Array(Int32))
+  end
+
+  def each : Std::Iterator::ArrayIterator(Int32)
+    Std::Iterator::ArrayIterator(Int32).new(@arr)
+  end
+end
+
+impl Iterable for IntList
+  type Iter = Std::Iterator::ArrayIterator(Int32)
+
+  def each : Std::Iterator::ArrayIterator(Int32)
+    Std::Iterator::ArrayIterator(Int32).new(@arr)
+  end
+end
+
+impl Steppable for Int32
+end
+
+def assert(condition : ::Bool, message : String) : ::Nil
+  unless condition
+    print "assertion failed: "
+    print message
+    print "\n"
+    raise message
+  end
+end
+
+def main : ::Nil
+  args = Program.args
+  if args.size > 0
+    mode = args[0]
+    if mode == "probe_not_nil"
+      nil.not_nil("nil probe panic")
+      return
+    elsif mode == "probe_char_to_i"
+      'z'.to_i(10)
+      return
+    elsif mode == "probe_enum_parse"
+      Color.parse("Yellow")
+      return
+    elsif mode == "probe_complex_div_zero"
+      c = Complex.new(1, 1)
+      c / 0
+      return
+    end
+  end
+
+  # ---- 1. Bool surface ----
+  print "== bool surface\n"
+  assert(true | false == true, "bool or")
+  assert(false | false == false, "bool or false")
+  assert(true & false == false, "bool and")
+  assert(true & true == true, "bool and true")
+  assert(true ^ false == true, "bool xor")
+  assert(true ^ true == false, "bool xor false")
+  assert(true.to_unsafe == 1, "bool to_unsafe true")
+  assert(false.to_unsafe == 0, "bool to_unsafe false")
+  assert(false < true, "bool <")
+  assert(false <= true, "bool <=")
+  assert(true > false, "bool >")
+  assert(true >= false, "bool >=")
+  assert((false <=> true) == -1, "bool <=>")
+  assert((true <=> false) == 1, "bool <=>")
+  assert((true <=> true) == 0, "bool <=>")
+  assert(true.clone == true, "bool clone")
+  assert(true.hash != false.hash, "bool hash")
+  print "bool surface: all passed\n"
+
+  # ---- 2. Nil surface ----
+  print "== nil surface\n"
+  assert(nil.object_id == 0_u64, "nil object_id")
+  assert(nil == nil, "nil ==")
+  assert(nil.same?(nil), "nil same?")
+  assert(nil.to_s == "", "nil to_s")
+  assert(nil.inspect == "nil", "nil inspect")
+  assert(nil.try { 42 }.nil?, "nil try")
+  assert(nil.presence.nil?, "nil presence")
+  assert(nil.clone.nil?, "nil clone")
+  assert(nil.hash == 0, "nil hash")
+  print "nil surface: all passed\n"
+
+  # ---- 3. Symbol surface ----
+  print "== symbol surface\n"
+  assert((:apple <=> :banana) == -1, "symbol <=>")
+  assert((:banana <=> :apple) == 1, "symbol <=>")
+  assert((:apple <=> :apple) == 0, "symbol <=>")
+  assert(:apple < :banana, "symbol <")
+  assert(:apple <= :banana, "symbol <=")
+  assert(:banana > :apple, "symbol >")
+  assert(:banana >= :apple, "symbol >=")
+  assert(:foo.to_s == "foo", "symbol to_s")
+  assert(:foo.inspect == ":foo", "symbol inspect")
+  assert(:"hello world".inspect == ":\"hello world\"", "symbol inspect quoted")
+  assert(Symbol.needs_quotes?("hello") == false, "needs_quotes false")
+  assert(Symbol.needs_quotes?("hello world") == true, "needs_quotes true")
+  assert(Symbol.needs_quotes_for_named_argument?("123foo") == true, "quote named arg true")
+  assert(Symbol.quote_for_named_argument("foo") == "foo", "quote named arg identity")
+  assert(Symbol.quote_for_named_argument("123foo") == "\"123foo\"", "quote named arg quoted")
+  assert(:test.clone == :test, "symbol clone")
+  print "symbol surface: all passed\n"
+
+  # ---- 4. Comparable surface ----
+  print "== comparable surface\n"
+  s1 = Score.new(80)
+  s2 = Score.new(90)
+  assert(s1 < s2, "comparable <")
+  assert(s1 <= s2, "comparable <=")
+  assert(s2 > s1, "comparable >")
+  assert(s2 >= s1, "comparable >=")
+  assert(s1.between?(Score.new(70), Score.new(90)), "comparable between?")
+  assert(s1.clamp(Score.new(85), Score.new(100)).val == 85, "comparable clamp min")
+  assert(s2.clamp(Score.new(50), Score.new(85)).val == 85, "comparable clamp max")
+  print "comparable surface: all passed\n"
+
+  # ---- 5. Steppable & Iterable surface ----
+  print "== steppable and iterable surface\n"
+  sum = 0
+  1.step(to: 5, by: 2) do |x|
+    sum = sum + x
+  end
+  assert(sum == 9, "steppable step block") # 1 + 3 + 5 = 9
+
+  iter = 1.step(to: 5, by: 2)
+  arr = iter.to_a
+  assert(arr.size == 3, "step iterator size")
+  assert(arr[0] == 1 && arr[1] == 3 && arr[2] == 5, "step iterator elements")
+
+  list = IntList.new([10, 20, 30, 40, 50])
+  stepped = list.each_step(2).to_a
+  assert(stepped.size == 3, "iterable each_step size")
+  assert(stepped[0] == 10 && stepped[1] == 30 && stepped[2] == 50, "iterable each_step vals")
+
+  indexed = list.each_with_index(1).to_a
+  assert(indexed.size == 5, "iterable each_with_index size")
+  print "steppable and iterable surface: all passed\n"
+
+  # ---- 6. Enum surface ----
+  print "== enum surface\n"
+  r = Color::Red
+  g = Color::Green
+  b = Color::Blue
+  assert(r.value == 1, "enum value")
+  assert(r.to_i == 1, "enum to_i")
+  assert(r.to_i32 == 1, "enum to_i32")
+  assert(r.to_i64 == 1_i64, "enum to_i64")
+  assert(r.to_f64 == 1.0, "enum to_f64")
+  assert(r.to_s == "Red", "enum to_s")
+  assert(r.inspect == "Red", "enum inspect")
+
+  rg = r | g
+  assert(rg.includes?(r), "enum includes? red")
+  assert(rg.includes?(g), "enum includes? green")
+  assert(rg.includes?(b) == false, "enum includes? blue false")
+  assert((r <=> g) == -1, "enum <=>")
+  assert(r < g, "enum <")
+  assert(g > r, "enum >")
+  assert(r == Color::Red, "enum ==")
+
+  assert(Color.names.size == 3, "enum names size")
+  assert(Color.values.size == 3, "enum values size")
+  assert(Color.from_value?(1) == r, "enum from_value? found")
+  assert(Color.from_value?(99).nil?, "enum from_value? nil")
+  assert(Color.from_value(2) == g, "enum from_value")
+  assert(Color.valid?(r), "enum valid? true")
+  assert(Color.parse?("Green") == g, "enum parse? found")
+  assert(Color.parse?("Yellow").nil?, "enum parse? nil")
+  assert(Color.parse("Blue") == b, "enum parse")
+
+  count = 0
+  Color.each do |c|
+    count = count + 1
+  end
+  assert(count == 3, "enum each count")
+  print "enum surface: all passed\n"
+
+  # ---- 7. Char surface ----
+  print "== char surface\n"
+  ch = 'a'
+  assert(ch.ord == 97, "char ord")
+  assert(ch - 'a' == 0, "char - char")
+  assert(ch + 1 == 'b', "char + int")
+  assert('b' - 1 == 'a', "char - int")
+  assert(('a' <=> 'b') == -1, "char <=>")
+  assert('a' < 'b', "char <")
+  assert('b' > 'a', "char >")
+  assert('a'.ascii?, "char ascii?")
+  assert('5'.ascii_number?, "char ascii_number?")
+  assert('f'.hex?, "char hex?")
+  assert('a'.ascii_lowercase?, "char ascii_lowercase?")
+  assert('A'.ascii_uppercase?, "char ascii_uppercase?")
+  assert('Z'.ascii_letter?, "char ascii_letter?")
+  assert('9'.ascii_alphanumeric?, "char ascii_alphanumeric?")
+  assert(' '.ascii_whitespace?, "char ascii_whitespace?")
+  assert('\n'.ascii_whitespace?, "char ascii_whitespace newline")
+  assert('\0'.ascii_control?, "char ascii_control?")
+  assert('a'.printable?, "char printable?")
+  assert('A'.downcase == 'a', "char downcase")
+  assert('a'.upcase == 'A', "char upcase")
+  assert('x'.succ == 'y', "char succ")
+  assert('y'.pred == 'x', "char pred")
+  assert('f'.to_i(16) == 15, "char to_i")
+  assert('5'.to_i == 5, "char to_i 10")
+  assert('z'.to_i?(10).nil?, "char to_i? invalid")
+  assert('a'.bytesize == 1, "char bytesize")
+  assert('c'.in_set?("a-z"), "char in_set? range")
+  assert('c'.in_set?("^c") == false, "char in_set? negated")
+  assert('a'.inspect == "'a'", "char inspect")
+
+  reader = Std::Char::Reader.new("hello")
+  chars_read = [] of ::Char
+  while reader.has_next?
+    chars_read << reader.current_char
+    reader.next_char
+  end
+  assert(chars_read.size == 5, "char reader count")
+  assert(chars_read[0] == 'h' && chars_read[4] == 'o', "char reader items")
+  print "char surface: all passed\n"
+
+  # ---- 8. Number surface ----
+  print "== number surface\n"
+  assert(Int32.zero == 0, "number zero")
+  assert(Int32.additive_identity == 0, "number additive_identity")
+  assert(Int32.multiplicative_identity == 1, "number multiplicative_identity")
+  assert(+42 == 42, "number unary +")
+  assert(42.abs == 42, "number abs")
+  assert((-42).abs == 42, "number abs negative")
+  assert(4.abs2 == 16, "number abs2")
+  assert(42.sign == 1, "number sign pos")
+  assert((-42).sign == -1, "number sign neg")
+  assert(0.sign == 0, "number sign zero")
+  assert(0.zero?, "number zero?")
+  assert(5.positive?, "number positive?")
+  assert((-5).negative?, "number negative?")
+  q, r_val = 14.divmod(3)
+  assert(q == 4 && r_val == 2, "number divmod")
+  print "number surface: all passed\n"
+
+  # ---- 9. Int surface ----
+  print "== int surface\n"
+  i8 = 10_i8
+  i16 = 20_i16
+  i32 = 30_i32
+  i64 = 40_i64
+  i128 = 50_i128
+  u8 = 60_u8
+  u16 = 70_u16
+  u32 = 80_u32
+  u64 = 90_u64
+  u128 = 100_u128
+
+  assert(i8.to_i32 == 10, "int8 to_i32")
+  assert(i16.to_i32 == 20, "int16 to_i32")
+  assert(i32.to_i64 == 30_i64, "int32 to_i64")
+  assert(i64.to_i32 == 40, "int64 to_i32")
+  assert(i128.to_i32 == 50, "int128 to_i32")
+  assert(u8.to_i32 == 60, "uint8 to_i32")
+  assert(u16.to_i32 == 70, "uint16 to_i32")
+  assert(u32.to_i64 == 80_i64, "uint32 to_i64")
+  assert(u64.to_i64 == 90_i64, "uint64 to_i64")
+  assert(u128.to_i64 == 100_i64, "uint128 to_i64")
+
+  assert(Int8::MIN == -128_i8, "int8 min")
+  assert(Int8::MAX == 127_i8, "int8 max")
+  assert(UInt8::MAX == 255_u8, "uint8 max")
+  assert(Int32::MIN == -2147483648_i32, "int32 min")
+  assert(Int32::MAX == 2147483647_i32, "int32 max")
+  assert(UInt32::MAX == 4294967295_u32, "uint32 max")
+  assert(Int64::MAX > 9000000000000000000_i64, "int64 max")
+
+  assert(12.gcd(18) == 6, "int gcd")
+  assert(12.lcm(18) == 36, "int lcm")
+  assert(7.popcount == 3, "int popcount")
+  assert(8.trailing_zeros_count == 3, "int trailing_zeros_count")
+  assert(255.bits_set?(15), "int bits_set?")
+  assert(255.all_bits_set?(15), "int all_bits_set?")
+  assert(240.no_bits_set?(15), "int no_bits_set?")
+  assert(241.any_bits_set?(15), "int any_bits_set?")
+  assert(4.even?, "int even?")
+  assert(5.odd?, "int odd?")
+  assert(14.tdiv(3) == 4, "int tdiv")
+  assert(14.tmod(3) == 2, "int tmod")
+  assert(14.fdiv(4) == 3.5, "int fdiv")
+  digs = 42.digits
+  assert(digs.size == 2 && digs[0] == 2 && digs[1] == 4, "int digits")
+  assert(65.chr == 'A', "int chr")
+
+  upto_sum = 0
+  1.upto(4) do |n|
+    upto_sum = upto_sum + n
+  end
+  assert(upto_sum == 10, "int upto") # 1+2+3+4=10
+
+  downto_sum = 0
+  4.downto(1) do |n|
+    downto_sum = downto_sum + n
+  end
+  assert(downto_sum == 10, "int downto")
+  print "int surface: all passed\n"
+
+  # ---- 10. Float surface ----
+  print "== float surface\n"
+  f32 = 2.5_f32
+  f64 = 3.5_f64
+  assert(f32.to_f64 == 2.5, "f32 to_f64")
+  assert(f64.to_f32 == 3.5_f32, "f64 to_f32")
+  assert(f64.finite?, "float finite?")
+  assert(f64.nan? == false, "float nan? false")
+  assert(Float64::NAN.nan?, "float nan? true")
+  assert(Float64::INFINITY.infinite? == 1, "float infinite? pos")
+  assert((0.0 - Float64::INFINITY).infinite? == -1, "float infinite? neg")
+  assert((7.5 // 2.0) == 3.0, "float //")
+  assert((7.5 % 2.0) == 1.5, "float %")
+  assert(3.7.trunc == 3.0, "float trunc")
+  assert(Float64::MAX > 1.0e300, "float64 max")
+  assert(Float32::MAX > 1.0e38_f32, "float32 max")
+  print "float surface: all passed\n"
+
+  # ---- 11. Math surface ----
+  print "== math surface\n"
+  assert(Math.sin(0.0) == 0.0, "math sin 0")
+  assert(Math.cos(0.0) == 1.0, "math cos 0")
+  assert(Math.tan(0.0) == 0.0, "math tan 0")
+  assert(Math.sqrt(25.0) == 5.0, "math sqrt")
+  assert(Math.cbrt(27.0) == 3.0, "math cbrt")
+  assert(Math.cbrt(-8.0) == -2.0, "math cbrt neg")
+  assert(Math.exp(0.0) == 1.0, "math exp 0")
+  assert(Math.exp2(3.0) == 8.0, "math exp2")
+  assert(Math.log(Math::E) == 1.0, "math log E")
+  assert(Math.log2(8.0) == 3.0, "math log2")
+  assert(Math.log10(100.0) == 2.0, "math log10")
+  assert(Math.pow(2.0, 3.0) == 8.0, "math pow")
+  assert(Math.hypot(3.0, 4.0) == 5.0, "math hypot")
+  assert(Math.copysign(5.0, -1.0) == -5.0, "math copysign")
+  assert(Math.min(3.0, 7.0) == 3.0, "math min")
+  assert(Math.max(3.0, 7.0) == 7.0, "math max")
+  assert(Math.fma(2.0, 3.0, 4.0) == 10.0, "math fma")
+  assert((Math.atan2(1.0, 1.0) - Math::PI / 4.0).abs < 1.0e-12, "math atan2")
+  assert(Math.sinh(0.0) == 0.0, "math sinh 0")
+  assert(Math.cosh(0.0) == 1.0, "math cosh 0")
+  assert(Math.tanh(0.0) == 0.0, "math tanh 0")
+  assert(Math.asinh(0.0) == 0.0, "math asinh 0")
+  assert(Math.acosh(1.0) == 0.0, "math acosh 1")
+  assert(Math.atanh(0.0) == 0.0, "math atanh 0")
+  assert(Math.erf(0.0).abs < 1.0e-6, "math erf 0")
+  assert((Math.erfc(0.0) - 1.0).abs < 1.0e-6, "math erfc 0")
+  assert((Math.tgamma(5.0) - 24.0).abs < 1.0e-6, "math tgamma")
+  assert((Math.besselj0(0.0) - 1.0).abs < 1.0e-6, "math besselj0 0")
+  assert(Math.besselj1(0.0).abs < 1.0e-6, "math besselj1 0")
+  assert(Math.gcd(24, 36) == 12, "math gcd")
+  assert(Math.lcm(4, 6) == 12, "math lcm")
+  print "math surface: all passed\n"
+
+  # ---- 12. Complex surface ----
+  print "== complex surface\n"
+  c1 = Complex.new(3, 4)
+  c2 = Complex.new(1, 2)
+  c_add = c1 + c2
+  assert(c_add.real == 4.0 && c_add.imag == 6.0, "complex +")
+
+  c_sub = c1 - c2
+  assert(c_sub.real == 2.0 && c_sub.imag == 2.0, "complex -")
+
+  c_mul = c1 * c2
+  assert(c_mul.real == -5.0 && c_mul.imag == 10.0, "complex *")
+
+  assert(c1.abs == 5.0, "complex abs")
+  assert(c1.abs2 == 25.0, "complex abs2")
+
+  conj = c1.conj
+  assert(conj.real == 3.0 && conj.imag == -4.0, "complex conj")
+
+  ci = 3.i
+  assert(ci.real == 0.0 && ci.imag == 3.0, "number .i")
+
+  c_real = 5.to_c
+  assert(c_real.real == 5.0 && c_real.imag == 0.0, "number .to_c")
+
+  sqrt_neg1 = Math.sqrt(Complex.new(-1, 0))
+  assert((sqrt_neg1.real).abs < 1.0e-12 && (sqrt_neg1.imag - 1.0).abs < 1.0e-12, "complex sqrt(-1)")
+
+  exp_c = Math.exp(Complex.new(0, Math::PI))
+  assert((exp_c.real + 1.0).abs < 1.0e-12 && (exp_c.imag).abs < 1.0e-12, "complex e^(i*pi) = -1")
+  print "complex surface: all passed\n"
+
+  print "all core numeric checks passed\n"
+end
+
+main
